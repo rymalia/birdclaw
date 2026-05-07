@@ -226,6 +226,58 @@ describe("birdclaw queries", () => {
 		});
 	});
 
+	it("sanitizes handle-shaped DM search queries for FTS", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+        insert into dm_messages (
+          id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+        ) values (?, 'dm_003', 'profile_me', ?, ?, 'outbound', 1, 0)
+        `,
+		).run(
+			"msg_dm_handle_query",
+			"ask @github about the identity clue",
+			"2026-03-08T11:03:00.000Z",
+		);
+		db.prepare("insert into dm_fts (message_id, text) values (?, ?)").run(
+			"msg_dm_handle_query",
+			"ask @github about the identity clue",
+		);
+
+		const filtered = listDmConversations({
+			search: "@github",
+			context: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_003"]);
+		expect(filtered[0]?.searchSnippet).toContain("<mark>github</mark>");
+		expect(filtered[0]?.matches?.[0]?.message.id).toBe("msg_dm_handle_query");
+	});
+
+	it("treats punctuation-only DM search as an unfiltered query", () => {
+		setupTempHome();
+
+		const filtered = listDmConversations({
+			search: "@",
+			context: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual([
+			"dm_001",
+			"dm_003",
+			"dm_002",
+			"dm_004",
+		]);
+		expect(
+			filtered.every(
+				(item) =>
+					item.searchSnippet === null || item.searchSnippet === undefined,
+			),
+		).toBe(true);
+		expect(filtered.every((item) => item.matches === undefined)).toBe(true);
+	});
+
 	it("omits DM search snippets when no query is provided", () => {
 		setupTempHome();
 

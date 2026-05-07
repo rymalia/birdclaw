@@ -79,6 +79,15 @@ function parseJsonField<T>(value: unknown, fallback: T): T {
 	}
 }
 
+function toFtsSearchQuery(value: string) {
+	const terms = value.match(/[\p{L}\p{N}_]+/gu) ?? [];
+	return terms
+		.map((term) => term.trim())
+		.filter((term) => term.length > 0)
+		.map((term) => `"${term.replaceAll('"', '""')}"`)
+		.join(" ");
+}
+
 function enrichEntities(
 	entities: TweetEntities,
 	profiles: Record<string, ProfileRecord>,
@@ -339,12 +348,13 @@ export function listTimelineItems({
 		params.push(until.trim());
 	}
 
-	if (search?.trim()) {
+	const ftsSearch = search?.trim() ? toFtsSearchQuery(search) : "";
+	if (ftsSearch) {
 		join += " join tweets_fts on tweets_fts.tweet_id = t.id ";
 		where += " and tweets_fts.text match ?";
 		searchSnippetSelect =
 			", snippet(tweets_fts, 1, '<mark>', '</mark>', '...', 16) as search_snippet";
-		params.push(search.trim());
+		params.push(ftsSearch);
 	}
 
 	if (likedOnly) {
@@ -535,6 +545,7 @@ export function listDmConversations({
 	let join = "";
 	let where = "where 1 = 1";
 	let searchSnippetSelect = "";
+	const ftsSearch = search?.trim() ? toFtsSearchQuery(search) : "";
 
 	if (account && account !== "all") {
 		where += " and a.id = ?";
@@ -567,9 +578,9 @@ export function listDmConversations({
 		params.push(maxFollowers);
 	}
 
-	if (search?.trim()) {
+	if (ftsSearch) {
 		searchSnippetCte = `
-      with ranked_dm_search as materialized (
+	      with ranked_dm_search as materialized (
         select
           latest_search.id,
           latest_search.conversation_id,
@@ -590,10 +601,10 @@ export function listDmConversations({
         where ranked_dm_search.match_rank = 1
           and dm_fts.text match ?
       )
-    `;
+	`;
 		join += " join dm_search on dm_search.conversation_id = c.id ";
 		searchSnippetSelect = ", dm_search.search_snippet as search_snippet";
-		joinParams.push(search.trim(), search.trim());
+		joinParams.push(ftsSearch, ftsSearch);
 	}
 
 	params.push(limit);
@@ -728,9 +739,9 @@ export function listDmConversations({
 
 	const limited = filtered.slice(0, limit);
 	const normalizedContext = normalizeDmContext(context);
-	if (search?.trim() && normalizedContext > 0 && limited.length > 0) {
+	if (ftsSearch && normalizedContext > 0 && limited.length > 0) {
 		const matches = getDmSearchMatches({
-			search: search.trim(),
+			search: ftsSearch,
 			conversationIds: limited.map((item) => item.id),
 			context: normalizedContext,
 		});
@@ -876,6 +887,9 @@ function getDmSearchMatches({
 	context: number;
 }) {
 	const db = getNativeDb();
+	if (search.length === 0) {
+		return new Map<string, DmConversationItem["matches"]>();
+	}
 	const conversationPlaceholders = conversationIds.map(() => "?").join(", ");
 	const matchRows = db
 		.prepare(
