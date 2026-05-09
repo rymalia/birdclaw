@@ -168,3 +168,67 @@ describe("database init", () => {
 		expect(busyTimeout).toBe(5000);
 	});
 });
+
+describe("native sqlite compatibility wrapper", () => {
+	it("normalizes rows, buffers, parameter arrays, and close behavior", () => {
+		const db = new NativeSqliteDatabase(":memory:");
+		db.exec(
+			"create table files (id integer primary key, name text, data blob)",
+		);
+
+		const insert = db.prepare("insert into files (name, data) values (?, ?)");
+		const result = insert.run(["readme", Buffer.from("hello")]);
+		expect(result).toMatchObject({ changes: 1, lastInsertRowid: 1 });
+
+		const row = db
+			.prepare("select id, name, data from files where name = ?")
+			.get("readme") as { id: number; name: string; data: Buffer };
+		expect(Object.getPrototypeOf(row)).toBe(Object.prototype);
+		expect(row.data).toBeInstanceOf(Buffer);
+		expect(row.data.toString("utf8")).toBe("hello");
+
+		const rows = [
+			...db.prepare("select name from files where id in (?)").iterate(1),
+		] as Array<{ name: string }>;
+		expect(rows).toEqual([{ name: "readme" }]);
+		expect(db.pragma("application_id")).toEqual([
+			expect.objectContaining({ application_id: 0 }),
+		]);
+		expect(db.pragma("does_not_exist", { simple: true })).toBeUndefined();
+
+		db.close();
+		expect(() => db.close()).not.toThrow();
+	});
+
+	it("commits, rolls back, and nests transactions with savepoints", () => {
+		const db = new NativeSqliteDatabase(":memory:");
+		db.exec("create table events (name text)");
+
+		db.transaction((name: string) => {
+			db.prepare("insert into events (name) values (?)").run(name);
+		})("committed");
+
+		expect(() =>
+			db.transaction(() => {
+				db.prepare("insert into events (name) values (?)").run("rolled-back");
+				throw new Error("nope");
+			})(),
+		).toThrow("nope");
+
+		expect(() =>
+			db.transaction(() => {
+				db.prepare("insert into events (name) values (?)").run("outer");
+				db.transaction(() => {
+					db.prepare("insert into events (name) values (?)").run("inner");
+					throw new Error("inner nope");
+				})();
+			})(),
+		).toThrow("inner nope");
+
+		const names = db
+			.prepare("select name from events order by name")
+			.all() as Array<{ name: string }>;
+		expect(names).toEqual([{ name: "committed" }]);
+		db.close();
+	});
+});
