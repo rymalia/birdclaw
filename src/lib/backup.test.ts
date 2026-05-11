@@ -160,6 +160,24 @@ function seedBackupFixture() {
       ('dm_1', 'Backup this please'),
       ('dm_2', 'On it');
 
+    insert into url_expansions (
+      short_url, expanded_url, final_url, status, expanded_tweet_id,
+      expanded_handle, title, description, error, source, updated_at
+    ) values (
+      'https://t.co/shared', 'https://x.com/friend/status/2039395915421942108',
+      'https://x.com/friend/status/2039395915421942108', 'hit',
+      '2039395915421942108', 'friend', 'Shared tweet', 'An expanded DM share',
+      null, 'network', '2025-01-05T10:01:00.000Z'
+    );
+
+    insert into link_occurrences (
+      source_kind, source_id, source_position, short_url, account_id,
+      conversation_id, direction, created_at
+    ) values (
+      'dm', 'dm_2', 0, 'https://t.co/shared', 'acct_primary', 'dm:friend',
+      'outbound', '2025-01-05T10:00:00.000Z'
+    );
+
     insert into blocks (account_id, profile_id, source, created_at)
     values ('acct_primary', 'profile_friend', 'manual', '2025-01-06T00:00:00.000Z');
 
@@ -232,6 +250,8 @@ describe("text backup", () => {
 			collections_likes: 2,
 			dm_conversations: 1,
 			dm_messages: 2,
+			url_expansions: 1,
+			link_occurrences: 1,
 			blocks: 1,
 			mutes: 1,
 			tweet_actions: 1,
@@ -248,8 +268,20 @@ describe("text backup", () => {
 		);
 		expect(existsSync(path.join(repoPath, "data/dms/2025.jsonl"))).toBe(true);
 		expect(
+			existsSync(path.join(repoPath, "data/links/url_expansions.jsonl")),
+		).toBe(true);
+		expect(
+			existsSync(path.join(repoPath, "data/links/occurrences.jsonl")),
+		).toBe(true);
+		expect(
 			readFileSync(path.join(repoPath, "data/tweets/2025.jsonl"), "utf8"),
 		).toContain('"bookmarked":1');
+		expect(
+			readFileSync(
+				path.join(repoPath, "data/links/url_expansions.jsonl"),
+				"utf8",
+			),
+		).toContain('"expanded_tweet_id":"2039395915421942108"');
 
 		resetDatabaseForTests();
 		resetBirdclawPathsForTests();
@@ -275,23 +307,30 @@ describe("text backup", () => {
 		expect(after).toEqual(before);
 		expect(imported.fingerprint).toEqual(before);
 		expect(
-			(
-				staleDb
-					.prepare("select count(*) as count from link_occurrences")
-					.get() as {
-					count: number;
-				}
-			).count,
-		).toBe(0);
+			staleDb
+				.prepare(
+					"select short_url, expanded_tweet_id from url_expansions order by short_url",
+				)
+				.all(),
+		).toEqual([
+			{
+				short_url: "https://t.co/shared",
+				expanded_tweet_id: "2039395915421942108",
+			},
+		]);
 		expect(
-			(
-				staleDb
-					.prepare("select count(*) as count from url_expansions")
-					.get() as {
-					count: number;
-				}
-			).count,
-		).toBe(0);
+			staleDb
+				.prepare(
+					"select source_kind, source_id, short_url from link_occurrences order by source_kind, source_id",
+				)
+				.all(),
+		).toEqual([
+			{
+				source_kind: "dm",
+				source_id: "dm_2",
+				short_url: "https://t.co/shared",
+			},
+		]);
 
 		const validation = await validateBackup(repoPath);
 		expect(validation.ok).toBe(true);
@@ -386,6 +425,8 @@ describe("text backup", () => {
 			collections_likes: 2,
 			dm_conversations: 1,
 			dm_messages: 2,
+			url_expansions: 1,
+			link_occurrences: 1,
 			blocks: 1,
 			mutes: 1,
 			tweet_actions: 1,

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Include expanded short URLs and link occurrences in Git-friendly backups so linked-tweet search survives backup restore.
+
 ## 0.4.1 - 2026-05-11
 
 ### Added

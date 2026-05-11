@@ -287,6 +287,30 @@ function getExportRowSets(db: Database) {
           is_replied, media_count
         from dm_messages
         order by conversation_id, created_at, id
+				`,
+			),
+		},
+		{
+			logicalName: "url_expansions",
+			rows: rowsForQuery(
+				db,
+				`
+        select short_url, expanded_url, final_url, status, expanded_tweet_id,
+          expanded_handle, title, description, error, source, updated_at
+        from url_expansions
+        order by short_url
+        `,
+			),
+		},
+		{
+			logicalName: "link_occurrences",
+			rows: rowsForQuery(
+				db,
+				`
+        select source_kind, source_id, source_position, short_url, account_id,
+          conversation_id, direction, created_at
+        from link_occurrences
+        order by source_kind, source_id, source_position, short_url
         `,
 			),
 		},
@@ -411,6 +435,12 @@ function buildShards(db: Database) {
 					);
 				}
 				break;
+			case "url_expansions":
+				addRows(shards, "data/links/url_expansions.jsonl", rowSet.rows);
+				break;
+			case "link_occurrences":
+				addRows(shards, "data/links/occurrences.jsonl", rowSet.rows);
+				break;
 			case "blocks":
 			case "mutes":
 				addRows(
@@ -514,11 +544,17 @@ function computeCounts(files: BackupFileManifest[]) {
 							? "dm_conversations"
 							: second === "dms"
 								? "dm_messages"
-								: second === "moderation"
-									? third?.replace(/\.jsonl$/, "") || "moderation"
-									: second === "actions"
-										? third?.replace(/\.jsonl$/, "") || "actions"
-										: second?.replace(/\.jsonl$/, "") || "unknown";
+								: second === "links"
+									? third === "url_expansions.jsonl"
+										? "url_expansions"
+										: third === "occurrences.jsonl"
+											? "link_occurrences"
+											: "links"
+									: second === "moderation"
+										? third?.replace(/\.jsonl$/, "") || "moderation"
+										: second === "actions"
+											? third?.replace(/\.jsonl$/, "") || "actions"
+											: second?.replace(/\.jsonl$/, "") || "unknown";
 		counts[key] = (counts[key] ?? 0) + file.rows;
 	}
 	return counts;
@@ -552,11 +588,14 @@ data/collections/likes.jsonl
 data/collections/bookmarks.jsonl
 data/dms/conversations.jsonl
 data/dms/YYYY.jsonl
+data/links/url_expansions.jsonl
+data/links/occurrences.jsonl
 data/moderation/blocks.jsonl
 data/moderation/mutes.jsonl
 \`\`\`
 
 Tweets are sharded by creation year. Collection-only tweets whose creation date is unknown live in \`data/tweets/unknown.jsonl\`. Timeline edges keep account-scoped home/mention membership separate from canonical tweet content. DMs are sharded by year and keep \`conversation_id\` in each row.
+The links shard stores expanded short URLs and their source tweet/DM occurrences so linked-tweet search can be rebuilt without re-expanding every \`t.co\` URL.
 
 Never commit live tokens, browser cookies, raw SQLite WAL/SHM sidecars, or temporary cache files here.
 `,
@@ -1029,6 +1068,8 @@ export async function importBackup({
 		mutes,
 		actions,
 		scores,
+		urlExpansions,
+		linkOccurrences,
 	] = await Promise.all([
 		readRows((file) => file === "data/accounts.jsonl"),
 		readRows((file) => file === "data/profiles.jsonl"),
@@ -1047,6 +1088,8 @@ export async function importBackup({
 		readRows((file) => file === "data/moderation/mutes.jsonl"),
 		readRows((file) => file === "data/actions/tweet_actions.jsonl"),
 		readRows((file) => file === "data/ai_scores.jsonl"),
+		readRows((file) => file === "data/links/url_expansions.jsonl"),
+		readRows((file) => file === "data/links/occurrences.jsonl"),
 	]);
 
 	db.transaction(() => {
@@ -1406,6 +1449,65 @@ export async function importBackup({
 			],
 		);
 		insertFtsRows(db, "dm_fts", "message_id", messages, "id", "text", dmFtsIds);
+		insertRows(
+			db,
+			`
+      insert into url_expansions (
+        short_url, expanded_url, final_url, status, expanded_tweet_id,
+        expanded_handle, title, description, error, source, updated_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(short_url) do update set
+        expanded_url = excluded.expanded_url,
+        final_url = excluded.final_url,
+        status = excluded.status,
+        expanded_tweet_id = excluded.expanded_tweet_id,
+        expanded_handle = excluded.expanded_handle,
+        title = excluded.title,
+        description = excluded.description,
+        error = excluded.error,
+        source = excluded.source,
+        updated_at = excluded.updated_at
+      `,
+			urlExpansions,
+			[
+				"short_url",
+				"expanded_url",
+				"final_url",
+				"status",
+				"expanded_tweet_id",
+				"expanded_handle",
+				"title",
+				"description",
+				"error",
+				"source",
+				"updated_at",
+			],
+		);
+		insertRows(
+			db,
+			`
+      insert into link_occurrences (
+        source_kind, source_id, source_position, short_url, account_id,
+        conversation_id, direction, created_at
+      ) values (?, ?, ?, ?, ?, ?, ?, ?)
+      on conflict(source_kind, source_id, source_position, short_url) do update set
+        account_id = excluded.account_id,
+        conversation_id = excluded.conversation_id,
+        direction = excluded.direction,
+        created_at = excluded.created_at
+      `,
+			linkOccurrences,
+			[
+				"source_kind",
+				"source_id",
+				"source_position",
+				"short_url",
+				"account_id",
+				"conversation_id",
+				"direction",
+				"created_at",
+			],
+		);
 		insertRows(
 			db,
 			`
