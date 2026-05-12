@@ -30,10 +30,7 @@ import {
 import { syncDirectMessagesViaCachedBird } from "#/lib/dms-live";
 import { listInboxItems, scoreInbox } from "#/lib/inbox";
 import { backfillLinkIndex, searchLinks } from "#/lib/link-index";
-import {
-	fetchTweetMedia,
-	formatMediaFetchResult,
-} from "#/lib/media-fetch";
+import { fetchTweetMedia, formatMediaFetchResult } from "#/lib/media-fetch";
 import { syncMentionThreads } from "#/lib/mention-threads-live";
 import { exportMentionItems } from "#/lib/mentions-export";
 import {
@@ -513,10 +510,15 @@ const mediaCommand = program
 
 mediaCommand
 	.command("fetch")
-	.description("Fetch missing pbs.twimg.com image media already stored in tweets")
+	.description(
+		"Fetch missing pbs.twimg.com image media already stored in tweets",
+	)
 	.option("--account <accountId>", "Account id")
 	.option("--limit <n>", "Stop after N tweets processed")
-	.option("--kind <kind>", "Tweet or collection kind, e.g. home, like, bookmark")
+	.option(
+		"--kind <kind>",
+		"Tweet or collection kind, e.g. home, like, bookmark",
+	)
 	.option("--since <isoDate>", "Only tweets created at or after this date")
 	.option("--parallel <n>", "Concurrent fetch workers, capped at 5", "1")
 	.option("--pacing-ms <n>", "Delay between request starts", "250")
@@ -532,15 +534,12 @@ mediaCommand
 		if (options.limit !== undefined && limit === undefined) {
 			return;
 		}
-		const parallel = parsePositiveIntegerOption(options.parallel, "--parallel") ?? 1;
-		const pacingMs = parseNonNegativeIntegerOption(
-			options.pacingMs,
-			"--pacing-ms",
-		) ?? 250;
-		const retryMax = parseNonNegativeIntegerOption(
-			options.retryMax,
-			"--retry-max",
-		) ?? 3;
+		const parallel =
+			parsePositiveIntegerOption(options.parallel, "--parallel") ?? 1;
+		const pacingMs =
+			parseNonNegativeIntegerOption(options.pacingMs, "--pacing-ms") ?? 250;
+		const retryMax =
+			parseNonNegativeIntegerOption(options.retryMax, "--retry-max") ?? 3;
 		const videoPacingMs =
 			options.videoPacingMs === undefined
 				? undefined
@@ -548,10 +547,9 @@ mediaCommand
 						options.videoPacingMs,
 						"--video-pacing-ms",
 					);
-		const maxBytes = parseNonNegativeIntegerOption(
-			options.maxBytes,
-			"--max-bytes",
-		) ?? 100 * 1024 * 1024;
+		const maxBytes =
+			parseNonNegativeIntegerOption(options.maxBytes, "--max-bytes") ??
+			100 * 1024 * 1024;
 		if (process.exitCode) {
 			return;
 		}

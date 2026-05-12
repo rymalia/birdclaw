@@ -5,7 +5,13 @@
  * URLs. It only downloads media URLs already stored in `tweets.media_json`,
  * skips files present on disk, paces requests, and backs off on 429.
  */
-import { createWriteStream, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import {
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	statSync,
+} from "node:fs";
 import { copyFile, rename } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -110,12 +116,19 @@ function basenameKey(url: URL) {
 function imageExtension(url: URL) {
 	const ext = path.posix.extname(url.pathname).toLowerCase();
 	if (ext === ".jpeg" || ext === ".jpg") return ".jpg";
-	if (ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg") return ext;
+	if (ext === ".png" || ext === ".webp" || ext === ".gif" || ext === ".svg")
+		return ext;
 	const format = url.searchParams.get("format")?.toLowerCase();
-	return format === "png" || format === "webp" || format === "gif" ? `.${format}` : ".jpg";
+	return format === "png" || format === "webp" || format === "gif"
+		? `.${format}`
+		: ".jpg";
 }
 
-function imageCandidate(urlValue: string, dir: string, tweetId: string): Candidate | null {
+function imageCandidate(
+	urlValue: string,
+	dir: string,
+	tweetId: string,
+): Candidate | null {
 	let url: URL;
 	try {
 		url = new URL(urlValue);
@@ -157,10 +170,18 @@ function variantUrl(value: unknown) {
 	};
 }
 
-function videoCandidate(item: Record<string, unknown>, dir: string, tweetId: string): Candidate | null {
+function videoCandidate(
+	item: Record<string, unknown>,
+	dir: string,
+	tweetId: string,
+): Candidate | null {
 	const rawType = String(item.type ?? "");
 	const kind: MediaKind | null =
-		rawType === "video" ? "video" : rawType === "animated_gif" || rawType === "gif" ? "gif" : null;
+		rawType === "video"
+			? "video"
+			: rawType === "animated_gif" || rawType === "gif"
+				? "gif"
+				: null;
 	if (!kind) return null;
 	const variants = Array.isArray(item.variants)
 		? item.variants
@@ -169,7 +190,10 @@ function videoCandidate(item: Record<string, unknown>, dir: string, tweetId: str
 			: [];
 	const best = variants
 		.map(variantUrl)
-		.filter((variant): variant is { url: string; bitrate: number } => variant !== null)
+		.filter(
+			(variant): variant is { url: string; bitrate: number } =>
+				variant !== null,
+		)
 		.sort((left, right) => right.bitrate - left.bitrate)[0];
 	if (!best) return null;
 
@@ -179,7 +203,8 @@ function videoCandidate(item: Record<string, unknown>, dir: string, tweetId: str
 	} catch {
 		return null;
 	}
-	if (url.protocol !== "https:" || url.hostname !== "video.twimg.com") return null;
+	if (url.protocol !== "https:" || url.hostname !== "video.twimg.com")
+		return null;
 	const mediaKey = basenameKey(url);
 	return {
 		kind,
@@ -273,7 +298,11 @@ function collect(options: MediaFetchOptions, dir: string) {
 	return { candidates, skipped_cached, would_fetch };
 }
 
-function fail(item: Candidate, reason: string, rateLimited = false): FetchOneResult {
+function fail(
+	item: Candidate,
+	reason: string,
+	rateLimited = false,
+): FetchOneResult {
 	return {
 		fetched: 0,
 		bytes: 0,
@@ -316,18 +345,29 @@ function contentLength(response: Response) {
 }
 
 function contentRangeTotal(response: Response) {
-	const total = /\/(\d+)\s*$/.exec(response.headers.get("content-range") ?? "")?.[1];
+	const total = /\/(\d+)\s*$/.exec(
+		response.headers.get("content-range") ?? "",
+	)?.[1];
 	return total ? Number(total) : null;
 }
 
-async function writeResponseBody(response: Response, tmpPath: string, append: boolean) {
+async function writeResponseBody(
+	response: Response,
+	tmpPath: string,
+	append: boolean,
+) {
 	if (!response.body) throw new Error("missing response body");
 	let bytes = 0;
-	const stream = Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]);
+	const stream = Readable.fromWeb(
+		response.body as Parameters<typeof Readable.fromWeb>[0],
+	);
 	stream.on("data", (chunk: Buffer) => {
 		bytes += chunk.byteLength;
 	});
-	await pipeline(stream, createWriteStream(tmpPath, { flags: append ? "a" : "w" }));
+	await pipeline(
+		stream,
+		createWriteStream(tmpPath, { flags: append ? "a" : "w" }),
+	);
 	return bytes;
 }
 
@@ -359,7 +399,11 @@ async function fetchOne({
 				},
 			});
 		} catch (error) {
-			return fail(item, error instanceof Error ? error.message : String(error), rateLimited);
+			return fail(
+				item,
+				error instanceof Error ? error.message : String(error),
+				rateLimited,
+			);
 		}
 		if (response.status === 429) {
 			rateLimited = true;
@@ -374,7 +418,9 @@ async function fetchOne({
 		}
 
 		const expectedTotal =
-			contentRangeTotal(response) ?? (contentLength(response) ?? 0) + (response.status === 206 ? partialBytes : 0);
+			contentRangeTotal(response) ??
+			(contentLength(response) ?? 0) +
+				(response.status === 206 ? partialBytes : 0);
 		if (expectedTotal > maxBytes) return fail(item, "max-bytes");
 
 		const append = partialBytes > 0 && response.status === 206;
@@ -420,9 +466,8 @@ async function runGroup(
 			for (;;) {
 				const item = items[next++];
 				if (!item) return;
-				const waitMs = lastStart !== null
-					? Math.max(0, lastStart + pacingMs - now())
-					: 0;
+				const waitMs =
+					lastStart !== null ? Math.max(0, lastStart + pacingMs - now()) : 0;
 				if (waitMs > 0) await sleep(waitMs);
 				lastStart = now();
 				await worker(item);
@@ -439,8 +484,14 @@ export async function fetchTweetMedia(options: MediaFetchOptions = {}) {
 	const retryMax = Math.max(0, Math.floor(options.retryMax ?? 3));
 	const parallel = Math.min(5, Math.max(1, Math.floor(options.parallel ?? 1)));
 	const pacingMs = Math.max(0, Math.floor(options.pacingMs ?? 250));
-	const videoPacingMs = Math.max(0, Math.floor(options.videoPacingMs ?? pacingMs));
-	const maxBytes = Math.max(0, Math.floor(options.maxBytes ?? DEFAULT_MAX_BYTES));
+	const videoPacingMs = Math.max(
+		0,
+		Math.floor(options.videoPacingMs ?? pacingMs),
+	);
+	const maxBytes = Math.max(
+		0,
+		Math.floor(options.maxBytes ?? DEFAULT_MAX_BYTES),
+	);
 	const userAgent =
 		options.userAgent ??
 		`birdclaw/${packageVersion ?? "0.0.0"} (https://github.com/steipete/birdclaw)`;

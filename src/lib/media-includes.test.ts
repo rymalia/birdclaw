@@ -17,16 +17,29 @@ const video: XurlMediaItem = {
 	preview_image_url: "https://pbs.twimg.com/ext_tw_video_thumb/v.jpg",
 	duration_ms: 46947,
 	variants: [
-		{ url: "https://video.twimg.com/low.mp4", content_type: "video/mp4", bit_rate: 832000 },
-		{ url: "https://video.twimg.com/high.mp4", content_type: "video/mp4", bit_rate: 2176000 },
-		{ url: "https://video.twimg.com/playlist.m3u8", content_type: "application/x-mpegURL" },
+		{
+			url: "https://video.twimg.com/low.mp4",
+			content_type: "video/mp4",
+			bit_rate: 832000,
+		},
+		{
+			url: "https://video.twimg.com/high.mp4",
+			content_type: "video/mp4",
+			bit_rate: 2176000,
+		},
+		{
+			url: "https://video.twimg.com/playlist.m3u8",
+			content_type: "application/x-mpegURL",
+		},
 	],
 };
 const gif: XurlMediaItem = {
 	media_key: "gif_1",
 	type: "animated_gif",
 	preview_image_url: "https://pbs.twimg.com/tweet_video_thumb/g.jpg",
-	variants: [{ url: "https://video.twimg.com/gif.mp4", content_type: "video/mp4" }],
+	variants: [
+		{ url: "https://video.twimg.com/gif.mp4", content_type: "video/mp4" },
+	],
 };
 
 function media(keys: string[], includes: XurlMediaItem[]) {

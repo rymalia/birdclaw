@@ -23,7 +23,11 @@ function home() {
 	return dir;
 }
 
-function insertTweet(id: string, media: unknown[], createdAt = "2026-05-01T12:00:00.000Z") {
+function insertTweet(
+	id: string,
+	media: unknown[],
+	createdAt = "2026-05-01T12:00:00.000Z",
+) {
 	getNativeDb({ seedDemoData: false })
 		.prepare(
 			`
@@ -41,7 +45,12 @@ function pbs(name: string) {
 	return { url: `https://pbs.twimg.com/media/${name}.jpg`, type: "image" };
 }
 
-function archiveTweetFile(root: string, tweetId: string, basename: string, ext = ".jpg") {
+function archiveTweetFile(
+	root: string,
+	tweetId: string,
+	basename: string,
+	ext = ".jpg",
+) {
 	return path.join(
 		root,
 		"media",
@@ -82,7 +91,10 @@ describe("media fetch", () => {
 			throw new Error("must not fetch");
 		});
 
-		const result = await fetchTweetMedia({ dryRun: true, fetchImpl: fetchMock });
+		const result = await fetchTweetMedia({
+			dryRun: true,
+			fetchImpl: fetchMock,
+		});
 
 		expect(result).toMatchObject({
 			fetched: 0,
@@ -96,7 +108,9 @@ describe("media fetch", () => {
 			],
 		});
 		expect(fetchMock).not.toHaveBeenCalled();
-		expect(existsSync(path.join(root, "media", "originals", "demo.jpg"))).toBe(false);
+		expect(existsSync(path.join(root, "media", "originals", "demo.jpg"))).toBe(
+			false,
+		);
 	});
 
 	it("skips existing files by media key", async () => {
@@ -107,7 +121,9 @@ describe("media fetch", () => {
 		insertTweet("tweet_1", [pbs("demo")]);
 		const fetchMock = vi.fn();
 
-		await expect(fetchTweetMedia({ fetchImpl: fetchMock })).resolves.toMatchObject({
+		await expect(
+			fetchTweetMedia({ fetchImpl: fetchMock }),
+		).resolves.toMatchObject({
 			fetched: 0,
 			skipped_cached: 1,
 		});
@@ -133,9 +149,9 @@ describe("media fetch", () => {
 			bytes: 3,
 		});
 		expect(fetchMock).not.toHaveBeenCalled();
-		expect(readFileSync(path.join(root, "media", "originals", "demo.jpg"))).toEqual(
-			Buffer.from([9, 8, 7]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "demo.jpg")),
+		).toEqual(Buffer.from([9, 8, 7]));
 	});
 
 	it("falls through to HTTP when archive bytes are missing", async () => {
@@ -151,9 +167,9 @@ describe("media fetch", () => {
 			bytes: 2,
 		});
 		expect(fetchMock).toHaveBeenCalledTimes(1);
-		expect(readFileSync(path.join(root, "media", "originals", "demo.jpg"))).toEqual(
-			Buffer.from([1, 2]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "demo.jpg")),
+		).toEqual(Buffer.from([1, 2]));
 	});
 
 	it("ignores stale archive bytes with a different basename", async () => {
@@ -169,9 +185,9 @@ describe("media fetch", () => {
 		expect(result.reused_from_archive).toBe(0);
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(readFileSync(archiveFile, "utf8")).toBe("stale");
-		expect(readFileSync(path.join(root, "media", "originals", "demo.jpg"))).toEqual(
-			Buffer.from([3]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "demo.jpg")),
+		).toEqual(Buffer.from([3]));
 	});
 
 	it("keeps reruns idempotent after archive reuse", async () => {
@@ -195,9 +211,9 @@ describe("media fetch", () => {
 			skipped_cached: 1,
 		});
 		expect(fetchMock).not.toHaveBeenCalled();
-		expect(readFileSync(path.join(root, "media", "originals", "demo.jpg"))).toEqual(
-			Buffer.from([4, 5]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "demo.jpg")),
+		).toEqual(Buffer.from([4, 5]));
 	});
 
 	it("backs off and retries once after 429", async () => {
@@ -233,9 +249,9 @@ describe("media fetch", () => {
 		});
 		expect(sleeps).toEqual([1000]);
 		expect(fetchMock).toHaveBeenCalledTimes(2);
-		expect(readFileSync(path.join(root, "media", "originals", "demo.jpg"))).toEqual(
-			Buffer.from([1, 2, 3]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "demo.jpg")),
+		).toEqual(Buffer.from([1, 2, 3]));
 	});
 
 	it("records a failure when retry-max is exhausted", async () => {
@@ -294,7 +310,10 @@ describe("media fetch", () => {
 			{
 				type: "video",
 				variants: [
-					{ url: "https://video.twimg.com/hls.m3u8", content_type: "application/x-mpegURL" },
+					{
+						url: "https://video.twimg.com/hls.m3u8",
+						content_type: "application/x-mpegURL",
+					},
 					mp4("low", 256000),
 					mp4("high", 2176000),
 				],
@@ -316,7 +335,9 @@ describe("media fetch", () => {
 
 	it("handles animated gifs as mp4 downloads", async () => {
 		const root = home();
-		insertTweet("tweet_1", [{ type: "animated_gif", variants: [mp4("gif", 0)] }]);
+		insertTweet("tweet_1", [
+			{ type: "animated_gif", variants: [mp4("gif", 0)] },
+		]);
 
 		const result = await fetchTweetMedia({
 			fetchImpl: async () => new Response(new Uint8Array([7, 8])),
@@ -324,9 +345,9 @@ describe("media fetch", () => {
 		});
 
 		expect(result).toMatchObject({ fetched: 1, gifs_fetched: 1, gif_bytes: 2 });
-		expect(readFileSync(path.join(root, "media", "originals", "gif.mp4"))).toEqual(
-			Buffer.from([7, 8]),
-		);
+		expect(
+			readFileSync(path.join(root, "media", "originals", "gif.mp4")),
+		).toEqual(Buffer.from([7, 8]));
 	});
 
 	it("skips HLS-only media instead of attempting manifests", async () => {
@@ -335,13 +356,18 @@ describe("media fetch", () => {
 			{
 				type: "video",
 				variants: [
-					{ url: "https://video.twimg.com/hls.m3u8", content_type: "application/x-mpegURL" },
+					{
+						url: "https://video.twimg.com/hls.m3u8",
+						content_type: "application/x-mpegURL",
+					},
 				],
 			},
 		]);
 		const fetchMock = vi.fn();
 
-		await expect(fetchTweetMedia({ fetchImpl: fetchMock })).resolves.toMatchObject({
+		await expect(
+			fetchTweetMedia({ fetchImpl: fetchMock }),
+		).resolves.toMatchObject({
 			fetched: 0,
 			failed: 0,
 		});
@@ -389,7 +415,10 @@ describe("media fetch", () => {
 
 		await fetchTweetMedia({ fetchImpl: fetchMock, pacingMs: 0 });
 
-		const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+		const [, init] = fetchMock.mock.calls[0] as unknown as [
+			string,
+			RequestInit,
+		];
 		expect(init.headers).toMatchObject({ range: "bytes=3-" });
 		expect(readFileSync(path.join(mediaDir, "resume.mp4"))).toEqual(
 			Buffer.from([1, 2, 3, 4, 5, 6]),
@@ -416,5 +445,4 @@ describe("media fetch", () => {
 
 		expect(sleeps).toEqual([40]);
 	});
-
 });

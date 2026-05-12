@@ -36,7 +36,9 @@ function localType(media: XurlMediaItem): TweetMediaItem["type"] {
 	return media.type;
 }
 
-function mp4Variants(media: XurlMediaItem): NonNullable<TweetMediaItem["variants"]> {
+function mp4Variants(
+	media: XurlMediaItem,
+): NonNullable<TweetMediaItem["variants"]> {
 	return (media.variants ?? [])
 		.filter(
 			(variant) =>
@@ -49,7 +51,9 @@ function mp4Variants(media: XurlMediaItem): NonNullable<TweetMediaItem["variants
 				? { bitRate: Number(variant.bit_rate) }
 				: {}),
 		}))
-		.sort((left, right) => Number(right.bitRate ?? 0) - Number(left.bitRate ?? 0));
+		.sort(
+			(left, right) => Number(right.bitRate ?? 0) - Number(left.bitRate ?? 0),
+		);
 }
 
 export function buildMediaJsonFromIncludes(
