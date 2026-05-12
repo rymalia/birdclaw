@@ -226,9 +226,23 @@ async function runShortcut(
 	}
 }
 
-async function runJsonCommand(args: string[], attempt = 0) {
+async function runJsonCommand(
+	args: string[],
+	{ timeoutMs }: { timeoutMs?: number } = {},
+	attempt = 0,
+) {
+	const controller =
+		typeof timeoutMs === "number" && Number.isFinite(timeoutMs) && timeoutMs > 0
+			? new AbortController()
+			: undefined;
+	const timeout = controller
+		? setTimeout(() => controller.abort(), timeoutMs)
+		: undefined;
+
 	try {
-		const { stdout } = await execFileAsync("xurl", args);
+		const { stdout } = controller
+			? await execFileAsync("xurl", args, { signal: controller.signal })
+			: await execFileAsync("xurl", args);
 		return JSON.parse(stdout) as Record<string, unknown>;
 	} catch (error) {
 		const retryDelayMs = getRetryDelayMs(error, attempt);
@@ -237,7 +251,11 @@ async function runJsonCommand(args: string[], attempt = 0) {
 		}
 
 		await sleep(retryDelayMs);
-		return runJsonCommand(args, attempt + 1);
+		return runJsonCommand(args, { timeoutMs }, attempt + 1);
+	} finally {
+		if (timeout) {
+			clearTimeout(timeout);
+		}
 	}
 }
 
@@ -636,9 +654,11 @@ export async function searchRecentByConversationId(
 	{
 		maxResults,
 		paginationToken,
+		timeoutMs,
 	}: {
 		maxResults: number;
 		paginationToken?: string;
+		timeoutMs?: number;
 	},
 ): Promise<XurlTweetsResponse> {
 	const query = new URLSearchParams({
@@ -652,9 +672,10 @@ export async function searchRecentByConversationId(
 		query.set("pagination_token", paginationToken);
 	}
 
-	const payload = await runJsonCommand([
-		`/2/tweets/search/recent?${query.toString()}`,
-	]);
+	const payload = await runJsonCommand(
+		[`/2/tweets/search/recent?${query.toString()}`],
+		{ timeoutMs },
+	);
 	return {
 		data: Array.isArray(payload.data)
 			? (payload.data as XurlTweetsResponse["data"])
@@ -670,14 +691,22 @@ export async function searchRecentByConversationId(
 	};
 }
 
-export async function getTweetById(id: string): Promise<XurlTweetsResponse> {
+export async function getTweetById(
+	id: string,
+	{ timeoutMs }: { timeoutMs?: number } = {},
+): Promise<XurlTweetsResponse> {
 	const query = new URLSearchParams({
 		expansions: "author_id",
 		"tweet.fields": THREAD_TWEET_FIELDS,
 		"user.fields": RICH_USER_FIELDS,
 	});
 
-	const payload = await runJsonCommand([`/2/tweets/${id}?${query.toString()}`]);
+	const payload = await runJsonCommand(
+		[`/2/tweets/${id}?${query.toString()}`],
+		{
+			timeoutMs,
+		},
+	);
 	const data =
 		payload.data &&
 		typeof payload.data === "object" &&

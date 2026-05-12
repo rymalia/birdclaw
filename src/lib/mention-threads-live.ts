@@ -321,10 +321,12 @@ async function fetchConversationViaRecentSearch({
 	conversationId,
 	all,
 	maxPages,
+	timeoutMs,
 }: {
 	conversationId: string;
 	all: boolean;
 	maxPages?: number;
+	timeoutMs: number;
 }) {
 	const pages: XurlTweetsResponse[] = [];
 	let nextToken: string | undefined;
@@ -334,6 +336,7 @@ async function fetchConversationViaRecentSearch({
 		const payload = await searchRecentByConversationId(conversationId, {
 			maxResults: MAX_XURL_SEARCH_RESULTS,
 			paginationToken: nextToken,
+			timeoutMs,
 		});
 		pages.push(payload);
 		nextToken =
@@ -342,7 +345,7 @@ async function fetchConversationViaRecentSearch({
 				: undefined;
 		pageCount += 1;
 	} while (
-		all &&
+		(all || maxPages !== undefined) &&
 		nextToken &&
 		(maxPages === undefined || pageCount < maxPages)
 	);
@@ -359,9 +362,11 @@ async function fetchConversationViaRecentSearch({
 async function fetchParentChainViaXurl({
 	mention,
 	maxDepth,
+	timeoutMs,
 }: {
 	mention: LocalMention;
 	maxDepth: number;
+	timeoutMs: number;
 }) {
 	const pages: XurlTweetsResponse[] = [];
 	const warnings: string[] = [];
@@ -377,7 +382,7 @@ async function fetchParentChainViaXurl({
 	let shouldUseRawAnchor = Boolean(rawAnchorPayload);
 
 	if (!nextParentId) {
-		const anchorPayload = await getTweetById(mention.id);
+		const anchorPayload = await getTweetById(mention.id, { timeoutMs });
 		pages.push(anchorPayload);
 		generalReadTweets += anchorPayload.data.length;
 		const anchorTweet = anchorPayload.data[0];
@@ -409,7 +414,7 @@ async function fetchParentChainViaXurl({
 		}
 
 		fallbackDepth += 1;
-		const parentPayload = await getTweetById(nextParentId);
+		const parentPayload = await getTweetById(nextParentId, { timeoutMs });
 		pages.push(parentPayload);
 		generalReadTweets += parentPayload.data.length;
 		const parentTweet = parentPayload.data[0];
@@ -472,17 +477,20 @@ async function fetchThreadContextViaXurl({
 	all,
 	maxPages,
 	maxFallbackDepth,
+	timeoutMs,
 }: {
 	mention: LocalMention;
 	all: boolean;
 	maxPages?: number;
 	maxFallbackDepth: number;
+	timeoutMs: number;
 }) {
 	if (!mention.conversationId) {
 		if (mention.replyToId) {
 			const fallback = await fetchParentChainViaXurl({
 				mention,
 				maxDepth: maxFallbackDepth,
+				timeoutMs,
 			});
 			return {
 				strategy: "parent_walk" as const,
@@ -512,6 +520,7 @@ async function fetchThreadContextViaXurl({
 		conversationId: mention.conversationId,
 		all,
 		maxPages,
+		timeoutMs,
 	});
 	if (search.payload.data.length > 0) {
 		const missingAncestorId = findMissingAncestorId(mention, search.payload);
@@ -519,6 +528,7 @@ async function fetchThreadContextViaXurl({
 			const fallback = await fetchParentChainViaXurl({
 				mention,
 				maxDepth: maxFallbackDepth,
+				timeoutMs,
 			});
 			return {
 				strategy: "conversation_search+parent_walk" as const,
@@ -545,6 +555,7 @@ async function fetchThreadContextViaXurl({
 	const fallback = await fetchParentChainViaXurl({
 		mention,
 		maxDepth: maxFallbackDepth,
+		timeoutMs,
 	});
 	return {
 		strategy: "parent_walk" as const,
@@ -634,6 +645,7 @@ export async function syncMentionThreads({
 							all,
 							maxPages: parsedMaxPages,
 							maxFallbackDepth: DEFAULT_FALLBACK_DEPTH,
+							timeoutMs: parsedTimeoutMs,
 						});
 			const { payload } = fetchResult;
 			mergeMentionThreadIntoLocalStore({

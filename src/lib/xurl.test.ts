@@ -392,6 +392,46 @@ describe("xurl transport wrapper", () => {
 		]);
 	});
 
+	it("aborts thread lookups when a timeout is provided", async () => {
+		vi.useFakeTimers();
+		try {
+			execFileAsyncMock.mockImplementation(
+				(
+					_command: string,
+					_args: string[],
+					options?: { signal?: AbortSignal },
+				) =>
+					new Promise((_resolve, reject) => {
+						options?.signal?.addEventListener("abort", () => {
+							reject(new Error("aborted"));
+						});
+					}),
+			);
+			const { getTweetById } = await import("./xurl");
+
+			let rejected: unknown;
+			const result = getTweetById("tweet_1", { timeoutMs: 1000 }).catch(
+				(error: unknown) => {
+					rejected = error;
+				},
+			);
+			await vi.advanceTimersByTimeAsync(1000);
+
+			await result;
+			expect(rejected).toEqual(expect.any(Error));
+			expect(String((rejected as Error).message)).toContain("aborted");
+			expect(execFileAsyncMock).toHaveBeenCalledWith(
+				"xurl",
+				[
+					`/2/tweets/tweet_1?expansions=author_id&tweet.fields=created_at%2Cconversation_id%2Centities%2Cpublic_metrics%2Creferenced_tweets%2Cin_reply_to_user_id&user.fields=${RICH_USER_FIELDS}`,
+				],
+				expect.objectContaining({ signal: expect.any(Object) }),
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("lists liked and bookmarked tweets through raw Twitter endpoints", async () => {
 		execFileAsyncMock
 			.mockResolvedValueOnce({
