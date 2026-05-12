@@ -139,6 +139,57 @@ describe("mention thread sync", () => {
 		expect(sideReply).toEqual({ kind: "thread", reply_to_id: "root_1" });
 	});
 
+	it("persists thread video variants in media_json", async () => {
+		setupTempHome();
+		mocks.listThreadViaBird.mockResolvedValue({
+			data: [
+				{
+					id: "mention_1",
+					author_id: "42",
+					text: "mention text",
+					created_at: "2026-05-04T07:00:00.000Z",
+					conversation_id: "mention_1",
+					attachments: { media_keys: ["video_1"] },
+				},
+			],
+			includes: {
+				users: [{ id: "42", username: "sam", name: "Sam" }],
+				media: [
+					{
+						media_key: "video_1",
+						type: "video",
+						preview_image_url:
+							"https://pbs.twimg.com/ext_tw_video_thumb/video_1.jpg",
+						duration_ms: 46947,
+						variants: [
+							{
+								url: "https://video.twimg.com/ext_tw_video/high.mp4",
+								content_type: "video/mp4",
+								bit_rate: 2176000,
+							},
+						],
+					},
+				],
+			},
+			meta: { result_count: 1 },
+		});
+		const { syncMentionThreads } = await import("./mention-threads-live");
+
+		await syncMentionThreads({ limit: 1, delayMs: 0, timeoutMs: 5000 });
+		const row = getNativeDb()
+			.prepare("select media_count, media_json from tweets where id = ?")
+			.get("mention_1") as { media_count: number; media_json: string };
+
+		expect(row.media_count).toBe(1);
+		expect(JSON.parse(row.media_json)).toMatchObject([
+			{
+				type: "video",
+				durationMs: 46947,
+				variants: [{ bitRate: 2176000 }],
+			},
+		]);
+	});
+
 	it("records failed thread fetches without failing the sync", async () => {
 		setupTempHome();
 		mocks.listThreadViaBird.mockRejectedValue(new Error("rate limited"));

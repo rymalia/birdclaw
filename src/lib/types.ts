@@ -111,6 +111,12 @@ export interface TweetMediaItem {
 	width?: number;
 	height?: number;
 	thumbnailUrl?: string;
+	durationMs?: number;
+	variants?: Array<{
+		url: string;
+		contentType?: string;
+		bitRate?: number;
+	}>;
 }
 
 export interface EmbeddedTweet {
@@ -479,6 +485,7 @@ export interface XurlMentionData {
 	text: string;
 	created_at: string;
 	conversation_id?: string;
+	attachments?: { media_keys?: string[] };
 	entities?: Record<string, unknown>;
 	referenced_tweets?: XurlReferencedTweet[];
 	public_metrics?: XurlPublicMetrics;
@@ -495,6 +502,7 @@ export interface XurlUserTweet {
 	text: string;
 	created_at: string;
 	conversation_id?: string;
+	attachments?: { media_keys?: string[] };
 	referenced_tweets?: XurlReferencedTweet[];
 	public_metrics?: XurlPublicMetrics;
 	edit_history_tweet_ids?: string[];
@@ -506,10 +514,28 @@ export interface XurlTweetData {
 	text: string;
 	created_at: string;
 	conversation_id?: string;
+	attachments?: { media_keys?: string[] };
 	entities?: Record<string, unknown>;
 	referenced_tweets?: XurlReferencedTweet[];
 	public_metrics?: XurlPublicMetrics;
 	edit_history_tweet_ids?: string[];
+}
+
+export interface XurlMediaItem {
+	media_key: string;
+	type: "photo" | "video" | "animated_gif";
+	url?: string;
+	preview_image_url?: string;
+	duration_ms?: number;
+	width?: number;
+	height?: number;
+	alt_text?: string;
+	public_metrics?: XurlPublicMetrics;
+	variants?: Array<{
+		url: string;
+		content_type: string;
+		bit_rate?: number;
+	}>;
 }
 
 export interface ProfileReplyItem {
@@ -541,6 +567,7 @@ export interface XurlMentionsResponse {
 	data: XurlMentionData[];
 	includes?: {
 		users?: XurlMentionUser[];
+		media?: XurlMediaItem[];
 	};
 	meta?: Record<string, unknown>;
 }
@@ -549,6 +576,7 @@ export interface XurlTweetsResponse {
 	data: XurlTweetData[];
 	includes?: {
 		users?: XurlMentionUser[];
+		media?: XurlMediaItem[];
 	};
 	meta?: Record<string, unknown>;
 }

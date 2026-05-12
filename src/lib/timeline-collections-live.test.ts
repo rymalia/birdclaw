@@ -107,6 +107,62 @@ describe("live timeline collection sync", () => {
 		});
 	});
 
+	it("persists xurl video variants in media_json", async () => {
+		setupTempHome();
+		mocks.listLikedTweetsViaXurl.mockResolvedValue({
+			data: [
+				{
+					id: "liked_video_1",
+					author_id: "42",
+					text: "video item",
+					created_at: "2026-04-26T13:43:34.000Z",
+					attachments: { media_keys: ["video_1"] },
+				},
+			],
+			includes: {
+				users: [{ id: "42", username: "sam", name: "Sam" }],
+				media: [
+					{
+						media_key: "video_1",
+						type: "video",
+						preview_image_url:
+							"https://pbs.twimg.com/ext_tw_video_thumb/video_1.jpg",
+						duration_ms: 46947,
+						variants: [
+							{
+								url: "https://video.twimg.com/ext_tw_video/high.mp4",
+								content_type: "video/mp4",
+								bit_rate: 2176000,
+							},
+						],
+					},
+				],
+			},
+			meta: { result_count: 1 },
+		});
+		const { syncTimelineCollection } =
+			await import("./timeline-collections-live");
+
+		await syncTimelineCollection({
+			kind: "likes",
+			mode: "xurl",
+			limit: 5,
+			refresh: true,
+		});
+		const row = getNativeDb()
+			.prepare("select media_count, media_json from tweets where id = ?")
+			.get("liked_video_1") as { media_count: number; media_json: string };
+
+		expect(row.media_count).toBe(1);
+		expect(JSON.parse(row.media_json)).toMatchObject([
+			{
+				type: "video",
+				durationMs: 46947,
+				variants: [{ bitRate: 2176000 }],
+			},
+		]);
+	});
+
 	it("paginates xurl collections and deduplicates tweets and users", async () => {
 		setupTempHome();
 		const db = getNativeDb();

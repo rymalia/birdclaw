@@ -14,6 +14,10 @@ const execFileAsync = promisify(execFile);
 const TRANSPORT_STATUS_TTL_MS = 5 * 60_000;
 const AUTHENTICATED_USER_TTL_MS = 60_000;
 const JSON_RETRY_LIMIT = 6;
+const MEDIA_EXPANSION = "attachments.media_keys";
+const AUTHOR_MEDIA_EXPANSIONS = `author_id,${MEDIA_EXPANSION}`;
+const MEDIA_FIELDS =
+	"variants,preview_image_url,duration_ms,alt_text,type,width,height,public_metrics";
 
 let transportStatusCache:
 	| {
@@ -356,8 +360,9 @@ export async function listMentionsViaXurl({
 
 	const query = new URLSearchParams({
 		max_results: String(maxResults),
-		expansions: "author_id",
+		expansions: AUTHOR_MEDIA_EXPANSIONS,
 		"tweet.fields": "created_at,conversation_id,entities,public_metrics",
+		"media.fields": MEDIA_FIELDS,
 		"user.fields":
 			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
 	});
@@ -415,9 +420,10 @@ async function listTimelineCollectionViaXurl({
 
 	const query = new URLSearchParams({
 		max_results: String(maxResults),
-		expansions: "author_id",
+		expansions: AUTHOR_MEDIA_EXPANSIONS,
 		"tweet.fields":
 			"created_at,conversation_id,entities,public_metrics,referenced_tweets",
+		"media.fields": MEDIA_FIELDS,
 		"user.fields":
 			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
 	});
@@ -569,8 +575,10 @@ export async function listUserTweets(
 ) {
 	const query = new URLSearchParams({
 		max_results: String(maxResults),
+		expansions: MEDIA_EXPANSION,
 		"tweet.fields":
 			"created_at,conversation_id,public_metrics,referenced_tweets",
+		"media.fields": MEDIA_FIELDS,
 	});
 	if (excludeRetweets) {
 		query.set("exclude", "retweets");
@@ -587,11 +595,16 @@ export async function listUserTweets(
 		payload.meta && typeof payload.meta === "object"
 			? (payload.meta as Record<string, unknown>)
 			: null;
+	const includes =
+		payload.includes && typeof payload.includes === "object"
+			? (payload.includes as XurlMentionsResponse["includes"])
+			: undefined;
 
 	return {
 		items: data,
 		nextToken:
 			typeof meta?.next_token === "string" ? String(meta.next_token) : null,
+		...(includes ? { includes } : {}),
 	};
 }
 
@@ -604,9 +617,10 @@ export async function lookupTweetsByIds(
 
 	const query = new URLSearchParams({
 		ids: ids.join(","),
-		expansions: "author_id",
+		expansions: AUTHOR_MEDIA_EXPANSIONS,
 		"tweet.fields":
 			"created_at,conversation_id,entities,public_metrics,referenced_tweets",
+		"media.fields": MEDIA_FIELDS,
 		"user.fields":
 			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
 	});
