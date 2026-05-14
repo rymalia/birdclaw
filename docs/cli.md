@@ -219,6 +219,7 @@ birdclaw backup validate ~/Projects/birdclaw-store --json
 - import selected slices
 - stream bundled media files from `data/tweets_media/`, `data/direct_messages_media/`, `data/community_tweet_media/`, `data/deleted_tweets_media/`, `data/profile_media/`, `data/moments_tweets_media/`, and `data/direct_messages_group_media/` into `~/.birdclaw/media/originals/archive/<kind>/<id>/<filename>`
 - extract `extended_entities.media[].video_info.variants[]` onto each tweet media row for archive video and animated GIFs
+- parse `data/follower.js` and `data/following.js` into the local follow graph
 - idempotent
 
 Flags:
@@ -238,7 +239,7 @@ Default:
 - update canonical tables
 - refresh cursors
 - refresh FTS incrementally
-- `sync likes` and `sync bookmarks` use cached live transport; `auto` tries `xurl`, then `bird`
+- `sync likes` and `sync bookmarks` use cached live transport; `auto` tries `xurl`, then `bird`; `--early-stop` caps at 10 pages unless paired with `--all` or `--max-pages`
 - `sync timeline` stores the live home timeline through `bird`; it defaults to the chronological Following feed
 - `sync mention-threads` fetches conversation context for recent mentions through `bird thread`; use `--delay-ms` and `--timeout-ms` to stay gentle on live X
 - `sync followers` and `sync following` default to dry-run and require `--yes` for live sync or fresh-cache merge; `auto` prefers `bird`, then falls back to `xurl`
@@ -252,6 +253,7 @@ Common flags:
 - `--mode auto|xurl|bird`
 - `--all`
 - `--max-pages <n>`
+- `--early-stop` (on `sync likes` and `sync bookmarks`)
 - `--refresh`
 - `--cache-ttl <seconds>`
 
@@ -259,7 +261,9 @@ Examples:
 
 ```bash
 birdclaw sync likes --mode auto --limit 100 --refresh --json
+birdclaw sync likes --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
 birdclaw sync bookmarks --mode auto --limit 100 --refresh --json
+birdclaw sync bookmarks --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
 birdclaw sync bookmarks --mode bird --all --max-pages 5 --limit 100 --refresh --json
 birdclaw sync timeline --limit 100 --refresh --json
 birdclaw sync mention-threads --limit 30 --delay-ms 1500 --timeout-ms 15000 --json
