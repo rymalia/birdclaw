@@ -935,7 +935,7 @@ describe("cached live mentions", () => {
 		);
 	});
 
-	it("resumes partial mention syncs with cached pagination instead of advancing since_id", async () => {
+	it("resumes partial mention syncs and commits the page-one high-water", async () => {
 		makeTempHome();
 		clearLocalMentionRows();
 		insertLocalMentionBaseline({ tweetId: "100" });
@@ -973,6 +973,10 @@ describe("cached live mentions", () => {
 					},
 				],
 				meta: { result_count: 0 },
+			})
+			.mockResolvedValueOnce({
+				data: [],
+				meta: { result_count: 0 },
 			});
 		const { syncMentions } = await import("./mentions-live");
 
@@ -994,17 +998,24 @@ describe("cached live mentions", () => {
 		expect(firstRunRows.map((row) => row.id)).toEqual(["100", "200", "250"]);
 		expect(JSON.parse(cacheRow?.value_json ?? "{}")).toMatchObject({
 			meta: { next_token: "page-2" },
-			birdclaw: { boundary: { kind: "since", sinceId: "100" } },
+			birdclaw: {
+				boundary: { kind: "since", sinceId: "100" },
+				pendingNewestId: "250",
+			},
 		});
 		await syncMentions({ mode: "xurl" });
+		await syncMentions({ mode: "xurl", refresh: true });
 
-		expect(listMentionsViaXurlMock).toHaveBeenCalledTimes(2);
+		expect(listMentionsViaXurlMock).toHaveBeenCalledTimes(3);
 		expect(listMentionsViaXurlMock.mock.calls[0]?.[0]).toMatchObject({
 			sinceId: "100",
 		});
 		expect(listMentionsViaXurlMock.mock.calls[1]?.[0]).toMatchObject({
 			paginationToken: "page-2",
 			sinceId: "100",
+		});
+		expect(listMentionsViaXurlMock.mock.calls[2]?.[0]).toMatchObject({
+			sinceId: "250",
 		});
 		expect(
 			db.prepare("select kind from tweets where id = ?").get("180"),

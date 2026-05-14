@@ -35,6 +35,7 @@ interface MentionScanShape {
 interface MentionCursorValue extends XurlMentionsResponse {
 	birdclaw?: {
 		boundary?: MentionScanBoundary;
+		pendingNewestId?: string | null;
 	};
 }
 interface MentionHighWaterValue {
@@ -267,13 +268,22 @@ function parseCachedMentionBoundary(
 	return fallbackBoundary;
 }
 
-function addMentionCursorBoundary(
+function getCachedMentionPendingNewestId(
+	value: MentionCursorValue | XurlMentionsResponse | undefined,
+) {
+	const pendingNewestId = (value as MentionCursorValue | undefined)?.birdclaw
+		?.pendingNewestId;
+	return isNumericTweetId(pendingNewestId) ? pendingNewestId : undefined;
+}
+
+function addMentionCursorState(
 	payload: XurlMentionsResponse,
 	boundary: MentionScanBoundary,
+	pendingNewestId: string | undefined,
 ): MentionCursorValue {
 	return {
 		...payload,
-		birdclaw: { boundary },
+		birdclaw: { boundary, pendingNewestId: pendingNewestId ?? null },
 	};
 }
 
@@ -297,6 +307,7 @@ function readMentionCursor({
 			key: cursorKey,
 			token: currentToken,
 			boundary: parseCachedMentionBoundary(current.value, fallbackBoundary),
+			pendingNewestId: getCachedMentionPendingNewestId(current.value),
 			legacyKeys: [] as string[],
 		};
 	}
@@ -309,6 +320,7 @@ function readMentionCursor({
 				key: legacyKey,
 				token: legacyToken,
 				boundary: parseCachedMentionBoundary(legacy.value, fallbackBoundary),
+				pendingNewestId: getCachedMentionPendingNewestId(legacy.value),
 				legacyKeys: [legacyKey],
 			};
 		}
@@ -874,12 +886,13 @@ export async function syncMentions({
 		if (payloadPaginationToken) {
 			writeSyncCache(
 				cursorKey,
-				addMentionCursorBoundary(
+				addMentionCursorState(
 					payload,
 					getMentionRequestBoundary({
 						sinceId: resolvedSinceId,
 						startTime: resolvedStartTime,
 					}),
+					maxNumericTweetId(resolvedSinceId, getNewestMentionId(payload)),
 				),
 				db,
 			);
@@ -905,7 +918,11 @@ export async function syncMentions({
 					db,
 					parsedMode,
 					resolvedAccount.accountId,
-					maxNumericTweetId(resolvedSinceId, getNewestMentionId(payload)),
+					maxNumericTweetId(
+						resolvedSinceId,
+						cursor?.pendingNewestId,
+						getNewestMentionId(payload),
+					),
 				);
 			}
 		}
