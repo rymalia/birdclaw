@@ -167,6 +167,11 @@ Find and import an archive:
 birdclaw archive find --json
 birdclaw import archive --json
 birdclaw import archive ~/Downloads/twitter-archive-2025.zip --json
+```
+
+Optional profile hydration can improve bios, follower counts, and avatars, but it performs live X profile reads and can spend API credits on large archives:
+
+```bash
 birdclaw import hydrate-profiles --json
 ```
 

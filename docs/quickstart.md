@@ -37,10 +37,13 @@ birdclaw archive find --json
 birdclaw import archive --json
 # or with an explicit path:
 birdclaw import archive ~/Downloads/twitter-archive-2025.zip --json
-birdclaw import hydrate-profiles --json
 ```
 
-`hydrate-profiles` fills bios, follower counts, and avatars from live Twitter metadata using whichever transport is available.
+Optional profile hydration fills bios, follower counts, and avatars from live Twitter metadata using whichever transport is available. It can perform hundreds or thousands of live profile reads on large archives, so run it only when you are ready to spend those X API reads:
+
+```bash
+birdclaw import hydrate-profiles --json
+```
 
 Later, when you download a newer archive, you can refresh only one stale slice without wiping live-synced or local data:
 
