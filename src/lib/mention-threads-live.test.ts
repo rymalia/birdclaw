@@ -680,6 +680,93 @@ describe("mention thread sync", () => {
 		}
 	});
 
+	it("uses one xurl timeout budget across paginated thread requests", async () => {
+		vi.useFakeTimers();
+		try {
+			setupTempHome();
+			insertMention(
+				"mention_timeout_budget",
+				"timeout budget mention",
+				"2026-05-12T10:00:00.000Z",
+			);
+			upsertMentionEdge("mention_timeout_budget", {
+				id: "mention_timeout_budget",
+				author_id: "42",
+				text: "timeout budget mention",
+				created_at: "2026-05-12T10:00:00.000Z",
+				conversation_id: "root_timeout_budget",
+			});
+			mocks.searchRecentByConversationId.mockImplementation(
+				(
+					_conversationId: string,
+					options: { paginationToken?: string; timeoutMs: number },
+				) =>
+					new Promise((resolve, reject) => {
+						if (!options.paginationToken) {
+							setTimeout(
+								() =>
+									resolve({
+										data: [
+											{
+												id: "first_timeout_budget_page",
+												author_id: "42",
+												text: "first page",
+												created_at: "2026-05-12T10:00:00.000Z",
+												conversation_id: "root_timeout_budget",
+											},
+										],
+										meta: { next_token: "page-2" },
+									}),
+								700,
+							);
+							return;
+						}
+						setTimeout(
+							() =>
+								reject(
+									new Error(`timed out after ${String(options.timeoutMs)}`),
+								),
+							options.timeoutMs,
+						);
+					}),
+			);
+			const { syncMentionThreads } = await import("./mention-threads-live");
+
+			const resultPromise = syncMentionThreads({
+				mode: "xurl",
+				limit: 1,
+				delayMs: 0,
+				timeoutMs: 1000,
+				maxPages: 2,
+			});
+			await vi.advanceTimersByTimeAsync(700);
+			await vi.advanceTimersByTimeAsync(300);
+			const result = await resultPromise;
+
+			expect(mocks.searchRecentByConversationId).toHaveBeenNthCalledWith(
+				1,
+				"root_timeout_budget",
+				{ maxResults: 100, paginationToken: undefined, timeoutMs: 1000 },
+			);
+			expect(mocks.searchRecentByConversationId).toHaveBeenNthCalledWith(
+				2,
+				"root_timeout_budget",
+				{ maxResults: 100, paginationToken: "page-2", timeoutMs: 300 },
+			);
+			expect(result).toMatchObject({
+				failed: 1,
+				failures: [
+					expect.objectContaining({
+						tweetId: "mention_timeout_budget",
+						error: "timed out after 300",
+					}),
+				],
+			});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("walks parents when xurl search results omit ancestors", async () => {
 		setupTempHome();
 		insertMention(

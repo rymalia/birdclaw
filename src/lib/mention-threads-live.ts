@@ -56,6 +56,19 @@ function sleep(ms: number) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function getRemainingThreadTimeoutMs(
+	deadlineMs: number,
+	originalTimeoutMs: number,
+) {
+	const remainingMs = deadlineMs - Date.now();
+	if (remainingMs <= 0) {
+		throw new Error(
+			`xurl thread timed out after ${String(originalTimeoutMs)}ms`,
+		);
+	}
+	return remainingMs;
+}
+
 function getMediaCount(tweet: XurlMentionData) {
 	const urls = Array.isArray(tweet.entities?.urls) ? tweet.entities.urls : [];
 	return urls.filter(
@@ -325,11 +338,13 @@ async function fetchConversationViaRecentSearch({
 	all,
 	maxPages,
 	timeoutMs,
+	deadlineMs,
 }: {
 	conversationId: string;
 	all: boolean;
 	maxPages?: number;
 	timeoutMs: number;
+	deadlineMs: number;
 }) {
 	const pages: XurlTweetsResponse[] = [];
 	let nextToken: string | undefined;
@@ -339,7 +354,7 @@ async function fetchConversationViaRecentSearch({
 		const payload = await searchRecentByConversationId(conversationId, {
 			maxResults: MAX_XURL_SEARCH_RESULTS,
 			paginationToken: nextToken,
-			timeoutMs,
+			timeoutMs: getRemainingThreadTimeoutMs(deadlineMs, timeoutMs),
 		});
 		pages.push(payload);
 		nextToken =
@@ -367,10 +382,12 @@ async function fetchParentChainViaXurl({
 	mention,
 	maxDepth,
 	timeoutMs,
+	deadlineMs,
 }: {
 	mention: LocalMention;
 	maxDepth: number;
 	timeoutMs: number;
+	deadlineMs: number;
 }) {
 	const pages: XurlTweetsResponse[] = [];
 	const warnings: string[] = [];
@@ -386,7 +403,9 @@ async function fetchParentChainViaXurl({
 	let shouldUseRawAnchor = Boolean(rawAnchorPayload);
 
 	if (!nextParentId) {
-		const anchorPayload = await getTweetById(mention.id, { timeoutMs });
+		const anchorPayload = await getTweetById(mention.id, {
+			timeoutMs: getRemainingThreadTimeoutMs(deadlineMs, timeoutMs),
+		});
 		pages.push(anchorPayload);
 		generalReadTweets += anchorPayload.data.length;
 		const anchorTweet = anchorPayload.data[0];
@@ -418,7 +437,9 @@ async function fetchParentChainViaXurl({
 		}
 
 		fallbackDepth += 1;
-		const parentPayload = await getTweetById(nextParentId, { timeoutMs });
+		const parentPayload = await getTweetById(nextParentId, {
+			timeoutMs: getRemainingThreadTimeoutMs(deadlineMs, timeoutMs),
+		});
 		pages.push(parentPayload);
 		generalReadTweets += parentPayload.data.length;
 		const parentTweet = parentPayload.data[0];
@@ -489,12 +510,14 @@ async function fetchThreadContextViaXurl({
 	maxFallbackDepth: number;
 	timeoutMs: number;
 }) {
+	const deadlineMs = Date.now() + timeoutMs;
 	if (!mention.conversationId) {
 		if (mention.replyToId) {
 			const fallback = await fetchParentChainViaXurl({
 				mention,
 				maxDepth: maxFallbackDepth,
 				timeoutMs,
+				deadlineMs,
 			});
 			return {
 				strategy: "parent_walk" as const,
@@ -525,6 +548,7 @@ async function fetchThreadContextViaXurl({
 		all,
 		maxPages,
 		timeoutMs,
+		deadlineMs,
 	});
 	if (search.payload.data.length > 0) {
 		const missingAncestorId = findMissingAncestorId(mention, search.payload);
@@ -533,6 +557,7 @@ async function fetchThreadContextViaXurl({
 				mention,
 				maxDepth: maxFallbackDepth,
 				timeoutMs,
+				deadlineMs,
 			});
 			return {
 				strategy: "conversation_search+parent_walk" as const,
@@ -560,6 +585,7 @@ async function fetchThreadContextViaXurl({
 		mention,
 		maxDepth: maxFallbackDepth,
 		timeoutMs,
+		deadlineMs,
 	});
 	return {
 		strategy: "parent_walk" as const,
