@@ -333,9 +333,19 @@ test("adds and removes a local blocklist entry", async ({ page }) => {
 test("switches theme and keeps it after reload", async ({ page }) => {
 	await page.goto("/");
 
-	const darkButton = page.getByRole("button", { name: "Dark theme" });
-	await expect(darkButton).toBeEnabled();
-	await darkButton.click();
+	const themeButton = page.getByTestId("theme-toggle");
+	await expect(
+		page.getByRole("button", {
+			name: "Theme: System default. Switch to Light theme.",
+		}),
+	).toBeEnabled();
+	await themeButton.click();
+	await expect(
+		page.getByRole("button", {
+			name: "Theme: Light theme. Switch to Dark theme.",
+		}),
+	).toBeEnabled();
+	await themeButton.click();
 	await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 	await expect(page.locator("html")).toHaveAttribute(
 		"data-theme-preference",

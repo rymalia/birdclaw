@@ -56,7 +56,7 @@ export function AppNav() {
 					<span className={sidebarBrandCopyClass}>
 						<span className={sidebarBrandTitleClass}>birdclaw</span>
 						<span className={sidebarBrandTaglineClass}>
-							Fast search for your archive.
+							Fast search for your Twitter archive.
 						</span>
 					</span>
 				</Link>
