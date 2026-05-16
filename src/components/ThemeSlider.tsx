@@ -45,7 +45,7 @@ export function ThemeSlider() {
 
 	return (
 		<div
-			className="theme-toggle-shell flex justify-center px-2 py-1 min-[1100px]:justify-start min-[1100px]:px-3"
+			className="theme-toggle-shell flex justify-center px-1 py-1 min-[1100px]:justify-start min-[1100px]:px-2"
 			title={`${activeOption.label}; click for ${nextOption.label}`}
 		>
 			<button

@@ -1,6 +1,6 @@
-import { render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThemeProvider } from "#/lib/theme";
 
 vi.mock("@tanstack/react-router", () => ({
@@ -27,10 +27,14 @@ vi.mock("@tanstack/react-router", () => ({
 }));
 
 vi.mock("./AccountSwitcher", () => ({
-	AccountSwitcher: () => null,
+	AccountSwitcher: () => <div data-testid="account-switcher" />,
 }));
 
 import { AppNav } from "./AppNav";
+
+afterEach(() => {
+	cleanup();
+});
 
 describe("AppNav", () => {
 	it("marks the active route", () => {
@@ -56,5 +60,23 @@ describe("AppNav", () => {
 				name: "Theme: System default. Switch to Light theme.",
 			}),
 		).toBeInTheDocument();
+	});
+
+	it("places the theme toggle above the bottom account picker", () => {
+		render(
+			<ThemeProvider>
+				<AppNav />
+			</ThemeProvider>,
+		);
+
+		const themeButton = screen.getByRole("button", {
+			name: "Theme: System default. Switch to Light theme.",
+		});
+		const accountSwitcher = screen.getByTestId("account-switcher");
+
+		expect(
+			themeButton.compareDocumentPosition(accountSwitcher) &
+				Node.DOCUMENT_POSITION_FOLLOWING,
+		).toBeTruthy();
 	});
 });
