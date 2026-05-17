@@ -2,7 +2,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { gzipSync } from "node:zlib";
+import { brotliCompressSync, deflateSync, gzipSync } from "node:zlib";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
@@ -64,6 +64,40 @@ describe("link preview metadata", () => {
 		expect(__test__.youtubeThumbnail("https://youtu.be/GMIWm5y90xA")).toBe(
 			"https://i.ytimg.com/vi/GMIWm5y90xA/hqdefault.jpg",
 		);
+		expect(
+			__test__.youtubeThumbnail("https://www.youtube.com/shorts/GMIWm5y90xA"),
+		).toBe("https://i.ytimg.com/vi/GMIWm5y90xA/hqdefault.jpg");
+		expect(
+			__test__.youtubeThumbnail(
+				"https://youtube-nocookie.com/embed/GMIWm5y90xA",
+			),
+		).toBe("https://i.ytimg.com/vi/GMIWm5y90xA/hqdefault.jpg");
+		expect(__test__.youtubeThumbnail("not a url")).toBeNull();
+		expect(__test__.youtubeThumbnail("https://youtu.be/no")).toBeNull();
+	});
+
+	it("handles metadata fallbacks, duplicates, and loose attributes", () => {
+		const metadata = extractLinkPreviewMetadata(
+			`
+      <head>
+        <meta name=description value='First &amp; best'>
+        <meta property="og:description" content="">
+        <meta property="og:description" content="OG description">
+        <meta property="og:description" content="Duplicate">
+        <meta property="application-name" content="App">
+        <meta property="twitter:image" content="::bad-url">
+      </head>
+      `,
+			"https://example.com/posts/1",
+		);
+
+		expect(metadata).toEqual({
+			url: "https://example.com/posts/1",
+			title: "example.com",
+			description: "OG description",
+			imageUrl: "https://example.com/posts/::bad-url",
+			siteName: "App",
+		});
 	});
 
 	it("keeps malformed numeric HTML entities as text", () => {
@@ -124,8 +158,48 @@ describe("link preview metadata", () => {
 		expect(__test__.isBlockedAddress("[::ffff:0:7f00:1]")).toBe(true);
 		expect(__test__.isBlockedAddress("[::7f00:1]")).toBe(true);
 		expect(__test__.isBlockedAddress("[64:ff9b::7f00:1]")).toBe(true);
+		expect(__test__.isBlockedAddress("[64:ff9b:1::7f00:1]")).toBe(true);
+		expect(__test__.isBlockedAddress("[2002:7f00:1::]")).toBe(true);
+		expect(__test__.isBlockedAddress("[fe80::1]")).toBe(true);
 		expect(__test__.isBlockedAddress("fec0::1")).toBe(true);
+		expect(__test__.isBlockedAddress("ff02::1")).toBe(true);
+		expect(__test__.isBlockedAddress("not-an-address")).toBe(false);
 		expect(__test__.isBlockedAddress("8.8.8.8")).toBe(false);
+	});
+
+	it("covers address parser edge cases used by preview host checks", () => {
+		expect(__test__.ipv4ToNumber("1.2.3")).toBeNull();
+		expect(__test__.ipv4ToNumber("1.2.3.x")).toBeNull();
+		expect(__test__.ipv4ToNumber("256.1.1.1")).toBeNull();
+		expect(__test__.isIpv4InRange("8.8.8.8", "0.0.0.0", 0)).toBe(true);
+		expect(__test__.isIpv4InRange("bad", "0.0.0.0", 0)).toBe(false);
+		expect(__test__.parseIpv6Parts("not-an-ip")).toBeNull();
+		expect(__test__.parseIpv6Parts("1::2::3")).toBeNull();
+		expect(__test__.parseIpv6Parts("::ffff:127.0.0.1")).toEqual([
+			0, 0, 0, 0, 0, 0xffff, 0x7f00, 1,
+		]);
+		expect(__test__.ipv4FromIpv6Suffix("::ffff:7f00:1")).toBe("127.0.0.1");
+		expect(__test__.ipv4FromIpv6Suffix("not-an-ip")).toBeNull();
+		expect(__test__.isPrivateIpv6("not-an-ip")).toBe(false);
+		expect(__test__.isPrivateIpv6("fd00::1")).toBe(true);
+	});
+
+	it("rejects unsupported schemes and credentialed preview URLs", async () => {
+		const fetchImpl = vi.fn();
+
+		await expect(
+			fetchLinkPreviewMetadata("file:///tmp/card.html", { fetchImpl }),
+		).resolves.toMatchObject({
+			error: "Link preview URL must use http or https",
+		});
+		await expect(
+			fetchLinkPreviewMetadata("https://user:pass@example.com/", {
+				fetchImpl,
+			}),
+		).resolves.toMatchObject({
+			error: "Link preview URL must not include credentials",
+		});
+		expect(fetchImpl).not.toHaveBeenCalled();
 	});
 
 	it("answers Node lookup callbacks in all-address mode", () => {
@@ -140,6 +214,18 @@ describe("link preview metadata", () => {
 		expect(callback).toHaveBeenCalledWith(null, [
 			{ address: "93.184.216.34", family: 4 },
 		]);
+	});
+
+	it("answers Node lookup callbacks in single-address mode", () => {
+		const callback = vi.fn();
+
+		__test__.respondWithResolvedAddress(
+			{ address: "93.184.216.34", family: 4 },
+			undefined,
+			callback,
+		);
+
+		expect(callback).toHaveBeenCalledWith(null, "93.184.216.34", 4);
 	});
 
 	it("blocks DNS resolutions and redirects to private addresses", async () => {
@@ -169,6 +255,100 @@ describe("link preview metadata", () => {
 		expect(resolveHost).toHaveBeenCalledWith("example.com");
 	});
 
+	it("reports DNS resolution failures before fetching", async () => {
+		const fetchImpl = vi.fn();
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/", {
+				fetchImpl,
+				resolveHost: vi.fn(async () => []),
+			}),
+		).resolves.toMatchObject({
+			error: "Link preview host did not resolve",
+		});
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/", {
+				fetchImpl,
+				resolveHost: vi.fn(async () => ["not-an-address"]),
+			}),
+		).resolves.toMatchObject({
+			error: "Link preview host resolved to an invalid address",
+		});
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("stops redirect loops and cancels redirect bodies", async () => {
+		const cancel = vi.fn();
+		const fetchImpl = vi.fn().mockImplementation(
+			async () =>
+				new Response(new ReadableStream({ cancel }), {
+					status: 302,
+					headers: { location: "/next" },
+				}),
+		);
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/start", { fetchImpl }),
+		).resolves.toMatchObject({
+			error: "Link preview redirected too many times",
+		});
+		expect(fetchImpl).toHaveBeenCalledTimes(5);
+		expect(cancel).toHaveBeenCalledTimes(5);
+	});
+
+	it("treats redirect responses without locations as fetch responses", async () => {
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response(null, { status: 304 }));
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/cache", { fetchImpl }),
+		).resolves.toMatchObject({
+			error: "HTTP 304",
+		});
+	});
+
+	it("times out before fetching when no time remains", async () => {
+		const fetchImpl = vi.fn();
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/", {
+				fetchImpl,
+				timeoutMs: 0,
+			}),
+		).resolves.toMatchObject({
+			error: "Link preview request timed out",
+		});
+		expect(fetchImpl).not.toHaveBeenCalled();
+	});
+
+	it("rejects injected fetches outside tests", async () => {
+		const previousNodeEnv = process.env.NODE_ENV;
+		const previousVitest = process.env.VITEST;
+		process.env.NODE_ENV = "production";
+		delete process.env.VITEST;
+		try {
+			await expect(
+				fetchLinkPreviewMetadata("https://example.com/", {
+					fetchImpl: vi.fn(),
+				}),
+			).resolves.toMatchObject({
+				error: "Custom link preview fetch is only available in tests",
+			});
+		} finally {
+			if (previousNodeEnv === undefined) {
+				delete process.env.NODE_ENV;
+			} else {
+				process.env.NODE_ENV = previousNodeEnv;
+			}
+			if (previousVitest === undefined) {
+				delete process.env.VITEST;
+			} else {
+				process.env.VITEST = previousVitest;
+			}
+		}
+	});
+
 	it("caps oversized link preview bodies", async () => {
 		const fetchImpl = vi.fn().mockResolvedValue(
 			new Response("too much", {
@@ -186,11 +366,50 @@ describe("link preview metadata", () => {
 		});
 	});
 
-	it("decodes compressed link preview bodies", async () => {
+	it("uses default body decoding for uncompressed responses", async () => {
 		const fetchImpl = vi.fn().mockResolvedValue(
-			new Response(gzipSync("<title>Compressed</title>"), {
+			new Response("<title>Plain</title>", {
+				headers: { "content-type": "text/html" },
+			}),
+		);
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/", { fetchImpl }),
+		).resolves.toMatchObject({
+			title: "Plain",
+		});
+	});
+
+	it("caps streamed link preview bodies while reading", async () => {
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(
+				new ReadableStream({
+					start(controller) {
+						controller.enqueue(new Uint8Array(2_000_001));
+						controller.close();
+					},
+				}),
+				{ headers: { "content-type": "text/html" } },
+			),
+		);
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/", { fetchImpl }),
+		).resolves.toMatchObject({
+			error: "Link preview response is too large",
+		});
+	});
+
+	it.each([
+		["gzip", gzipSync],
+		["x-gzip", gzipSync],
+		["deflate", deflateSync],
+		["br", brotliCompressSync],
+	])("decodes %s link preview bodies", async (encoding, compress) => {
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(compress(`<title>${encoding}</title>`), {
 				headers: {
-					"content-encoding": "gzip",
+					"content-encoding": encoding,
 					"content-type": "text/html",
 				},
 			}),
@@ -199,8 +418,26 @@ describe("link preview metadata", () => {
 		await expect(
 			fetchLinkPreviewMetadata("https://example.com/", { fetchImpl }),
 		).resolves.toMatchObject({
-			title: "Compressed",
+			title: encoding,
 		});
+	});
+
+	it("cancels direct image response bodies", async () => {
+		const cancel = vi.fn();
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(new ReadableStream({ cancel }), {
+				headers: { "content-type": "image/png" },
+			}),
+		);
+
+		await expect(
+			fetchLinkPreviewMetadata("https://example.com/card.png", { fetchImpl }),
+		).resolves.toMatchObject({
+			imageUrl: "https://example.com/card.png",
+			siteName: "example.com",
+			title: "example.com",
+		});
+		expect(cancel).toHaveBeenCalledOnce();
 	});
 
 	it("returns preview errors for malformed redirects", async () => {

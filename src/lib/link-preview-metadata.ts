@@ -932,7 +932,12 @@ export function getOrFetchLinkPreview(
 export const __test__ = {
 	assertSafePreviewUrl,
 	decodeHtmlEntities,
+	ipv4FromIpv6Suffix,
+	ipv4ToNumber,
 	isBlockedAddress,
+	isIpv4InRange,
+	isPrivateIpv6,
+	parseIpv6Parts,
 	respondWithResolvedAddress,
 	youtubeThumbnail,
 };
