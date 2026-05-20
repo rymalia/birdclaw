@@ -30,7 +30,7 @@ describe("api query route", () => {
 		queryResourceMock.mockReturnValue({ resource: "dms", items: [] });
 		const response = await GET({
 			request: new Request(
-				"http://localhost/api/query?resource=dms&inbox=requests&replyFilter=unreplied&minFollowers=10&minInfluenceScore=90&sort=influence",
+				"http://localhost/api/query?resource=dms&inbox=requests&replyFilter=unreplied&minFollowers=10&minInfluenceScore=90&sort=followers",
 			),
 		});
 
@@ -40,11 +40,27 @@ describe("api query route", () => {
 				replyFilter: "unreplied",
 				minFollowers: 10,
 				minInfluenceScore: 90,
+				sort: "followers",
 				inbox: "requests",
-				sort: "influence",
 			}),
 		);
 		expect(response.status).toBe(200);
+	});
+
+	it("accepts the legacy dm influence sort as followers", async () => {
+		queryResourceMock.mockReturnValue({ resource: "dms", items: [] });
+		await GET({
+			request: new Request(
+				"http://localhost/api/query?resource=dms&sort=influence",
+			),
+		});
+
+		expect(queryResourceMock).toHaveBeenCalledWith(
+			"dms",
+			expect.objectContaining({
+				sort: "followers",
+			}),
+		);
 	});
 
 	it("defaults invalid reply filters to all", async () => {

@@ -148,8 +148,10 @@ export function DmWorkspace({
 										</span>
 									) : null}
 									<span className={cx(pillClass, pillSoftClass)}>
-										{conversation.influenceScore} ·{" "}
-										{conversation.influenceLabel}
+										{formatCompactNumber(
+											conversation.participant.followersCount,
+										)}{" "}
+										followers
 									</span>
 								</div>
 							</div>

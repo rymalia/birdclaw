@@ -28,6 +28,13 @@ function parseOptionalNumber(value: string | null) {
 	return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+function parseDmSort(value: string | null) {
+	if (value === "followers" || value === "influence") {
+		return "followers";
+	}
+	return "recent";
+}
+
 function parseQualityFilter(value: string | null): TimelineQualityFilter {
 	return value === "summary" ? "summary" : "all";
 }
@@ -86,10 +93,7 @@ export const Route = createFileRoute("/api/query")({
 									maxInfluenceScore: parseOptionalNumber(
 										url.searchParams.get("maxInfluenceScore"),
 									),
-									sort:
-										url.searchParams.get("sort") === "influence"
-											? "influence"
-											: "recent",
+									sort: parseDmSort(url.searchParams.get("sort")),
 									inbox: parseDmInbox(url.searchParams.get("inbox")),
 									conversationId:
 										url.searchParams.get("conversationId") ?? undefined,

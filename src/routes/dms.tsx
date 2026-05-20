@@ -47,6 +47,11 @@ const TABS: Array<{ value: ReplyFilter; label: string }> = [
 	{ value: "replied", label: "Replied" },
 ];
 
+const SORTS: Array<{ value: "recent" | "followers"; label: string }> = [
+	{ value: "recent", label: "Newest" },
+	{ value: "followers", label: "Followers" },
+];
+
 type DmInboxFilter = "all" | "accepted" | "requests";
 
 const INBOX_FILTERS: Array<{ value: DmInboxFilter; label: string }> = [
@@ -69,7 +74,7 @@ function DmsRoute() {
 	const [replyFilter, setReplyFilter] = useState<ReplyFilter>("unreplied");
 	const [minFollowers, setMinFollowers] = useState("0");
 	const [minInfluenceScore, setMinInfluenceScore] = useState("0");
-	const [sort, setSort] = useState<"recent" | "influence">("recent");
+	const [sort, setSort] = useState<"recent" | "followers">("recent");
 	const [search, setSearch] = useState("");
 	const [replyDraft, setReplyDraft] = useState("");
 	const [refreshTick, setRefreshTick] = useState(0);
@@ -313,22 +318,22 @@ function DmsRoute() {
 						value={minInfluenceScore}
 					/>
 					<div className={segmentedClass}>
-						{(["recent", "influence"] as const).map((value) => (
+						{SORTS.map((option) => (
 							<button
-								key={value}
+								key={option.value}
 								className={cx(
 									segmentClass,
-									value === sort && segmentActiveClass,
+									option.value === sort && segmentActiveClass,
 								)}
-								onClick={() => setSort(value)}
+								onClick={() => setSort(option.value)}
 								type="button"
 							>
-								{value}
+								{option.label}
 							</button>
 						))}
 					</div>
 				</div>
-				<div className={tabStripClass}>
+				<div className={tabStripClass} aria-label="DM reply filter">
 					{TABS.map((tab) => {
 						const active = replyFilter === tab.value;
 						return (
