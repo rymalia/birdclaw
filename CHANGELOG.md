@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- Link grouped AI digest tweet citations to nearby readable text instead of showing raw `tweet_...` IDs.
 - Expand the Messages web layout into an icon-rail workspace so the DM list and thread panes no longer squeeze into the standard feed width.
 - Show DM message requests across accounts instead of filtering them by the active sidebar account.
 - Verify the live `bird` account before DM sync, preserve stable account IDs for sparse DM payloads, and pace request-page imports.

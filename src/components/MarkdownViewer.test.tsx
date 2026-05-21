@@ -1,5 +1,5 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 import type { PeriodDigestContext } from "#/lib/period-digest";
 import { MarkdownViewer } from "./MarkdownViewer";
 
@@ -44,6 +44,44 @@ const context = {
 			bookmarked: false,
 			needsReply: true,
 		},
+		{
+			id: "2057574939775938900",
+			url: "https://x.com/kilocode/status/2057574939775938900",
+			source: "home",
+			author: "kilocode",
+			name: "Kilo Code",
+			authorProfile: {
+				...authorProfile,
+				id: "profile_kilocode",
+				handle: "kilocode",
+				displayName: "Kilo Code",
+			},
+			createdAt: "2026-05-18T10:12:00.000Z",
+			text: "StepFun Step 3.5 Flash is the most-used free model in Kilo modes.",
+			likeCount: 42,
+			liked: false,
+			bookmarked: false,
+			needsReply: false,
+		},
+		{
+			id: "2057578665408434460",
+			url: "https://x.com/kilocode/status/2057578665408434460",
+			source: "home",
+			author: "kilocode",
+			name: "Kilo Code",
+			authorProfile: {
+				...authorProfile,
+				id: "profile_kilocode",
+				handle: "kilocode",
+				displayName: "Kilo Code",
+			},
+			createdAt: "2026-05-18T10:15:00.000Z",
+			text: "BYOK access reaches Opus, GPT-5.5, Gemini 3, and more.",
+			likeCount: 43,
+			liked: false,
+			bookmarked: false,
+			needsReply: false,
+		},
 	],
 	dms: [],
 	links: [],
@@ -51,6 +89,8 @@ const context = {
 } satisfies PeriodDigestContext;
 
 describe("MarkdownViewer", () => {
+	afterEach(cleanup);
+
 	it("links generated tweet citations without showing raw ids", () => {
 		render(
 			<MarkdownViewer
@@ -72,5 +112,76 @@ describe("MarkdownViewer", () => {
 			"href",
 			"https://x.com/ChainZenit/status/2056286865875935400",
 		);
+	});
+
+	it("links comma-separated tweet citations to nearby readable text", () => {
+		render(
+			<MarkdownViewer
+				context={context}
+				markdown={
+					"@kilocode says StepFun is widely used, with BYOK access to Opus, GPT-5.5, Gemini 3, and 500+ models at provider cost (tweet_2057574939775938900, tweet_2057578665408434460)."
+				}
+			/>,
+		);
+
+		expect(
+			screen.queryByText(/tweet_2057574939775938900/),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByText(/tweet_2057578665408434460/),
+		).not.toBeInTheDocument();
+		expect(
+			screen.getByRole("link", {
+				name: "with BYOK access to Opus, GPT-5.5, Gemini 3, and 500+ models at provider cost",
+			}),
+		).toHaveAttribute(
+			"href",
+			"https://x.com/kilocode/status/2057574939775938900",
+		);
+		expect(screen.getByRole("link", { name: "source 2" })).toHaveAttribute(
+			"href",
+			"https://x.com/kilocode/status/2057578665408434460",
+		);
+	});
+
+	it("keeps mixed unresolved grouped tweet citations visible", () => {
+		render(
+			<MarkdownViewer
+				context={context}
+				markdown={
+					"@kilocode says StepFun is widely used (tweet_2057574939775938900, tweet_missing)."
+				}
+			/>,
+		);
+
+		expect(
+			screen.getByText("(tweet_2057574939775938900, tweet_missing)", {
+				exact: false,
+			}),
+		).toBeInTheDocument();
+		expect(screen.queryByRole("link", { name: "source 2" })).toBeNull();
+	});
+
+	it("renders all grouped citation links when no readable text precedes", () => {
+		render(
+			<MarkdownViewer
+				context={context}
+				markdown={
+					"**Kilo:** (tweet_2057574939775938900, tweet_2057578665408434460)."
+				}
+			/>,
+		);
+
+		expect(screen.getByRole("link", { name: "source 1" })).toHaveAttribute(
+			"href",
+			"https://x.com/kilocode/status/2057574939775938900",
+		);
+		expect(screen.getByRole("link", { name: "source 2" })).toHaveAttribute(
+			"href",
+			"https://x.com/kilocode/status/2057578665408434460",
+		);
+		expect(
+			screen.queryByText(/tweet_2057574939775938900/),
+		).not.toBeInTheDocument();
 	});
 });

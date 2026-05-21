@@ -19,6 +19,42 @@ function normalizeTweetReference(value: string) {
 		.replace(/^tweet_/, "");
 }
 
+function tweetReferencesFromToken(token: string) {
+	return Array.from(token.matchAll(/\b(?:tweet_)?[A-Za-z0-9_:-]{3,}\b/g))
+		.map((match) => match[0])
+		.filter((value) => value.startsWith("tweet_") || /^\d{12,25}$/.test(value));
+}
+
+function trailingReadableBounds(value: string) {
+	let start = 0;
+	for (const separator of [". ", "? ", "! ", "; ", ": "]) {
+		const index = value.lastIndexOf(separator);
+		if (index >= 0) start = Math.max(start, index + separator.length);
+	}
+
+	let end = value.length;
+	while (start < end && /\s/.test(value[start] ?? "")) start += 1;
+	while (end > start && /\s/.test(value[end - 1] ?? "")) end -= 1;
+
+	let clauseStart = start;
+	for (const separator of [", with ", ", while ", ", and "]) {
+		const index = value.lastIndexOf(separator, end);
+		if (index >= start) {
+			clauseStart = index + 2;
+			break;
+		}
+	}
+
+	if (clauseStart > start || end - start > 140) {
+		while (clauseStart < end && /\s/.test(value[clauseStart] ?? "")) {
+			clauseStart += 1;
+		}
+		if (end > clauseStart) start = clauseStart;
+	}
+
+	return end > start ? { start, end } : null;
+}
+
 function trimBullet(value: string) {
 	return value.replace(/^[-*]\s+/, "");
 }
@@ -75,33 +111,79 @@ function TweetPreviewToken({
 	);
 }
 
-function linkTrailingCitationText(
-	nodes: ReactNode[],
-	tweet: PeriodDigestContext["tweets"][number],
+function additionalCitationLinks(
+	tweets: Array<PeriodDigestContext["tweets"][number]>,
 	key: string,
 ) {
+	return tweets.slice(1).flatMap((tweet, index) => [
+		index === 0 ? " " : ", ",
+		<TweetPreviewToken key={`${key}-source-${String(index + 2)}`} tweet={tweet}>
+			{`source ${String(index + 2)}`}
+		</TweetPreviewToken>,
+	]);
+}
+
+function fallbackCitationLinks(
+	tweets: Array<PeriodDigestContext["tweets"][number]>,
+	key: string,
+) {
+	return tweets.flatMap((tweet, index) => [
+		index === 0 ? "" : ", ",
+		<TweetPreviewToken
+			key={`${key}-fallback-${String(index + 1)}`}
+			tweet={tweet}
+		>
+			{tweets.length === 1 ? "source" : `source ${String(index + 1)}`}
+		</TweetPreviewToken>,
+	]);
+}
+
+function linkTrailingCitationText(
+	nodes: ReactNode[],
+	tweets: Array<PeriodDigestContext["tweets"][number]>,
+	key: string,
+) {
+	const tweet = tweets[0];
+	if (!tweet) return false;
 	const last = nodes.at(-1);
 	if (typeof last !== "string") return false;
 
 	const match = /(["“][^"”]+["”])(\s*)$/.exec(last);
-	if (!match) return false;
+	if (match) {
+		const quoted = match[1];
+		const trailing = match[2] ?? "";
+		const before = last.slice(0, match.index);
+		nodes[nodes.length - 1] = before;
+		nodes.push(
+			<TweetPreviewToken key={key} tweet={tweet}>
+				{quoted}
+			</TweetPreviewToken>,
+			...additionalCitationLinks(tweets, key),
+			/^\s*$/.test(trailing) ? "" : trailing,
+		);
+		return true;
+	}
 
-	const quoted = match[1];
-	const trailing = match[2] ?? "";
-	const before = last.slice(0, match.index);
+	const bounds = trailingReadableBounds(last);
+	if (!bounds) return false;
+
+	const before = last.slice(0, bounds.start);
+	const readable = last.slice(bounds.start, bounds.end);
+	const trailing = last.slice(bounds.end);
 	nodes[nodes.length - 1] = before;
 	nodes.push(
 		<TweetPreviewToken key={key} tweet={tweet}>
-			{quoted}
+			{readable}
 		</TweetPreviewToken>,
-		trailing,
+		...additionalCitationLinks(tweets, key),
+		/^\s*$/.test(trailing) ? "" : trailing,
 	);
 	return true;
 }
 
 function renderInline(text: string, lookup: InlineLookup) {
 	const pattern =
-		/(\*\*[^*]+\*\*|@[A-Za-z0-9_]{1,20}|\(?\btweet_[A-Za-z0-9_:-]+\)?|\b\d{12,25}\b)/g;
+		/(\*\*[^*]+\*\*|@[A-Za-z0-9_]{1,20}|\((?:\s*(?:tweet_[A-Za-z0-9_:-]+|\d{12,25})\s*,?)+\)|\btweet_[A-Za-z0-9_:-]+\b|\b\d{12,25}\b)/g;
 	const nodes: ReactNode[] = [];
 	let cursor = 0;
 	let match: RegExpExecArray | null;
@@ -147,14 +229,38 @@ function renderInline(text: string, lookup: InlineLookup) {
 			continue;
 		}
 
-		const tweet = lookup.tweetsById.get(normalizeTweetReference(token));
+		const references = tweetReferencesFromToken(token);
+		const resolvedTweets = references.map((reference) =>
+			lookup.tweetsById.get(normalizeTweetReference(reference)),
+		);
+		const allReferencesResolved =
+			references.length > 0 && resolvedTweets.every(Boolean);
+		const tweets = resolvedTweets.filter(
+			(tweet): tweet is PeriodDigestContext["tweets"][number] => Boolean(tweet),
+		);
+		const tweet = tweets[0];
 		const isParenthesizedTweetRef =
 			token.startsWith("(") && token.endsWith(")");
 		if (
+			isParenthesizedTweetRef &&
+			references.length > 1 &&
+			!allReferencesResolved
+		) {
+			nodes.push(token);
+			continue;
+		}
+		if (
 			tweet &&
 			isParenthesizedTweetRef &&
-			linkTrailingCitationText(nodes, tweet, `${token}-${String(match.index)}`)
+			allReferencesResolved &&
+			linkTrailingCitationText(nodes, tweets, `${token}-${String(match.index)}`)
 		) {
+			continue;
+		}
+		if (tweet && isParenthesizedTweetRef && allReferencesResolved) {
+			nodes.push(
+				...fallbackCitationLinks(tweets, `${token}-${String(match.index)}`),
+			);
 			continue;
 		}
 		nodes.push(
