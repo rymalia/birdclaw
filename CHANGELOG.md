@@ -44,6 +44,7 @@
 - Keep Discuss Live search scoped to live/search-result tweets instead of sweeping every local timeline bucket before AI streaming starts.
 - Tighten AI report line height and first-block spacing in Today and Discuss.
 - Keep Network Map profile positions anchored to exact geocoded locations and render dense areas through smarter avatar clusters instead of random scatter.
+- Ignore stale configured OAuth2 xurl account overrides for Profile Analyse user lookup and profile timeline reads.
 
 ## 0.6.0 - 2026-05-22
 
