@@ -1,86 +1,82 @@
 ---
 title: Sign in
-description: "How birdclaw connects to your Twitter/X account: pick a transport, set it up once, verify with auth status."
+description: "Connect birdclaw to X through xurl or bird, verify each tool, and choose the moderation write transport."
 ---
 
 # Sign in
 
-birdclaw does **not** run its own OAuth flow. It piggybacks on credentials that already exist on your machine via one of three pluggable *transports*. Pick the one that fits your use case, set it up once, and `birdclaw` will use it for live reads and writes.
+birdclaw keeps its database local. Archive import needs no X credentials. Live reads and writes are delegated to external CLIs:
 
-If you only want to import an exported archive ZIP and read it locally, you can skip this page entirely — archive import works with no credentials at all.
+- [`xurl`](https://github.com/xdevplatform/xurl) uses the official X API and your own developer app.
+- [`bird`](https://github.com/steipete/bird) uses the active browser session through X's web API.
 
-## Pick a transport
-
-| Transport | Auth model | What it covers | When to pick it |
-|---|---|---|---|
-| **xurl** | Official X API v2, OAuth2 | likes, bookmarks, blocks, mutes, authored tweets, posting | First choice. Most "above board". Revocable from x.com app settings. |
-| **bird** | Session cookies extracted from your logged-in browser | DMs, mentions, timeline, block fallback — surfaces xurl can't reach or where it gets rate-limited | Add alongside xurl for full coverage. |
-| **archive-only** | None | Whatever is in the archive ZIP you import | Pick this if you'd rather not wire live access at all. |
-
-You can have xurl, bird, both, or neither. The `auto` transport mode used by most commands tries xurl first and falls back to bird.
+Install either tool or both. Transport selection is workflow-specific: sync commands expose `--mode`, while `auth use` only controls moderation writes such as block, unblock, mute, and unmute.
 
 ## Set up xurl
 
-birdclaw shells out to the external [`xurl`](https://github.com/xdevplatform/xurl) CLI; it does not own `~/.xurl` itself.
+Install xurl, register an X developer app, then start OAuth2 authentication:
 
-```bash
-brew install xdevplatform/tap/xurl
-xurl auth login
+```text
+brew install --cask xdevplatform/tap/xurl
+xurl auth oauth2 --app my-app
+xurl whoami
 ```
 
-Full install options and notes are in [Install → Optional: xurl](install.md#optional-xurl).
+Register `my-app` first by following the [xurl authentication guide](https://github.com/xdevplatform/xurl#authentication). The redirect URI configured in the X developer portal must match xurl's configured URI. Treat the client secret as a secret; avoid entering it in shared shell history or exposing it in process listings.
 
 ## Set up bird
 
-bird extracts `auth_token` and `ct0` cookies from your already-logged-in browser (Safari, Chrome, or Firefox) and caches them under `~/.bird`. birdclaw shells out to it the same way it does for xurl.
+Install bird, sign in to x.com in Safari, Chrome, or Firefox, then verify the detected account:
 
-```bash
+```text
 brew install steipete/tap/bird
-bird auth import-cookies
+bird whoami
 ```
 
-Full install options, scheduled-job caveats, and the env-var override for `launchd` are in [Install → Optional: bird](install.md#optional-bird).
+bird reads `auth_token` and `ct0` cookies from the selected browser profile. If autodetection misses the right profile, see [bird authentication](https://github.com/steipete/bird#authentication-graphql) for cookie-source and profile flags.
 
-## Verify
+## Verify xurl in birdclaw
 
-```bash
+```text
 birdclaw auth status --json
 ```
 
-What to look for in the output:
+`auth status` runs a coarse xurl status probe. It does not probe bird, prove that a specific X API request will succeed, or choose a transport for every command.
 
-- **Nothing wired** — `transport` is `archive` (or `local`). Live sync will skip with a warning, archive import still works.
-- **xurl active** — `transport` is `xurl` and an account id is listed. Live sync uses the official API.
-- **bird active** — `transport` shows bird is available; it'll be used as a fallback or as the primary for surfaces xurl can't reach.
+- `installed` reports whether the xurl executable exists.
+- `availableTransport` is `xurl` when `xurl auth status` succeeds without a known unauthenticated message; otherwise it is `local`.
+- `statusText` explains the detected state.
+- `rawStatus` contains xurl's status output when available.
 
-If `auth status` looks wrong, re-run the matching transport's auth command (`xurl auth login` or `bird auth import-cookies`) and try again.
+Use `xurl whoami` as the end-to-end authentication check. Run `xurl auth status` for detailed app/token state and `bird whoami` to verify bird independently.
 
-## Change the default transport
+## Choose moderation transport
 
-Most commands accept `--mode <auto|xurl|bird>` (or `--transport`) and `auto` is the default. To change the default for every run, pick one:
+Persist the preferred transport for block, unblock, mute, and unmute:
 
-- **For a single shell session** — `export BIRDCLAW_ACTIONS_TRANSPORT=xurl` (or `bird`, `auto`).
-- **Persistently** — edit `~/.birdclaw/config.json` and set `actions.transport`:
+```text
+birdclaw auth use auto
+birdclaw auth use bird
+birdclaw auth use xurl
+```
 
-  ```json
-  {
-    "actions": { "transport": "xurl" }
-  }
-  ```
+`auto` tries bird first for moderation writes, then xurl. A command-level `--transport` flag overrides the saved value. `BIRDCLAW_ACTIONS_TRANSPORT` overrides the config for one process.
 
-  Allowed values: `auto`, `xurl`, `bird`. See `resolveActionsTransport` in `src/lib/config.ts` for the resolution order (per-command flag → env var → config file → `auto`).
+Sync commands do not use this saved moderation setting. Select their source with the command's `--mode` flag:
 
-## Privacy notes
+```text
+birdclaw sync timeline --mode auto
+birdclaw sync mentions --mode bird
+birdclaw sync likes --mode xurl
+```
 
-The non-OAuth transports work by re-using your existing browser session. That's worth being explicit about:
+Supported modes differ by command; use `birdclaw sync <command> --help`.
 
-- **bird** reads `auth_token` and `ct0` cookies from your browser cookie store once at `import-cookies` time and caches them in `~/.bird`. These are full session credentials — anyone with read access to that file can act as you on x.com until the session expires.
-- **x-web** (an experimental transport noted in [Configuration → Transport precedence](configuration.md#transport-precedence)) reads the same cookies on every request via [`@steipete/sweet-cookie`](https://www.npmjs.com/package/@steipete/sweet-cookie). See `src/lib/x-web.ts` for the exact request shape.
-- Both paths are revoked the moment you log out of x.com in the browser they were extracted from.
-- **xurl** is the only path with proper scopes and an app-revocation flow at <https://x.com/settings/connected_apps>.
+## Security
 
-If any of that feels wrong, stick to xurl, or run in archive-only mode.
+- xurl stores developer-app credentials and OAuth tokens under `~/.xurl`.
+- bird uses browser session cookies. Treat `auth_token` and `ct0` as full account credentials.
+- Use archive-only mode when live access is unnecessary.
+- Set `BIRDCLAW_DISABLE_LIVE_WRITES=1` for development or dry runs.
 
-## Multiple accounts
-
-Per-account profiles, `BIRDCLAW_ACCOUNT`, and config-driven transport overrides are in [Configuration](configuration.md). The same transport setup applies — bird and xurl each manage their own credentials, and birdclaw picks the right one per command.
+For multiple Birdclaw accounts, use `--account <id>` on commands that support it. See [Configuration](configuration.md#multi-account).

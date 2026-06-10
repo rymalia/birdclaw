@@ -219,7 +219,7 @@ birdclaw auth status --json
 birdclaw db stats --json
 ```
 
-`auth status` shows which live transports are wired. Set up `xurl` or `bird` for live sync, or skip straight to archive import — see [Sign in](docs/auth.md).
+`auth status` reports Birdclaw's coarse xurl status. Verify xurl with `xurl whoami` and bird with `bird whoami`. For setup and transport selection, see [Sign in](docs/auth.md).
 
 Find and import an archive:
 

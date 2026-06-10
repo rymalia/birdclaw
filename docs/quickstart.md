@@ -26,7 +26,7 @@ birdclaw db stats --json
 
 `init` creates `~/.birdclaw/`, opens the shared SQLite database, writes a default config when none exists, and probes for `xurl` and `bird` on `PATH`.
 
-`auth status` prints which transports are available and which account is active. Right after `init`, no account is configured yet — that comes in step 4. If you want live sync, see [Sign in](auth.md); skip it if you only need archive import.
+`auth status` runs Birdclaw's coarse xurl status probe. Verify xurl with `xurl whoami` and bird with `bird whoami`. If you want live sync, follow [Sign in](auth.md); skip it if you only need archive import.
 
 ## 3. Find and import an archive
 

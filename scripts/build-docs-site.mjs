@@ -455,7 +455,7 @@ function inline(text, currentRel) {
 	out = escapeHtml(out)
 		.replace(/&lt;(https?:\/\/[^\s<>]+)&gt;/g, (_, url) => {
 			stash.push(`<a href="${escapeAttr(url)}">${escapeHtml(url)}</a>`);
-			return ` ${stash.length - 1} `;
+			return `\u0000${stash.length - 1}\u0000`;
 		})
 		.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
 		.replace(/(^|[^*])\*([^*\s][^*]*?)\*(?!\*)/g, "$1<em>$2</em>")
