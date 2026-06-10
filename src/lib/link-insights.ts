@@ -380,6 +380,8 @@ function resolveRange(
 
 	const start = new Date(now);
 	if (range === "today") {
+		// "Today" follows the user's local calendar day; toISOString below
+		// converts that local midnight into the correct UTC storage boundary.
 		start.setHours(0, 0, 0, 0);
 	} else {
 		const days = range === "week" ? 7 : range === "month" ? 30 : 365;
