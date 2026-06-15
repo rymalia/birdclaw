@@ -6,6 +6,10 @@ import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Command } from "commander";
 import { registerModerationCommands } from "#/cli-moderation";
+import { registerComposeCommands } from "#/cli/register-compose";
+import { registerGraphCommands } from "#/cli/register-graph";
+import { registerInboxCommand } from "#/cli/register-inbox";
+import { registerStorageCommands } from "#/cli/register-storage";
 import { findArchives } from "#/lib/archive-finder";
 import {
 	ARCHIVE_IMPORT_SLICES,
@@ -25,14 +29,7 @@ import {
 	parseAccountSyncSteps,
 	runAccountSyncJob,
 } from "#/lib/account-sync-job";
-import {
-	exportBackup,
-	importBackup,
-	maybeAutoSyncBackup,
-	maybeAutoUpdateBackup,
-	syncBackup,
-	validateBackup,
-} from "#/lib/backup";
+import { maybeAutoSyncBackup, maybeAutoUpdateBackup } from "#/lib/backup";
 import {
 	installBookmarkSyncLaunchAgent,
 	runBookmarkSyncJob,
@@ -42,17 +39,14 @@ import { importBlocklist } from "#/lib/blocklist";
 import {
 	type ActionsTransport,
 	ensureBirdclawDirs,
-	getBirdclawPaths,
 	resolveMentionsDataSource,
 	setActionsTransport,
 } from "#/lib/config";
 import { closeDatabase } from "#/lib/db";
-import { getDatabaseRuntimeMetrics } from "#/lib/database-metrics";
 import {
 	type DirectMessagesSyncMode,
 	syncDirectMessagesViaCachedBird,
 } from "#/lib/dms-live";
-import { listInboxItems, scoreInbox } from "#/lib/inbox";
 import { backfillLinkIndex, searchLinks } from "#/lib/link-index";
 import { fetchTweetMedia, formatMediaFetchResult } from "#/lib/media-fetch";
 import { syncMentionThreads } from "#/lib/mention-threads-live";
@@ -73,15 +67,7 @@ import {
 	streamProfileAnalysis,
 	type ProfileAnalysisOptions,
 } from "#/lib/profile-analysis";
-import {
-	getFollowGraphSummary,
-	listFollowEvents,
-	listMutuals,
-	listNonMutualFollowing,
-	listTopFollowers,
-	listUnfollowedSince,
-	syncFollowGraph,
-} from "#/lib/follow-graph";
+import { syncFollowGraph } from "#/lib/follow-graph";
 import { hydrateProfilesFromX } from "#/lib/profile-hydration";
 import { resolveProfilesForIds } from "#/lib/profile-resolver";
 import { inspectProfileReplies } from "#/lib/profile-replies";
@@ -93,9 +79,6 @@ import {
 } from "#/lib/search-discussion";
 import {
 	applyDmRequestMutationToLocalStore,
-	createDmReply,
-	createPost,
-	createTweetReply,
 	getQueryEnvelope,
 	listDmConversations,
 	listTimelineItems,
@@ -1982,270 +1965,20 @@ registerModerationCommands({
 	resolveActionOptions,
 });
 
-const composeCommand = program
-	.command("compose")
-	.description("Create local/xurl actions");
+const commandContext = {
+	program,
+	print,
+	asJson: () => program.opts().json ?? false,
+	autoSyncAfterWrite,
+	autoUpdateBeforeRead,
+};
 
-composeCommand
-	.command("post <text>")
-	.option("--account <accountId>", "Account id", "acct_primary")
-	.action(async (text, options) => {
-		const result = await createPost(options.account, text);
-		await autoSyncAfterWrite();
-		print(result, program.opts().json ?? false);
-	});
+registerComposeCommands(commandContext);
+registerInboxCommand(commandContext);
 
-composeCommand
-	.command("reply <tweetId> <text>")
-	.option("--account <accountId>", "Account id", "acct_primary")
-	.action(async (tweetId, text, options) => {
-		const result = await createTweetReply(options.account, tweetId, text);
-		await autoSyncAfterWrite();
-		print(result, program.opts().json ?? false);
-	});
+registerGraphCommands(commandContext);
 
-composeCommand
-	.command("dm <conversationId> <text>")
-	.description("Reply inside an existing DM conversation")
-	.action(async (conversationId, text) => {
-		const result = await createDmReply(conversationId, text);
-		await autoSyncAfterWrite();
-		print(result, program.opts().json ?? false);
-	});
-
-program
-	.command("inbox")
-	.option("--kind <kind>", "mixed, mentions, or dms", "mixed")
-	.option("--min-score <n>", "Minimum rank", "0")
-	.option("--hide-low-signal", "Hide low-signal items")
-	.option("--score", "Score top items with OpenAI before listing")
-	.option("--limit <n>", "Limit results", "20")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		const kind =
-			options.kind === "mentions" || options.kind === "dms"
-				? options.kind
-				: "mixed";
-		if (options.score) {
-			await scoreInbox({
-				kind,
-				limit: Number(options.limit),
-			});
-			await autoSyncAfterWrite();
-		}
-		print(
-			listInboxItems({
-				kind,
-				minScore: Number(options.minScore),
-				hideLowSignal: Boolean(options.hideLowSignal),
-				limit: Number(options.limit),
-			}),
-			program.opts().json ?? false,
-		);
-	});
-
-const graphCommand = program
-	.command("graph")
-	.description("Query the local cache-only follow graph");
-
-graphCommand
-	.command("summary")
-	.description("Summarize cached followers, following, mutuals, and snapshots")
-	.option("--account <accountId>", "Account id")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(getFollowGraphSummary({ account: options.account }), true);
-	});
-
-graphCommand
-	.command("top-followers")
-	.description("List current followers sorted by their follower count")
-	.option("--account <accountId>", "Account id")
-	.option("--limit <n>", "Limit results", "20")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(
-			listTopFollowers({
-				account: options.account,
-				limit: Number(options.limit),
-			}),
-			true,
-		);
-	});
-
-graphCommand
-	.command("unfollowed")
-	.description("List cached ended follow edges since a date")
-	.requiredOption("--date <date>", "YYYY-MM-DD or ISO timestamp")
-	.option("--account <accountId>", "Account id")
-	.option("--direction <direction>", "followers or following", "followers")
-	.option("--limit <n>", "Limit results", "100")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(
-			listUnfollowedSince({
-				account: options.account,
-				date: options.date,
-				direction:
-					options.direction === "following" ? "following" : "followers",
-				limit: Number(options.limit),
-			}),
-			true,
-		);
-	});
-
-graphCommand
-	.command("events")
-	.description("List cached append-only follow graph events")
-	.option("--account <accountId>", "Account id")
-	.option("--direction <direction>", "followers or following")
-	.option("--kind <kind>", "started or ended")
-	.option("--since <date>", "YYYY-MM-DD or ISO timestamp")
-	.option("--until <date>", "YYYY-MM-DD or ISO timestamp")
-	.option("--limit <n>", "Limit results", "100")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(
-			listFollowEvents({
-				account: options.account,
-				direction:
-					options.direction === "followers" || options.direction === "following"
-						? options.direction
-						: undefined,
-				kind:
-					options.kind === "started" || options.kind === "ended"
-						? options.kind
-						: undefined,
-				since: options.since,
-				until: options.until,
-				limit: Number(options.limit),
-			}),
-			true,
-		);
-	});
-
-graphCommand
-	.command("non-mutual-following")
-	.description("List current following who are not current followers")
-	.option("--account <accountId>", "Account id")
-	.option("--sort <mode>", "followers or handle", "followers")
-	.option("--limit <n>", "Limit results", "100")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(
-			listNonMutualFollowing({
-				account: options.account,
-				sort: options.sort === "handle" ? "handle" : "followers",
-				limit: Number(options.limit),
-			}),
-			true,
-		);
-	});
-
-graphCommand
-	.command("mutuals")
-	.description("List profiles that are both followers and following")
-	.option("--account <accountId>", "Account id")
-	.option("--limit <n>", "Limit results", "100")
-	.action(async (options) => {
-		await autoUpdateBeforeRead();
-		print(
-			listMutuals({
-				account: options.account,
-				limit: Number(options.limit),
-			}),
-			true,
-		);
-	});
-
-program
-	.command("db stats")
-	.description("Show local storage and dataset stats")
-	.action(async () => {
-		await autoUpdateBeforeRead();
-		const meta = await getQueryEnvelope();
-		const paths = getBirdclawPaths();
-		print(
-			{
-				paths,
-				database: getDatabaseRuntimeMetrics(),
-				stats: meta.stats,
-				transport: meta.transport,
-			},
-			program.opts().json ?? false,
-		);
-	});
-
-const backupCommand = program
-	.command("backup")
-	.description("Export, import, and validate Git-friendly text backups");
-
-backupCommand
-	.command("export")
-	.description("Export canonical JSONL backup shards")
-	.requiredOption("--repo <path>", "Backup repository/path")
-	.option("--commit", "Create a git commit in the backup repo")
-	.option("--push", "Push the backup repo after committing")
-	.option(
-		"--message <message>",
-		"Git commit message",
-		"archive: update birdclaw backup",
-	)
-	.option("--no-validate", "Skip post-export validation")
-	.action(async (options) => {
-		const result = await exportBackup({
-			repoPath: options.repo,
-			commit: Boolean(options.commit) || Boolean(options.push),
-			push: Boolean(options.push),
-			message: options.message,
-			validate: options.validate,
-		});
-		print(result, true);
-	});
-
-backupCommand
-	.command("import <repo>")
-	.description("Merge a canonical JSONL backup into the local SQLite store")
-	.option("--no-validate", "Skip backup validation before import")
-	.option("--replace", "Replace local portable tables instead of merging")
-	.action(async (repo, options) => {
-		const result = await importBackup({
-			repoPath: repo,
-			validate: options.validate,
-			mode: options.replace ? "replace" : "merge",
-		});
-		print(result, true);
-	});
-
-backupCommand
-	.command("sync")
-	.description("Pull, merge-import, export, commit, and push a backup repo")
-	.requiredOption("--repo <path>", "Backup repository/path")
-	.option("--remote <url>", "Git remote to clone/configure")
-	.option(
-		"--message <message>",
-		"Git commit message",
-		"archive: sync birdclaw backup",
-	)
-	.action(async (options) => {
-		const result = await syncBackup({
-			repoPath: options.repo,
-			remote: options.remote,
-			message: options.message,
-		});
-		print(result, true);
-	});
-
-backupCommand
-	.command("validate <repo>")
-	.description("Validate backup manifest, shard hashes, and JSONL rows")
-	.action(async (repo) => {
-		const result = await validateBackup(repo);
-		print(result, true);
-		if (!result.ok) {
-			process.exitCode = 1;
-		}
-	});
+registerStorageCommands(commandContext);
 
 program
 	.command("serve")

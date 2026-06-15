@@ -10,6 +10,7 @@
 - Stream archive arrays and backup JSONL records through resumable batches instead of buffering entire source files.
 - Split query access into typed timeline, DM, status, resource, and action modules while retaining the existing compatibility import.
 - Retain Blocks, Inbox, Data Sources, and Rate Limits server state in TanStack Query across sidebar navigation and targeted refreshes.
+- Split compose, inbox, follow-graph, database, and backup CLI registration into domain-owned command modules.
 
 ## 0.8.2 - 2026-06-15
 
