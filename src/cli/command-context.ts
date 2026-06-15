@@ -6,4 +6,12 @@ export interface CliCommandContext {
 	asJson: () => boolean;
 	autoSyncAfterWrite: () => Promise<void>;
 	autoUpdateBeforeRead: () => Promise<void>;
+	parseNonNegativeIntegerOption: (
+		value: string | undefined,
+		option: string,
+	) => number | undefined;
+	parsePositiveIntegerOption: (
+		value: string | undefined,
+		option: string,
+	) => number | undefined;
 }

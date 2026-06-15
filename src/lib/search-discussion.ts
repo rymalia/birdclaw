@@ -2,10 +2,7 @@ import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { z } from "zod";
 import { prefetchCachedAvatarsForProfileIdsEffect } from "./avatar-cache";
-import {
-	runEffectBackground,
-	runEffectPromise,
-} from "./effect-runtime";
+import { runEffectBackground, runEffectPromise } from "./effect-runtime";
 import { getNativeDb } from "./db";
 import { listDmConversations } from "./dm-read-model";
 import {
