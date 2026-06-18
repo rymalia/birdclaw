@@ -124,6 +124,19 @@ describe("database init", () => {
         bookmarked integer not null default 0,
         liked integer not null default 0
       );
+			insert into tweets (
+				id, account_id, author_profile_id, kind, text, created_at,
+				bookmarked, liked
+			) values (
+				'legacy_saved_home', 'legacy_account', 'legacy_author', 'home',
+				'legacy tweet', '2026-01-01T00:00:00.000Z', 1, 1
+			), (
+				'legacy_authored', 'legacy_account', 'legacy_author', 'authored',
+				'legacy authored tweet', '2026-01-02T00:00:00.000Z', 0, 0
+			), (
+				'legacy_search', 'legacy_account', 'legacy_author', 'search',
+				'legacy search tweet', '2026-01-03T00:00:00.000Z', 0, 0
+			);
     `);
 		legacyDb.close();
 
@@ -139,6 +152,37 @@ describe("database init", () => {
 				"quoted_tweet_id",
 			]),
 		);
+		expect(columnNames.map((column) => column.name)).not.toEqual(
+			expect.arrayContaining(["account_id", "kind", "bookmarked", "liked"]),
+		);
+		expect(
+			db
+				.prepare(
+					"select account_id, tweet_id, kind from tweet_account_edges where tweet_id = ?",
+				)
+				.get("legacy_saved_home"),
+		).toEqual({
+			account_id: "legacy_account",
+			tweet_id: "legacy_saved_home",
+			kind: "home",
+		});
+		expect(
+			db
+				.prepare(
+					"select tweet_id, kind from tweet_account_edges where tweet_id in ('legacy_authored', 'legacy_search') order by tweet_id",
+				)
+				.all(),
+		).toEqual([
+			{ tweet_id: "legacy_authored", kind: "authored" },
+			{ tweet_id: "legacy_search", kind: "search" },
+		]);
+		expect(
+			db
+				.prepare(
+					"select kind from tweet_collections where tweet_id = ? order by kind",
+				)
+				.all("legacy_saved_home"),
+		).toEqual([{ kind: "bookmarks" }, { kind: "likes" }]);
 
 		const profileColumnNames = db
 			.prepare("pragma table_info(profiles)")
@@ -297,7 +341,7 @@ describe("database init", () => {
 		}) as number;
 		expect(busyTimeout).toBe(SQLITE_BUSY_TIMEOUT_MS);
 		expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
-		expect(db.pragma("user_version", { simple: true })).toBe(1);
+		expect(db.pragma("user_version", { simple: true })).toBe(2);
 	});
 
 	it("does not request a write lock for completed startup backfills", async () => {

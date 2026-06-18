@@ -2,7 +2,6 @@ import NativeSqliteDatabase, {
 	type Database,
 	SQLITE_BUSY_TIMEOUT_MS,
 } from "./sqlite";
-import { Kysely, SqliteDialect } from "kysely";
 import { ensureBirdclawDirs, getBirdclawPaths } from "./config";
 import {
 	type DatabaseMigration,
@@ -14,13 +13,9 @@ import {
 	recordDatabaseStatement,
 } from "./database-metrics";
 
-import type { BirdclawDatabase } from "./database-schema";
-export * from "./database-schema";
-
 let nativeDb: Database | undefined;
 let readDbs: Database[] = [];
 let readDbIndex = 0;
-let kyselyDb: Kysely<BirdclawDatabase> | undefined;
 let demoSeedAttempted = false;
 
 export interface InitDatabaseOptions {
@@ -28,10 +23,6 @@ export interface InitDatabaseOptions {
 }
 
 const BASE_SCHEMA_SQL = `
-  pragma journal_mode = wal;
-  pragma busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};
-  pragma foreign_keys = on;
-
   create table if not exists accounts (
     id text primary key,
     name text not null,
@@ -706,7 +697,7 @@ function backfillTweetAccountEdges(db: Database) {
 			`
       select 1
       from tweets as tweet
-      where tweet.kind in ('home', 'mention')
+      where tweet.kind in ('home', 'mention', 'authored', 'search')
         and not exists (
           select 1
           from tweet_account_edges as edge
@@ -739,12 +730,46 @@ function backfillTweetAccountEdges(db: Database) {
       '{}',
       ?
     from tweets
-    where kind in ('home', 'mention')
+    where kind in ('home', 'mention', 'authored', 'search')
   `).run(now);
 }
 
 function ensureSchemaIndexes(db: Database) {
 	db.exec(INDEX_SQL);
+}
+
+function normalizeTweetState(db: Database) {
+	backfillTweetCollections(db);
+	backfillTweetAccountEdges(db);
+	db.exec(`
+	  drop index if exists idx_tweets_kind_created;
+	  drop index if exists idx_tweets_account_created;
+	  alter table tweets rename to tweets_legacy_state;
+	  create table tweets (
+	    id text primary key,
+	    author_profile_id text not null,
+	    text text not null,
+	    created_at text not null,
+	    is_replied integer not null default 0,
+	    reply_to_id text,
+	    like_count integer not null default 0,
+	    media_count integer not null default 0,
+	    entities_json text not null default '{}',
+	    media_json text not null default '[]',
+	    quoted_tweet_id text
+	  );
+	  insert into tweets (
+	    id, author_profile_id, text, created_at, is_replied, reply_to_id,
+	    like_count, media_count, entities_json, media_json, quoted_tweet_id
+	  )
+	  select
+	    id, author_profile_id, text, created_at, is_replied, reply_to_id,
+	    like_count, media_count, entities_json, media_json, quoted_tweet_id
+	  from tweets_legacy_state;
+	  drop table tweets_legacy_state;
+	  create index idx_tweets_created on tweets(created_at desc);
+	  create index idx_tweets_quoted on tweets(quoted_tweet_id);
+	`);
 }
 
 const DATABASE_MIGRATIONS: readonly DatabaseMigration[] = [
@@ -770,6 +795,11 @@ const DATABASE_MIGRATIONS: readonly DatabaseMigration[] = [
 			backfillTweetAccountEdges(db);
 		},
 	},
+	{
+		version: 2,
+		name: "normalize tweet account and collection state",
+		up: normalizeTweetState,
+	},
 ];
 
 function ensureDemoData(db: Database) {
@@ -778,8 +808,6 @@ function ensureDemoData(db: Database) {
 	}
 
 	seedDemoData(db);
-	backfillTweetCollections(db);
-	backfillTweetAccountEdges(db);
 	demoSeedAttempted = true;
 }
 
@@ -790,6 +818,7 @@ function initDatabase(options: InitDatabaseOptions = {}) {
 		const { dbPath } = getBirdclawPaths();
 		nativeDb = createDatabaseConnection(dbPath, "writer");
 		nativeDb.exec(`
+		  pragma journal_mode = wal;
 		  pragma busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};
 		  pragma foreign_keys = on;
 		`);
@@ -799,14 +828,6 @@ function initDatabase(options: InitDatabaseOptions = {}) {
 		}
 	} else if (options.seedDemoData !== false) {
 		ensureDemoData(nativeDb);
-	}
-
-	if (!kyselyDb) {
-		kyselyDb = new Kysely<BirdclawDatabase>({
-			dialect: new SqliteDialect({
-				database: nativeDb,
-			}),
-		});
 	}
 }
 
@@ -848,42 +869,25 @@ export function getReadDb(options: InitDatabaseOptions = {}) {
 	return db;
 }
 
-export function getDb() {
-	initDatabase();
-	return kyselyDb as Kysely<BirdclawDatabase>;
-}
-
-export async function closeDatabase() {
-	const db = kyselyDb;
+export function closeDatabase() {
 	const native = nativeDb;
 	const readers = readDbs;
-	kyselyDb = undefined;
 	nativeDb = undefined;
 	readDbs = [];
 	readDbIndex = 0;
 	demoSeedAttempted = false;
 
 	for (const reader of readers) reader.close();
-	if (db) {
-		await db.destroy();
-	} else {
-		native?.close();
-	}
+	native?.close();
 }
 
 export function resetDatabaseForTests() {
-	const db = kyselyDb;
 	const native = nativeDb;
 	const readers = readDbs;
-	kyselyDb = undefined;
 	nativeDb = undefined;
 	readDbs = [];
 	readDbIndex = 0;
 	demoSeedAttempted = false;
 	for (const reader of readers) reader.close();
-	if (db) {
-		void db.destroy();
-	} else {
-		native?.close();
-	}
+	native?.close();
 }

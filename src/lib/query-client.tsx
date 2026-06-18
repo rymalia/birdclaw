@@ -1,15 +1,13 @@
-import {
-	QueryClient,
-	QueryClientProvider,
-	type QueryKey,
-} from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState, type ReactNode } from "react";
 
 export const queryKeys = {
 	status: ["status"] as const,
 	timelines: ["timeline"] as const,
 	dms: ["dms"] as const,
+	conversations: ["conversation"] as const,
 	linkInsights: ["link-insights"] as const,
+	linkPreviews: ["link-preview"] as const,
 	profileHydration: ["profile-hydration"] as const,
 	networkMap: ["network-map"] as const,
 	blocks: ["blocks"] as const,
@@ -30,13 +28,6 @@ export function createBirdclawQueryClient() {
 			},
 		},
 	});
-}
-
-export function invalidateQueryFamily(
-	queryClient: QueryClient,
-	queryKey: QueryKey,
-) {
-	return queryClient.invalidateQueries({ queryKey });
 }
 
 export function BirdclawQueryProvider({ children }: { children: ReactNode }) {

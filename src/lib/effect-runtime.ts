@@ -1,5 +1,13 @@
 import { Cause, Effect, Exit, Option } from "effect";
 
+export function toError(cause: unknown): Error {
+	return cause instanceof Error ? cause : new Error(String(cause));
+}
+
+export function trySync<A>(try_: () => A): Effect.Effect<A, Error> {
+	return Effect.try({ try: try_, catch: toError });
+}
+
 export function tryPromise<A>(
 	try_: () => PromiseLike<A>,
 ): Effect.Effect<A, unknown> {

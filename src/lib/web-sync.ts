@@ -13,12 +13,8 @@ import NativeSqliteDatabase from "./sqlite";
 import { syncTimelineCollectionEffect } from "./timeline-collections-live";
 import { syncHomeTimelineEffect } from "./timeline-live";
 
-export type WebSyncKind =
-	| "timeline"
-	| "mentions"
-	| "likes"
-	| "bookmarks"
-	| "dms";
+import type { WebSyncKind } from "./api-enums";
+export type { WebSyncKind } from "./api-enums";
 
 export interface WebSyncStep {
 	kind: WebSyncKind | "mention-threads";

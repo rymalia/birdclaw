@@ -1,5 +1,6 @@
 import { Effect } from "effect";
 import { databaseWriteEffect } from "./database-writer";
+import { toError } from "./effect-runtime";
 import type { Database } from "./sqlite";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
 
@@ -33,10 +34,6 @@ export interface CachedLiveSyncResult<
 	source: Source | "cache";
 	payload: Payload;
 	persisted: Persisted | undefined;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
 }
 
 export function resolveLiveSyncAccount(

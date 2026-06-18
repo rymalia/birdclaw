@@ -1,11 +1,10 @@
 import { Effect } from "effect";
 import { getAuthenticatedBirdAccountEffect } from "./bird";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import type { LiveDataSourcesResponse } from "./api-contracts";
 import type {
 	LiveDataSourceAccount,
 	LiveDataSourceCapability,
-	LiveDataSourcesResponse,
 	LiveDataSourceStatus,
 } from "./types";
 import {
@@ -212,8 +211,4 @@ export function getLiveDataSourcesEffect(): Effect.Effect<
 			capabilities,
 		};
 	});
-}
-
-export function getLiveDataSources(): Promise<LiveDataSourcesResponse> {
-	return runEffectPromise(getLiveDataSourcesEffect());
 }

@@ -2,6 +2,7 @@ import { Effect } from "effect";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+export const LOCAL_WEB_PEER_HEADER = "x-birdclaw-local-peer";
 
 export function jsonResponse(data: unknown, init?: ResponseInit) {
 	const headers = new Headers(init?.headers);
@@ -83,8 +84,12 @@ function isLocalWebHost(value: string) {
 	return LOCAL_HOSTS.has(host) || host.endsWith(".localhost");
 }
 
-function allowsUnauthenticatedLocalWeb() {
-	return process.env.BIRDCLAW_LOCAL_WEB === "1";
+function allowsUnauthenticatedLocalWeb(request: Request) {
+	const mode = process.env.BIRDCLAW_LOCAL_WEB;
+	if (mode === "socket") {
+		return request.headers.get(LOCAL_WEB_PEER_HEADER) === "1";
+	}
+	return mode === "1";
 }
 
 function hasForwardedRequestHeaders(request: Request) {
@@ -134,7 +139,7 @@ export function sensitiveRequestErrorResponse(request: Request) {
 	const url = new URL(request.url);
 	const token = requestWebTokenStatus(request);
 	const isLocalRequest =
-		allowsUnauthenticatedLocalWeb() &&
+		allowsUnauthenticatedLocalWeb(request) &&
 		isLocalWebHost(url.hostname) &&
 		!hasForwardedRequestHeaders(request);
 	const fetchSite = request.headers.get("sec-fetch-site");

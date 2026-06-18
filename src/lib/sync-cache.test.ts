@@ -1,31 +1,14 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { resetBirdclawPathsForTests } from "./config";
-import { getNativeDb, resetDatabaseForTests } from "./db";
+import { describe, expect, it } from "vitest";
+import { useTestHome } from "../test/test-home";
 import { createServerRuntimeServices } from "./server-runtime-services";
 import { deleteSyncCache, readSyncCache, writeSyncCache } from "./sync-cache";
 
-const tempDirs: string[] = [];
-
-afterEach(() => {
-	resetDatabaseForTests();
-	resetBirdclawPathsForTests();
-	delete process.env.BIRDCLAW_HOME;
-
-	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
+const testHome = useTestHome({ prefix: "birdclaw-sync-cache-" });
 
 describe("sync cache", () => {
 	it("stores and deletes structured payloads", () => {
-		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-sync-cache-"));
-		tempDirs.push(tempDir);
-		process.env.BIRDCLAW_HOME = tempDir;
-		const db = getNativeDb();
+		const { db } = testHome();
 
 		const updatedAt = writeSyncCache(
 			"mentions:test",
@@ -51,10 +34,7 @@ describe("sync cache", () => {
 	});
 
 	it("returns null for corrupted cached json", () => {
-		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-sync-cache-"));
-		tempDirs.push(tempDir);
-		process.env.BIRDCLAW_HOME = tempDir;
-		const db = getNativeDb();
+		const { db } = testHome();
 
 		db.prepare(
 			"insert into sync_cache (cache_key, value_json, updated_at) values (?, ?, ?)",

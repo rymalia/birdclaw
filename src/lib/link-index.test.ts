@@ -135,27 +135,48 @@ function insertTweet(
 ) {
 	db.prepare(`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked,
+        id, author_profile_id, text, created_at, is_replied,
+        reply_to_id, like_count, media_count,
         entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
 		options.id,
-		"acct_primary",
 		options.authorProfileId ?? "profile_me",
-		options.kind ?? "home",
 		options.text,
 		options.createdAt ?? "2026-04-01T12:00:00.000Z",
 		0,
 		null,
 		options.likeCount ?? 1,
 		options.mediaCount ?? 0,
-		options.bookmarked ?? 0,
-		options.liked ?? 0,
 		options.entitiesJson ?? "{}",
 		options.mediaJson ?? "[]",
 		null,
 	);
+	const createdAt = options.createdAt ?? "2026-04-01T12:00:00.000Z";
+	const accountId = "acct_primary";
+	const kind = options.kind ?? "home";
+	if (kind === "bookmark" || options.bookmarked) {
+		db.prepare(`
+			insert into tweet_collections (
+				account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+			) values (?, ?, 'bookmarks', ?, 'test', '{}', ?)
+		`).run(accountId, options.id, createdAt, createdAt);
+	}
+	if (kind === "like" || options.liked) {
+		db.prepare(`
+			insert into tweet_collections (
+				account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+			) values (?, ?, 'likes', ?, 'test', '{}', ?)
+		`).run(accountId, options.id, createdAt, createdAt);
+	}
+	if (kind !== "bookmark" && kind !== "like") {
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values (?, ?, ?, ?, ?, 1, 'test', '{}', ?)
+		`).run(accountId, options.id, kind, createdAt, createdAt, createdAt);
+	}
 }
 
 describe("link index", () => {
@@ -200,31 +221,20 @@ describe("link index", () => {
 
 	it("finds a DM t.co share through the expanded linked tweet", async () => {
 		const db = insertAccountFixture();
-		db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-			"2039395915421942108",
-			"acct_primary",
-			"profile_codetaur",
-			"bookmark",
-			"asking a vibecoder in the throes of AI psychosis what their 100k lines of code do https://t.co/veTztOtK8Q",
-			"2026-04-01T17:34:11.000Z",
-			0,
-			null,
-			4478,
-			1,
-			1,
-			1,
-			"{}",
-			JSON.stringify([
+		insertTweet(db, {
+			id: "2039395915421942108",
+			authorProfileId: "profile_codetaur",
+			kind: "bookmark",
+			text: "asking a vibecoder in the throes of AI psychosis what their 100k lines of code do https://t.co/veTztOtK8Q",
+			createdAt: "2026-04-01T17:34:11.000Z",
+			likeCount: 4478,
+			mediaCount: 1,
+			bookmarked: 1,
+			liked: 1,
+			mediaJson: JSON.stringify([
 				{ type: "video", url: "https://pbs.twimg.com/video.jpg" },
 			]),
-			null,
-		);
+		});
 		db.prepare(`
       insert into dm_conversations (
         id, account_id, participant_profile_id, title, last_message_at,
@@ -292,26 +302,10 @@ describe("link index", () => {
 
 	it("seeds tweet entity expansions without a network call", async () => {
 		const db = insertAccountFixture();
-		db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-			"tweet_1",
-			"acct_primary",
-			"profile_me",
-			"home",
-			"read https://t.co/entity",
-			"2026-04-01T12:00:00.000Z",
-			0,
-			null,
-			1,
-			0,
-			0,
-			0,
-			JSON.stringify({
+		insertTweet(db, {
+			id: "tweet_1",
+			text: "read https://t.co/entity",
+			entitiesJson: JSON.stringify({
 				urls: [
 					{
 						url: "https://t.co/entity",
@@ -320,9 +314,7 @@ describe("link index", () => {
 					},
 				],
 			}),
-			"[]",
-			null,
-		);
+		});
 		const fetchImpl = vi.fn();
 		const { backfillLinkIndex, searchLinks } = await import("./link-index");
 
@@ -640,10 +632,9 @@ describe("link index", () => {
 			entitiesJson: "{bad",
 			mediaJson: "",
 		});
-		db.prepare("update tweets set account_id = ? where id = ?").run(
-			"missing_account",
-			"777",
-		);
+		db.prepare(
+			"update tweet_account_edges set account_id = ? where tweet_id = ?",
+		).run("missing_account", "777");
 		db.prepare(`
       insert into url_expansions (
         short_url, expanded_url, final_url, status, expanded_tweet_id,

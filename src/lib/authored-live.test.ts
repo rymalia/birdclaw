@@ -91,25 +91,23 @@ function authoredCursor(accountId = "acct_primary") {
 function insertLocalAuthoredHomeTweet({
 	id,
 	source = "archive",
-	tweetAccountId = "acct_primary",
 	edgeAccountId = "acct_primary",
 }: {
 	id: string;
 	source?: string;
-	tweetAccountId?: string;
 	edgeAccountId?: string;
 }) {
 	getNativeDb()
 		.prepare(
 			`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked, entities_json,
+        id, author_profile_id, text, created_at, is_replied,
+        reply_to_id, like_count, media_count, entities_json,
         media_json, quoted_tweet_id
-      ) values (?, ?, 'profile_user_25401953', 'home', ?, ?, 0, null, 0, 0, 0, 0, '{}', '[]', null)
+      ) values (?, 'profile_user_25401953', ?, ?, 0, null, 0, 0, '{}', '[]', null)
       `,
 		)
-		.run(id, tweetAccountId, `archive tweet ${id}`, "2026-05-10T12:00:00.000Z");
+		.run(id, `archive tweet ${id}`, "2026-05-10T12:00:00.000Z");
 	getNativeDb()
 		.prepare(
 			`
@@ -654,12 +652,11 @@ describe("live authored tweet sync", () => {
 		}
 	});
 
-	it("seeds from selected account archive authored edges when the tweet belongs to another account", async () => {
+	it("seeds from selected account archive authored edges on a shared canonical tweet", async () => {
 		makeTempHome();
 		insertLocalAuthoredHomeTweet({
 			id: "1100",
 			source: "bird",
-			tweetAccountId: "acct_studio",
 			edgeAccountId: "acct_studio",
 		});
 		insertAuthoredEdge("1100", "acct_primary", "archive");

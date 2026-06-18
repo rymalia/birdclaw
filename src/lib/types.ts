@@ -1,5 +1,5 @@
-export type ResourceKind = "home" | "mentions" | "authored" | "search" | "dms";
-export type InboxKind = "mixed" | "mentions" | "dms";
+import type { FollowDirection, InboxKind, ResourceKind } from "./api-enums";
+export type { FollowDirection, InboxKind, ResourceKind } from "./api-enums";
 
 export type ReplyFilter = "all" | "replied" | "unreplied";
 export type TimelineQualityFilter = "all" | "summary";
@@ -145,7 +145,7 @@ export interface EmbeddedTweet {
 	media: TweetMediaItem[];
 }
 
-export interface TweetConversationResponse {
+export interface TweetConversation {
 	anchorId: string;
 	items: EmbeddedTweet[];
 }
@@ -162,11 +162,6 @@ export interface BlockSearchItem {
 	profile: ProfileRecord;
 	isBlocked: boolean;
 	blockedAt?: string;
-}
-
-export interface BlockListResponse {
-	items: BlockItem[];
-	matches: BlockSearchItem[];
 }
 
 export interface TimelineItem {
@@ -318,20 +313,6 @@ export interface LinkInsightQuery {
 	now?: Date;
 }
 
-export interface LinkInsightResponse {
-	kind: LinkInsightKind;
-	range: LinkInsightRange;
-	sort: LinkInsightSort;
-	source: LinkInsightSource;
-	since: string | null;
-	until: string | null;
-	items: LinkInsightItem[];
-	stats: {
-		occurrences: number;
-		groups: number;
-	};
-}
-
 export interface DmSearchMatchItem {
 	message: DmMessageItem;
 	before: DmMessageItem[];
@@ -427,14 +408,8 @@ export interface LiveDataSourceCapability {
 	notes?: string;
 }
 
-export interface LiveDataSourcesResponse {
-	generatedAt: string;
-	sources: LiveDataSourceStatus[];
-	capabilities: LiveDataSourceCapability[];
-}
-
 export type ModerationAction = "block" | "unblock" | "mute" | "unmute";
-export type ModerationTransportKind = "bird" | "xurl" | "x-web";
+export type ModerationTransportKind = "bird" | "xurl";
 
 export interface ModerationActionTransportResult {
 	ok: boolean;
@@ -449,28 +424,6 @@ export interface ArchiveCandidate {
 	sizeFormatted: string;
 	modifiedTime: string;
 	dateFormatted: string;
-}
-
-export interface QueryEnvelope {
-	accounts: AccountRecord[];
-	archives: ArchiveCandidate[];
-	transport: TransportStatus;
-	stats: {
-		home: number;
-		mentions: number;
-		dms: number;
-		needsReply: number;
-		inbox: number;
-	};
-}
-
-export interface QueryResponse {
-	resource: ResourceKind;
-	items: TimelineItem[] | DmConversationItem[];
-	selectedConversation?: {
-		conversation: DmConversationItem;
-		messages: DmMessageItem[];
-	} | null;
 }
 
 export interface InboxItem {
@@ -497,15 +450,6 @@ export interface InboxQuery {
 	minScore?: number;
 	hideLowSignal?: boolean;
 	limit?: number;
-}
-
-export interface InboxResponse {
-	items: InboxItem[];
-	stats: {
-		total: number;
-		openai: number;
-		heuristic: number;
-	};
 }
 
 export interface XurlPublicMetrics {
@@ -683,8 +627,6 @@ export interface XurlTweetsResponse {
 	};
 	meta?: Record<string, unknown>;
 }
-
-export type FollowDirection = "followers" | "following";
 
 export interface XurlFollowUsersResponse {
 	data: XurlMentionUser[];

@@ -5,6 +5,7 @@ import { getReadDb } from "./db";
 import { databaseWriteEffect } from "./database-writer";
 import { getConversationThread } from "./dm-read-model";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { upsertTweetAccountEdge } from "./tweet-account-edges";
 import {
 	dmViaXurlEffect,
 	lookupAuthenticatedUserFresh,
@@ -176,11 +177,18 @@ function writePostDraft(
 	db.prepare(
 		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked
-    ) values (?, ?, ?, 'home', ?, ?, 0, null, 0, 0, 0, 0)
+      id, author_profile_id, text, created_at,
+      is_replied, reply_to_id, like_count, media_count
+    ) values (?, ?, ?, ?, 0, null, 0, 0)
     `,
-	).run(draft.tweetId, accountId, draft.authorProfileId, text, draft.createdAt);
+	).run(draft.tweetId, draft.authorProfileId, text, draft.createdAt);
+	upsertTweetAccountEdge(db, {
+		accountId,
+		tweetId: draft.tweetId,
+		kind: "home",
+		source: "local",
+		seenAt: draft.createdAt,
+	});
 
 	db.prepare("insert into tweets_fts (tweet_id, text) values (?, ?)").run(
 		draft.tweetId,
@@ -245,18 +253,18 @@ export function createTweetReplyEffect(
 		db.prepare(
 			`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked
-    ) values (?, ?, ?, 'home', ?, ?, 1, ?, 0, 0, 0, 0)
+      id, author_profile_id, text, created_at,
+      is_replied, reply_to_id, like_count, media_count
+    ) values (?, ?, ?, ?, 1, ?, 0, 0)
     `,
-		).run(
-			draft.replyId,
+		).run(draft.replyId, draft.authorProfileId, text, draft.createdAt, tweetId);
+		upsertTweetAccountEdge(db, {
 			accountId,
-			draft.authorProfileId,
-			text,
-			draft.createdAt,
-			tweetId,
-		);
+			tweetId: draft.replyId,
+			kind: "home",
+			source: "local",
+			seenAt: draft.createdAt,
+		});
 		db.prepare("insert into tweets_fts (tweet_id, text) values (?, ?)").run(
 			draft.replyId,
 			text,

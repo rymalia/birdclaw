@@ -1,4 +1,5 @@
 import { Effect } from "effect";
+import type { z } from "zod";
 import { runEffectBackground } from "./effect-runtime";
 
 const encoder = new TextEncoder();
@@ -11,6 +12,7 @@ export function createEffectNdjsonResponse<Event>({
 	initialEvents = [],
 	run,
 	errorEvent,
+	schema,
 }: {
 	request: Request;
 	initialEvents?: Event[];
@@ -19,6 +21,7 @@ export function createEffectNdjsonResponse<Event>({
 		emit: (event: Event) => void;
 	}) => Effect.Effect<unknown, unknown>;
 	errorEvent: (error: unknown) => Event;
+	schema?: z.ZodType<Event>;
 }) {
 	let abortStream: (() => void) | undefined;
 
@@ -60,7 +63,7 @@ export function createEffectNdjsonResponse<Event>({
 					}
 				};
 				const emit = (event: Event) => {
-					enqueue(`${JSON.stringify(event)}\n`);
+					enqueue(`${JSON.stringify(schema ? schema.parse(event) : event)}\n`);
 				};
 
 				request.signal.addEventListener("abort", abort, { once: true });

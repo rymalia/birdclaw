@@ -1,12 +1,7 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
 import { Effect } from "effect";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { resetBirdclawPathsForTests } from "./config";
-import { resetDatabaseWriterForTests } from "./database-writer";
-import { getNativeDb, resetDatabaseForTests } from "./db";
+import { describe, expect, it, vi } from "vitest";
+import { insertTestAccount, useTestHome } from "../test/test-home";
 import { runEffectPromise } from "./effect-runtime";
 import {
 	assertLiveAccountMatches,
@@ -17,21 +12,10 @@ import {
 } from "./live-sync-engine";
 import { writeSyncCache } from "./sync-cache";
 
-let tempDir: string | undefined;
-
-afterEach(() => {
-	resetDatabaseWriterForTests();
-	resetDatabaseForTests();
-	resetBirdclawPathsForTests();
-	delete process.env.BIRDCLAW_HOME;
-	if (tempDir) rmSync(tempDir, { recursive: true, force: true });
-	tempDir = undefined;
-});
+const testHome = useTestHome({ prefix: "birdclaw-sync-engine-" });
 
 function setupDatabase() {
-	tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-sync-engine-"));
-	process.env.BIRDCLAW_HOME = tempDir;
-	const db = getNativeDb({ seedDemoData: false });
+	const { db } = testHome();
 	db.exec("create table sync_events (value text)");
 	return db;
 }
@@ -39,20 +23,23 @@ function setupDatabase() {
 describe("live sync engine", () => {
 	it("resolves default and selected accounts", () => {
 		const db = setupDatabase();
-		db.prepare(
-			"insert into accounts (id, name, handle, external_user_id, transport, is_default, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-		).run("main", "Main", "@main", null, "bird", 1, "2024-01-01");
-		db.prepare(
-			"insert into accounts (id, name, handle, external_user_id, transport, is_default, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-		).run(
-			"secondary",
-			"Secondary",
-			"@secondary",
-			"222",
-			"bird",
-			0,
-			"2024-01-02",
-		);
+		insertTestAccount(db, {
+			id: "main",
+			name: "Main",
+			handle: "@main",
+			externalUserId: null,
+			transport: "bird",
+			createdAt: "2024-01-01",
+		});
+		insertTestAccount(db, {
+			id: "secondary",
+			name: "Secondary",
+			handle: "@secondary",
+			externalUserId: "222",
+			transport: "bird",
+			isDefault: 0,
+			createdAt: "2024-01-02",
+		});
 
 		expect(resolveLiveSyncAccount(db)).toEqual({
 			accountId: "main",

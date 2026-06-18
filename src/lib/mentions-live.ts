@@ -3,7 +3,7 @@ import { Effect } from "effect";
 import type { MentionsDataSource } from "./config";
 import { databaseWriteEffect } from "./database-writer";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { liveTransportGateway } from "./live-transport-gateway";
 import {
 	assertLiveAccountMatches,
@@ -13,6 +13,7 @@ import {
 import { serializeMentionItemsAsXurlCompatible } from "./mentions-export";
 import { listTimelineItems } from "./timeline-read-model";
 import { deleteSyncCache, readSyncCache, writeSyncCache } from "./sync-cache";
+import { runSyncPlanEffect } from "./sync-plan";
 import type {
 	ReplyFilter,
 	XurlMentionData,
@@ -78,17 +79,6 @@ interface MentionCursorValue extends XurlMentionsResponse {
 }
 interface MentionHighWaterValue {
 	sinceId: string;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
 }
 
 function getMentionsFetchModeKey({
@@ -478,9 +468,7 @@ function mergeMentionsIntoLocalStore(
 	ingestTweetPayload(db, {
 		accountId,
 		payload,
-		kind: "mention",
 		edgeKind: "mention",
-		replaceSecondaryKind: true,
 		source,
 	});
 }
@@ -608,48 +596,36 @@ function fetchMentionsViaXurlEffect({
 			);
 		}
 
-		const pages: XurlMentionsResponse[] = [];
-		let nextToken: string | undefined = startPaginationToken;
-		let pageCount = 0;
-		do {
-			const payload = yield* liveTransportGateway.xurl.listMentions({
-				maxResults: limit,
-				username: resolvedAccount.username,
-				userId: String(accountUserId),
-				paginationToken: nextToken,
-				...(sinceId ? { sinceId } : {}),
-				...(startTime ? { startTime } : {}),
-			});
-			pages.push(payload);
-			const metaNextToken =
-				typeof payload.meta?.next_token === "string"
-					? payload.meta.next_token
-					: undefined;
-			nextToken = metaNextToken;
-			pageCount += 1;
-			const fetched = pages.reduce((sum, item) => sum + item.data.length, 0);
-			const done =
-				!all ||
-				!nextToken ||
-				(parsedMaxPages !== null && pageCount >= parsedMaxPages);
-			yield* Effect.sync(() =>
+		const result = yield* runSyncPlanEffect({
+			fetchPage: ({ cursor }) =>
+				liveTransportGateway.xurl.listMentions({
+					maxResults: limit,
+					username: resolvedAccount.username,
+					userId: String(accountUserId),
+					paginationToken: cursor,
+					...(sinceId ? { sinceId } : {}),
+					...(startTime ? { startTime } : {}),
+				}),
+			getItemCount: (page) => page.data.length,
+			getNextCursor: (page) =>
+				typeof page.meta?.next_token === "string"
+					? page.meta.next_token
+					: undefined,
+			initialCursor: startPaginationToken,
+			maxPages: all ? (parsedMaxPages ?? undefined) : 1,
+			onPage: ({ fetched, pageNumber, done }) =>
 				onProgress?.({
 					source: "xurl",
 					fetched,
 					total: parsedMaxPages === null ? undefined : parsedMaxPages * limit,
-					page: pageCount,
+					page: pageNumber,
 					maxPages: parsedMaxPages ?? undefined,
 					pageSize: limit,
 					done,
 				}),
-			);
-		} while (
-			all &&
-			nextToken &&
-			(parsedMaxPages === null || pageCount < parsedMaxPages)
-		);
+		});
 
-		return mergeMentionPayloads(pages);
+		return mergeMentionPayloads(result.pages);
 	});
 }
 

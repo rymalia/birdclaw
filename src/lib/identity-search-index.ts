@@ -2,6 +2,7 @@ import type { Database } from "./sqlite";
 import { fetchProfileAffiliations } from "./profile-affiliations";
 import { fetchProfileBioEntities } from "./profile-bio-entities";
 import { fetchProfileSnapshots } from "./profile-history";
+import { profileFromDbRow } from "./profile-row";
 import type { ProfileRecord } from "./types";
 
 interface IdentityIndexEntry {
@@ -49,20 +50,6 @@ function addEntry(
 	}
 }
 
-function parseJsonObject(value: unknown) {
-	if (typeof value !== "string" || value.length === 0) {
-		return undefined;
-	}
-	try {
-		const parsed = JSON.parse(value) as unknown;
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 function getUrlEntityExpandedUrl(entity: unknown) {
 	if (!entity || typeof entity !== "object") {
 		return undefined;
@@ -86,33 +73,6 @@ function getProfileBioUrls(profile: ProfileRecord) {
 	return urls
 		.map(getUrlEntityExpandedUrl)
 		.filter((url): url is string => Boolean(url));
-}
-
-function profileFromRow(row: Record<string, unknown>): ProfileRecord {
-	const entities = parseJsonObject(row.entities_json);
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio ?? ""),
-		followersCount: Number(row.followers_count ?? 0),
-		followingCount: Number(row.following_count ?? 0),
-		avatarHue: Number(row.avatar_hue ?? 0),
-		...(typeof row.avatar_url === "string" && row.avatar_url.length > 0
-			? { avatarUrl: row.avatar_url }
-			: {}),
-		...(typeof row.location === "string" && row.location.length > 0
-			? { location: row.location }
-			: {}),
-		...(typeof row.url === "string" && row.url.length > 0
-			? { url: row.url }
-			: {}),
-		...(typeof row.verified_type === "string" && row.verified_type.length > 0
-			? { verifiedType: row.verified_type }
-			: {}),
-		...(entities ? { entities } : {}),
-		createdAt: String(row.created_at),
-	};
 }
 
 function collectProfileEntries(
@@ -211,7 +171,7 @@ export function syncIdentitySearchIndexForProfileIds(
       `,
 		)
 		.all(...uniqueProfileIds) as Array<Record<string, unknown>>;
-	const profiles = rows.map(profileFromRow);
+	const profiles = rows.map((row) => profileFromDbRow(row));
 	const affiliationsByProfile = fetchProfileAffiliations(db, uniqueProfileIds);
 	const bioEntitiesByProfile = fetchProfileBioEntities(db, uniqueProfileIds);
 	const snapshotsByProfile = fetchProfileSnapshots(db, uniqueProfileIds);
@@ -362,8 +322,3 @@ export function ensureIdentitySearchIndexForDmProfiles(
 		rows.map((row) => row.profile_id),
 	);
 }
-
-export const __test__ = {
-	normalizeIndexValue,
-	getProfileBioUrls,
-};

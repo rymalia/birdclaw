@@ -1,13 +1,14 @@
 import { Effect } from "effect";
 import type { Database } from "./sqlite";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, toError, trySync } from "./effect-runtime";
 import { liveTransportGateway } from "./live-transport-gateway";
 import {
 	normalizeCacheTtlMs,
 	resolveLiveSyncAccount,
 	runCachedLiveSyncEffect,
 } from "./live-sync-engine";
+import { runSyncPlanEffect } from "./sync-plan";
 import type { XurlMentionsResponse, XurlTweetsResponse } from "./types";
 import { ingestTweetPayload } from "./tweet-repository";
 
@@ -49,17 +50,6 @@ const DEFAULT_MAX_PAGES = 200;
 const DEFAULT_CACHE_TTL_MS = 2 * 60_000;
 const XURL_PAGE_SIZE = 100;
 
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
 function normalizeLimit(limit: number | undefined) {
 	if (limit === undefined) return DEFAULT_SEARCH_LIMIT;
 	if (!Number.isFinite(limit) || limit < 1) {
@@ -94,7 +84,6 @@ function mergeTweetSearchIntoLocalStore(
 	return ingestTweetPayload(db, {
 		accountId,
 		payload,
-		kind: "search",
 		edgeKind: "search",
 		source,
 	});
@@ -214,31 +203,28 @@ function fetchXurlSearchEffect({
 	until?: string;
 }): Effect.Effect<XurlMentionsResponse, Error> {
 	return Effect.gen(function* () {
-		const responses: XurlMentionsResponse[] = [];
-		let nextToken: string | undefined;
-		for (let page = 0; page < maxPages; page += 1) {
-			const remaining =
-				limit -
-				responses.reduce((total, response) => total + response.data.length, 0);
-			if (remaining <= 0) break;
-			const response = yield* liveTransportGateway.xurl.searchRecentTweets(
-				query,
-				{
-					maxResults: Math.max(10, Math.min(XURL_PAGE_SIZE, remaining)),
-					paginationToken: nextToken,
-					startTime: since,
-					endTime: until,
-					timeoutMs,
-				},
-			);
-			responses.push(toMentionsResponse(response));
-			nextToken =
-				typeof response.meta?.next_token === "string"
-					? String(response.meta.next_token)
-					: undefined;
-			if (!nextToken) break;
-		}
-		return mergeResponses(responses);
+		const result = yield* runSyncPlanEffect({
+			fetchPage: ({ cursor, fetched }) => {
+				const remaining = Math.max(1, limit - fetched);
+				return liveTransportGateway.xurl
+					.searchRecentTweets(query, {
+						maxResults: Math.max(10, Math.min(XURL_PAGE_SIZE, remaining)),
+						paginationToken: cursor,
+						startTime: since,
+						endTime: until,
+						timeoutMs,
+					})
+					.pipe(Effect.map(toMentionsResponse));
+			},
+			getItemCount: (page) => page.data.length,
+			getNextCursor: (page) =>
+				typeof page.meta?.next_token === "string"
+					? page.meta.next_token
+					: undefined,
+			maxItems: limit,
+			maxPages,
+		});
+		return mergeResponses(result.pages);
 	});
 }
 

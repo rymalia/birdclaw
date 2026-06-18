@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { getNativeDb } from "./db";
+import { parseJsonObject } from "./json-codec";
 import { coordinatesFromLocationKey, normalizeLocationKey } from "./location";
 import type { Database } from "./sqlite";
 
@@ -114,8 +115,8 @@ export function readCachedGeocodes(
 				typeof row.approx_radius_m === "number"
 					? row.approx_radius_m
 					: undefined,
-			bounds: parseJsonRecord(row.bounds_json),
-			components: parseJsonRecord(row.components_json),
+			bounds: parseJsonObject(row.bounds_json),
+			components: parseJsonObject(row.components_json),
 		});
 	}
 	return map;
@@ -281,16 +282,4 @@ export async function geocodeLocation(
 	};
 	storeGeocode(result, db);
 	return result;
-}
-
-function parseJsonRecord(value: unknown) {
-	if (typeof value !== "string" || value.length === 0) return undefined;
-	try {
-		const parsed = JSON.parse(value) as unknown;
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: undefined;
-	} catch {
-		return undefined;
-	}
 }

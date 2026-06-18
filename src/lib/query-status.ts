@@ -1,12 +1,13 @@
 import { Effect } from "effect";
+import type { QueryEnvelope } from "./api-contracts";
 import type { Database } from "./sqlite";
 import { findArchivesCachedEffect } from "./archive-finder";
 import { getReadDb } from "./db";
 import { runEffectPromise } from "./effect-runtime";
-import type { AccountRecord, QueryEnvelope } from "./types";
+import type { AccountRecord } from "./types";
 import { getTransportStatusEffect } from "./xurl";
 
-export type { QueryEnvelope } from "./types";
+export type { QueryEnvelope } from "./api-contracts";
 
 function toError(error: unknown) {
 	return error instanceof Error ? error : new Error(String(error));
@@ -21,30 +22,12 @@ function countTimelineEdges(db: Database, kind: "home" | "mention") {
 		.prepare(
 			`
       select count(distinct tweet_id) as count
-      from (
-        select edge.tweet_id
-        from tweet_account_edges edge
-        where edge.kind = ?
-          and exists (
-            select 1
-            from tweets t
-            where t.id = edge.tweet_id
-          )
-        union all
-        select legacy.id as tweet_id
-        from tweets legacy
-        where legacy.kind = ?
-          and not exists (
-            select 1
-            from tweet_account_edges edge
-            where edge.account_id = legacy.account_id
-              and edge.tweet_id = legacy.id
-              and edge.kind = legacy.kind
-          )
-      )
+		from tweet_account_edges edge
+		where edge.kind = ?
+		  and exists (select 1 from tweets t where t.id = edge.tweet_id)
       `,
 		)
-		.get(kind, kind) as { count: number | bigint } | undefined;
+		.get(kind) as { count: number | bigint } | undefined;
 	return Number(row?.count ?? 0);
 }
 

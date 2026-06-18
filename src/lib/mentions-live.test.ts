@@ -51,33 +51,39 @@ function makeTempHome() {
 function clearLocalMentionRows() {
 	const db = getNativeDb();
 	db.exec("delete from tweet_account_edges where kind = 'mention'");
-	db.exec("delete from tweets where kind = 'mention'");
+	db.exec(`
+		delete from tweets
+		where not exists (
+			select 1 from tweet_account_edges edge where edge.tweet_id = tweets.id
+		)
+		and not exists (
+			select 1 from tweet_collections collection where collection.tweet_id = tweets.id
+		)
+	`);
 }
 
 function insertLocalMentionBaseline({
 	tweetId = "1000",
 	accountId = "acct_primary",
-	tweetAccountId = accountId,
 	source = "archive",
 }: {
 	tweetId?: string;
 	accountId?: string;
-	tweetAccountId?: string;
 	source?: string;
 } = {}) {
 	const db = getNativeDb();
 	db.prepare(
 		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
+	  id, author_profile_id, text, created_at,
+	  is_replied, reply_to_id, like_count, media_count,
+	  entities_json, media_json, quoted_tweet_id
     ) values (
-      ?, ?, 'profile_user_42', 'mention', 'archived mention',
-      '2026-03-09T01:59:00.000Z', 0, null, 0, 0, 0, 0, '{}', '[]', null
+	  ?, 'profile_user_42', 'archived mention',
+	  '2026-03-09T01:59:00.000Z', 0, null, 0, 0, '{}', '[]', null
     )
     `,
-	).run(tweetId, tweetAccountId);
+	).run(tweetId);
 	db.prepare(
 		`
     insert into tweet_account_edges (
@@ -416,13 +422,13 @@ describe("cached live mentions", () => {
 			.prepare(
 				`
 	    insert into tweets (
-	      id, account_id, author_profile_id, kind, text, created_at,
-	      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
+	      id, author_profile_id, text, created_at,
+	      is_replied, reply_to_id, like_count, media_count,
 	      entities_json, media_json, quoted_tweet_id
 	    ) values (
-	      'tweet_authored_mention', 'acct_primary', 'profile_user_42',
-	      'authored', 'authored original', '2026-03-09T01:59:00.000Z',
-	      0, null, 1, 0, 0, 0, '{}', '[]', null
+	      'tweet_authored_mention', 'profile_user_42',
+	      'authored original', '2026-03-09T01:59:00.000Z',
+	      0, null, 1, 0, '{}', '[]', null
 	    )
 	    `,
 			)
@@ -430,14 +436,28 @@ describe("cached live mentions", () => {
 		getNativeDb()
 			.prepare(
 				`
+				insert into tweet_account_edges (
+				  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+				  seen_count, source, raw_json, updated_at
+				) values (
+				  'acct_primary', 'tweet_authored_mention', 'authored',
+				  '2026-03-09T01:59:00.000Z', '2026-03-09T01:59:00.000Z',
+				  1, 'test', '{}', '2026-03-09T01:59:00.000Z'
+				)
+				`,
+			)
+			.run();
+		getNativeDb()
+			.prepare(
+				`
 	    insert into tweets (
-	      id, account_id, author_profile_id, kind, text, created_at,
-	      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
+	      id, author_profile_id, text, created_at,
+	      is_replied, reply_to_id, like_count, media_count,
 	      entities_json, media_json, quoted_tweet_id
 	    ) values (
-	      'tweet_media_mention', 'acct_primary', 'profile_user_42',
-	      'home', 'mention with archived media', '2026-03-09T01:58:00.000Z',
-	      0, null, 1, 1, 0, 0, '{}', '[{"url":"https://img.example/media.jpg","type":"image"}]', null
+	      'tweet_media_mention', 'profile_user_42',
+	      'mention with archived media', '2026-03-09T01:58:00.000Z',
+	      0, null, 1, 1, '{}', '[{"url":"https://img.example/media.jpg","type":"image"}]', null
 	    )
 	    `,
 			)
@@ -498,10 +518,9 @@ describe("cached live mentions", () => {
 		});
 		expect(
 			getNativeDb()
-				.prepare("select kind, text, like_count from tweets where id = ?")
+				.prepare("select text, like_count from tweets where id = ?")
 				.get("tweet_sync_mention_1"),
 		).toEqual({
-			kind: "mention",
 			text: "Synced mention from xurl",
 			like_count: 3,
 		});
@@ -518,13 +537,19 @@ describe("cached live mentions", () => {
 		});
 		expect(
 			getNativeDb()
-				.prepare("select kind, text, like_count from tweets where id = ?")
+				.prepare("select text, like_count from tweets where id = ?")
 				.get("tweet_authored_mention"),
 		).toEqual({
-			kind: "authored",
 			text: "authored tweet also appears as mention",
 			like_count: 8,
 		});
+		expect(
+			getNativeDb()
+				.prepare(
+					"select kind from tweet_account_edges where account_id = ? and tweet_id = ? and kind = 'authored'",
+				)
+				.get("acct_primary", "tweet_authored_mention"),
+		).toEqual({ kind: "authored" });
 		expect(
 			getNativeDb()
 				.prepare("select media_count, media_json from tweets where id = ?")
@@ -924,7 +949,9 @@ describe("cached live mentions", () => {
 		expect(thirdCall).not.toHaveProperty("sinceId");
 		expect(
 			getNativeDb()
-				.prepare("select kind from tweets where id = ?")
+				.prepare(
+					"select kind from tweet_account_edges where tweet_id = ? and kind = 'mention'",
+				)
 				.get("start_page_2"),
 		).toEqual({ kind: "mention" });
 	});
@@ -1132,7 +1159,11 @@ describe("cached live mentions", () => {
 		});
 		expect(call).not.toHaveProperty("sinceId");
 		expect(
-			db.prepare("select kind from tweets where id = ?").get("180"),
+			db
+				.prepare(
+					"select kind from tweet_account_edges where tweet_id = ? and kind = 'mention'",
+				)
+				.get("180"),
 		).toEqual({ kind: "mention" });
 		expect(
 			db
@@ -1277,11 +1308,15 @@ describe("cached live mentions", () => {
 			sinceId: "250",
 		});
 		expect(
-			db.prepare("select kind from tweets where id = ?").get("180"),
+			db
+				.prepare(
+					"select kind from tweet_account_edges where tweet_id = ? and kind = 'mention'",
+				)
+				.get("180"),
 		).toEqual({ kind: "mention" });
 	});
 
-	it("seeds from mention edges even when the tweet belongs to another account", async () => {
+	it("seeds from account-scoped mention edges on a shared tweet", async () => {
 		makeTempHome();
 		clearLocalMentionRows();
 		const db = getNativeDb();
@@ -1308,8 +1343,21 @@ describe("cached live mentions", () => {
 		insertLocalMentionBaseline({
 			tweetId: "2000",
 			accountId: "acct_B",
-			tweetAccountId: "acct_A",
 		});
+		db.prepare(
+			`
+			insert into tweet_account_edges (
+			  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+			  seen_count, source, raw_json, updated_at
+			) values (?, ?, 'home', ?, ?, 1, 'archive', '{}', ?)
+			`,
+		).run(
+			"acct_A",
+			"2000",
+			"2026-03-09T01:59:00.000Z",
+			"2026-03-09T01:59:00.000Z",
+			"2026-03-09T01:59:00.000Z",
+		);
 		listMentionsViaXurlMock.mockResolvedValueOnce({
 			data: [],
 			meta: { result_count: 0 },
@@ -1398,10 +1446,10 @@ describe("cached live mentions", () => {
 			.prepare(
 				`
         insert into tweets (
-          id, account_id, author_profile_id, kind, text, created_at,
-          is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-          entities_json, media_json, quoted_tweet_id
-        ) values (?, 'acct_primary', 'profile_user_999', 'mention', ?, ?, 0, null, 0, 1, 0, 0, '{}', ?, null)
+		  id, author_profile_id, text, created_at,
+		  is_replied, reply_to_id, like_count, media_count,
+		  entities_json, media_json, quoted_tweet_id
+		) values (?, 'profile_user_999', ?, ?, 0, null, 0, 1, '{}', ?, null)
         `,
 			)
 			.run(

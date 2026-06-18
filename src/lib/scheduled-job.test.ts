@@ -1,0 +1,72 @@
+// @vitest-environment node
+import {
+	existsSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	utimesSync,
+	writeFileSync,
+} from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+	acquireScheduledJobLock,
+	appendScheduledJobAudit,
+	startScheduledJobRun,
+} from "./scheduled-job";
+
+const tempDirs: string[] = [];
+
+function makeTempDir() {
+	const directory = mkdtempSync(
+		path.join(os.tmpdir(), "birdclaw-job-runtime-"),
+	);
+	tempDirs.push(directory);
+	return directory;
+}
+
+afterEach(() => {
+	for (const directory of tempDirs.splice(0)) {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+describe("scheduled job runtime", () => {
+	it("appends JSONL audit entries with run metadata", async () => {
+		const logPath = path.join(makeTempDir(), "audit", "job.jsonl");
+		const run = startScheduledJobRun(Date.now() - 10);
+		const entry = { job: "test", ok: true, ...run.finish() };
+
+		await appendScheduledJobAudit(logPath, entry);
+
+		expect(JSON.parse(readFileSync(logPath, "utf8"))).toMatchObject({
+			job: "test",
+			ok: true,
+			host: os.hostname(),
+			pid: process.pid,
+		});
+		expect(entry.durationMs).toBeGreaterThanOrEqual(10);
+	});
+
+	it("rejects active locks and replaces stale locks", async () => {
+		const lockPath = path.join(makeTempDir(), "locks", "job.lock");
+		const release = await acquireScheduledJobLock(lockPath, 1_000);
+
+		expect(release).toBeTypeOf("function");
+		await expect(
+			acquireScheduledJobLock(lockPath, 1_000),
+		).resolves.toBeUndefined();
+		await release?.();
+		expect(existsSync(lockPath)).toBe(false);
+
+		writeFileSync(lockPath, "stale\n", "utf8");
+		const old = new Date(Date.now() - 2_000);
+		utimesSync(lockPath, old, old);
+		const staleRelease = await acquireScheduledJobLock(lockPath, 1_000);
+
+		expect(staleRelease).toBeTypeOf("function");
+		expect(readFileSync(lockPath, "utf8")).toContain(`"pid":${process.pid}`);
+		await staleRelease?.();
+	});
+});

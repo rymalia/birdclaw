@@ -48,13 +48,24 @@ export function seedDemoData(db: Database) {
 
 	const insertTweet = db.prepare(`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at, is_replied,
-      reply_to_id, like_count, media_count, bookmarked, liked, entities_json, media_json, quoted_tweet_id
+      id, author_profile_id, text, created_at, is_replied, reply_to_id,
+      like_count, media_count, entities_json, media_json, quoted_tweet_id
     ) values (
-      @id, @accountId, @authorProfileId, @kind, @text, @createdAt, @isReplied,
-      @replyToId, @likeCount, @mediaCount, @bookmarked, @liked, @entitiesJson, @mediaJson, @quotedTweetId
+	  @id, @authorProfileId, @text, @createdAt, @isReplied, @replyToId,
+	  @likeCount, @mediaCount, @entitiesJson, @mediaJson, @quotedTweetId
     )
   `);
+	const insertTweetEdge = db.prepare(`
+	  insert into tweet_account_edges (
+	    account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+	    source, raw_json, updated_at
+	  ) values (?, ?, ?, ?, ?, 1, 'demo', '{}', ?)
+	`);
+	const insertTweetCollection = db.prepare(`
+	  insert into tweet_collections (
+	    account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+	  ) values (?, ?, ?, ?, 'demo', '{}', ?)
+	`);
 
 	const insertConversation = db.prepare(`
     insert into dm_conversations (
@@ -587,7 +598,45 @@ export function seedDemoData(db: Database) {
 		}
 
 		for (const tweet of tweets) {
-			insertTweet.run(tweet);
+			insertTweet.run({
+				id: tweet.id,
+				authorProfileId: tweet.authorProfileId,
+				text: tweet.text,
+				createdAt: tweet.createdAt,
+				isReplied: tweet.isReplied,
+				replyToId: tweet.replyToId,
+				likeCount: tweet.likeCount,
+				mediaCount: tweet.mediaCount,
+				entitiesJson: tweet.entitiesJson,
+				mediaJson: tweet.mediaJson,
+				quotedTweetId: tweet.quotedTweetId,
+			});
+			insertTweetEdge.run(
+				tweet.accountId,
+				tweet.id,
+				tweet.kind,
+				tweet.createdAt,
+				tweet.createdAt,
+				tweet.createdAt,
+			);
+			if (tweet.bookmarked) {
+				insertTweetCollection.run(
+					tweet.accountId,
+					tweet.id,
+					"bookmarks",
+					tweet.createdAt,
+					tweet.createdAt,
+				);
+			}
+			if (tweet.liked) {
+				insertTweetCollection.run(
+					tweet.accountId,
+					tweet.id,
+					"likes",
+					tweet.createdAt,
+					tweet.createdAt,
+				);
+			}
 			insertTweetsFts.run(tweet.id, tweet.text);
 		}
 

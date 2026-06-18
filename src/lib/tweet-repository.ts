@@ -8,25 +8,13 @@ import {
 } from "./tweet-account-edges";
 import { ensureStubProfileForXUser, upsertProfileFromXUser } from "./x-profile";
 
-export type CanonicalTweetKind =
-	| "authored"
-	| "bookmark"
-	| "home"
-	| "like"
-	| "mention"
-	| "search"
-	| "thread"
-	| "thread_context";
-
 export interface IngestTweetPayloadOptions {
 	accountId: string;
 	payload: XurlMentionsResponse;
-	kind: CanonicalTweetKind;
 	source: string;
 	edgeKind?: TweetAccountEdgeKind;
 	collectionKind?: "likes" | "bookmarks";
 	markRepliesAsReplied?: boolean;
-	replaceSecondaryKind?: boolean;
 }
 
 function getReferencedTweetId(tweet: XurlMentionData, type: string) {
@@ -48,12 +36,10 @@ export function ingestTweetPayload(
 	{
 		accountId,
 		payload,
-		kind,
 		source,
 		edgeKind,
 		collectionKind,
 		markRepliesAsReplied = false,
-		replaceSecondaryKind = false,
 	}: IngestTweetPayloadOptions,
 ) {
 	const usersById = new Map(
@@ -61,19 +47,11 @@ export function ingestTweetPayload(
 	);
 	const upsertTweet = db.prepare(`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, author_profile_id, text, created_at, is_replied, reply_to_id,
+      like_count, media_count, entities_json, media_json, quoted_tweet_id
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
-      account_id = tweets.account_id,
       author_profile_id = excluded.author_profile_id,
-      kind = case
-        when ? = 1
-          and tweets.kind not in ('authored', 'home', 'mention')
-          then excluded.kind
-        else tweets.kind
-      end,
       text = excluded.text,
       created_at = excluded.created_at,
       is_replied = max(tweets.is_replied, excluded.is_replied),
@@ -85,8 +63,6 @@ export function ingestTweetPayload(
         when excluded.media_json not in ('', '[]', 'null') then excluded.media_json
         else tweets.media_json
       end,
-      bookmarked = tweets.bookmarked,
-      liked = tweets.liked,
       quoted_tweet_id = coalesce(tweets.quoted_tweet_id, excluded.quoted_tweet_id)
   `);
 	const upsertCollection = collectionKind
@@ -113,21 +89,16 @@ export function ingestTweetPayload(
 			const quotedTweetId = getReferencedTweetId(tweet, "quoted");
 			upsertTweet.run(
 				tweet.id,
-				accountId,
 				profile.profile.id,
-				kind,
 				tweet.text,
 				tweet.created_at,
 				markRepliesAsReplied && replyToId ? 1 : 0,
 				replyToId,
 				Number(tweet.public_metrics?.like_count ?? 0),
 				countTweetMedia(tweet),
-				collectionKind === "bookmarks" ? 1 : 0,
-				collectionKind === "likes" ? 1 : 0,
 				JSON.stringify(tweetEntitiesFromXurl(tweet.entities)),
 				buildMediaJsonFromIncludes(tweet, payload.includes?.media),
 				quotedTweetId,
-				replaceSecondaryKind ? 1 : 0,
 			);
 			if (edgeKind) {
 				upsertTweetAccountEdge(db, {

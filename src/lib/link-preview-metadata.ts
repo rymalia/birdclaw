@@ -5,6 +5,7 @@ import net from "node:net";
 import { Readable } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { Effect } from "effect";
+import type { LinkPreviewResponse } from "./api-contracts";
 import { getNativeDb } from "./db";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
 import type { Database } from "./sqlite";
@@ -23,14 +24,7 @@ const MAX_HTML_CHARS = 2_000_000;
 const MAX_REDIRECTS = 4;
 const NO_BODY_STATUS_CODES = new Set([204, 205, 304]);
 
-export interface LinkPreviewMetadata {
-	url: string;
-	title: string | null;
-	description: string | null;
-	imageUrl: string | null;
-	siteName: string | null;
-	error?: string | null;
-}
+export type LinkPreviewMetadata = LinkPreviewResponse["preview"];
 
 export interface GetLinkPreviewOptions {
 	shortUrl?: string | null;

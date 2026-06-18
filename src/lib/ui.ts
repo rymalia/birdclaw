@@ -9,9 +9,6 @@ export const bodyClass =
 export const siteShellClass =
 	"mx-auto flex min-h-screen w-full max-w-[1280px] gap-0";
 
-export const siteShellDmClass =
-	"mx-auto flex min-h-screen w-full max-w-[1280px] gap-0";
-
 export const sidebarShellClass =
 	"sticky top-0 z-30 flex h-screen w-[72px] shrink-0 flex-col justify-between border-r border-[var(--line)] bg-[var(--bg)] px-2 py-3 min-[1100px]:w-[260px] min-[1100px]:px-3";
 
@@ -56,8 +53,6 @@ export const mainColumnClass =
 
 export const mainColumnDmClass =
 	"flex w-full min-w-0 flex-1 flex-col border-x border-[var(--line)] bg-[var(--bg)]";
-
-export const pageWrapClass = "flex w-full min-w-0 flex-1 justify-start";
 
 /* Sticky page header at top of the main column. */
 export const pageHeaderClass =
@@ -105,36 +100,19 @@ export const feedRowDotClass = "text-[var(--ink-soft)]";
 export const feedRowTimestampClass =
 	"shrink-0 text-[var(--ink-soft)] hover:underline";
 
-export const feedRowMetaClass =
-	"flex flex-wrap items-center gap-2 text-[13px] text-[var(--ink-soft)]";
-
 export const feedRowActionsClass =
 	"mt-2 flex max-w-md items-center justify-between text-[var(--ink-soft)]";
 
 export const feedActionButtonClass =
 	"action-button group/action inline-flex items-center gap-1 rounded-full border-0 bg-transparent px-2 py-1 text-[13px] text-[var(--ink-soft)] transition-colors duration-150 hover:text-[var(--accent)] disabled:cursor-default disabled:opacity-55";
 
-export const feedActionLikeClass = "hover:text-[var(--like)]";
-
 export const feedActionIconWrapClass =
 	"grid size-[34px] place-items-center rounded-full transition-colors duration-150 group-hover/action:bg-[var(--accent-soft)]";
-
-export const feedActionIconWrapLikeClass =
-	"group-hover/action:bg-[var(--like-soft)]";
 
 export const feedActionIconClass = "size-[18px]";
 
 export const feedRowTextClass =
 	"whitespace-pre-wrap break-words text-[15px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere]";
-
-export const feedRowBadgeClass =
-	"inline-flex items-center gap-1 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[12px] font-semibold text-[var(--accent)]";
-
-export const feedRowBadgeAlertClass =
-	"bg-[var(--alert-soft)] text-[var(--alert)]";
-
-export const feedRowBadgeNeutralClass =
-	"bg-[var(--bg-active)] text-[var(--ink-soft)]";
 
 export const feedRowStatePillClass =
 	"inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg-active)] px-2 py-0.5 text-[12px] font-semibold text-[var(--ink-soft)]";
@@ -158,8 +136,6 @@ export const searchFieldInputClass =
 export const textFieldClass =
 	"w-full rounded-md border border-[var(--line)] bg-[var(--bg)] px-3 py-2 text-[14px] text-[var(--ink)] outline-none transition-colors duration-150 placeholder:text-[var(--ink-soft)] focus:border-[var(--accent)] focus:shadow-[0_0_0_1px_var(--accent)] disabled:cursor-default disabled:opacity-55";
 
-export const textFieldWideClass = "w-full";
-
 export const textFieldShortClass = "w-[120px]";
 
 export const selectFieldClass = cx(textFieldClass, "appearance-none pr-8");
@@ -168,18 +144,13 @@ export const selectFieldClass = cx(textFieldClass, "appearance-none pr-8");
 export const primaryButtonClass =
 	"inline-flex items-center justify-center gap-1.5 rounded-full border-0 bg-[var(--accent)] px-4 py-1.5 text-[14px] font-bold text-white shadow-none transition-colors duration-150 hover:bg-[var(--accent-hover)] active:bg-[var(--accent-press)] disabled:cursor-default disabled:opacity-55";
 
-export const primaryButtonLargeClass =
-	"inline-flex items-center justify-center gap-1.5 rounded-full border-0 bg-[var(--accent)] px-5 py-2.5 text-[15px] font-bold text-white shadow-none transition-colors duration-150 hover:bg-[var(--accent-hover)] active:bg-[var(--accent-press)] disabled:cursor-default disabled:opacity-55";
-
 export const secondaryButtonClass =
 	"inline-flex items-center justify-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-transparent px-4 py-1.5 text-[14px] font-bold text-[var(--ink)] transition-colors duration-150 hover:bg-[var(--bg-hover)] disabled:cursor-default disabled:opacity-55";
 
 export const dangerButtonClass =
 	"inline-flex items-center justify-center gap-1.5 rounded-full border border-[var(--alert)] bg-transparent px-4 py-1.5 text-[14px] font-bold text-[var(--alert)] transition-colors duration-150 hover:bg-[var(--alert-soft)] disabled:cursor-default disabled:opacity-55";
 
-export const actionButtonClass = primaryButtonClass;
-
-/* Legacy segmented control retained for routes that still use it (compact pill). */
+/* Compact segmented control. */
 export const segmentedClass =
 	"inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg)] p-1";
 
@@ -374,67 +345,8 @@ export const blockRowClass =
 
 export const blockRowBodyClass = "flex min-w-0 flex-1 flex-col gap-1";
 
-/* Aside (optional right column for stats). Hidden on small screens. */
-export const asideShellClass =
-	"sticky top-0 hidden h-screen w-[300px] shrink-0 flex-col gap-4 overflow-y-auto px-4 py-4 min-[1180px]:flex";
-
-export const asideCardClass =
-	"rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)] p-4";
-
-export const asideTitleClass = "text-[15px] font-bold text-[var(--ink)]";
-
-export const asideStatRowClass =
-	"flex items-baseline justify-between border-t border-[var(--line)] py-2 first:border-t-0 first:pt-0";
-
-export const asideStatTermClass = "text-[13px] text-[var(--ink-soft)]";
-
-export const asideStatValueClass = "text-[14px] font-bold text-[var(--ink)]";
-
-/* Misc legacy aliases kept for compatibility while routes/components migrate. */
-export const eyebrowClass =
-	"text-[12px] font-semibold uppercase tracking-wide text-[var(--ink-soft)]";
-
-export const brandMarkClass = sidebarBrandTitleClass;
-
-export const navClass = sidebarShellClass;
-
-export const navLinksClass = sidebarNavClass;
-
-export const heroShellClass = "flex flex-col gap-1 px-4 pt-3 pb-2";
-
-export const heroShellDmClass = "";
-
-export const heroControlsClass = "flex flex-wrap items-center gap-2 px-4 py-2";
-
-export const heroControlsDmClass = "";
-
-export const heroControlsBlocksClass = "";
-
-export const heroTitleClass = pageTitleClass;
-
-export const heroCopyClass = pageSubtitleClass;
-
-export const surfaceCardClass =
-	"rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)]";
-
-export const contentCardClass = feedRowClass;
-
-export const cardHeaderClass = "flex items-start justify-between gap-3";
-
-export const cardFooterClass = "flex items-center justify-between gap-3";
-
-export const identityBlockClass = "flex items-start gap-3";
-
-export const identityRowClass =
-	"flex flex-wrap items-center gap-1.5 text-[15px] text-[var(--ink-soft)]";
-
-export const metaRowClass =
-	"flex flex-wrap items-center gap-1.5 text-[13px] text-[var(--ink-soft)]";
-
 export const mutedDotClass =
 	"inline-block size-1 shrink-0 rounded-full bg-[var(--ink-soft)]";
-
-export const metaStackClass = "flex flex-col items-end gap-1";
 
 export const pillClass =
 	"inline-flex items-center rounded-full px-2 py-0.5 text-[12px] font-semibold";
@@ -446,78 +358,6 @@ export const pillAlertClass = "bg-[var(--alert-soft)] text-[var(--alert)]";
 export const timestampClass = "text-[13px] text-[var(--ink-soft)]";
 
 export const bodyCopyClass = feedRowTextClass;
-
-export const inboxTitleClass = "text-[16px] font-bold text-[var(--ink)]";
-
-export const metricRowClass =
-	"flex flex-wrap items-center gap-3 text-[13px] text-[var(--ink-soft)]";
-
-export const actionRowClass = "flex items-center gap-2";
-
-export const feedPageClass = "flex w-full min-w-0 flex-col";
-
-export const timelineLaneClass = feedClass;
-
-export const inboxLaneClass = feedClass;
-
-export const dmPageClass = "flex w-full min-w-0 flex-col";
-
-export const stackGridClass = "flex flex-col";
-
-/* Embedded tweet legacy aliases. */
-export const embeddedTweetCardClass = embeddedCardClass;
-
-export const embeddedTweetLabelClass = embeddedCardLabelClass;
-
-export const embeddedTweetHeaderClass = embeddedCardHeaderClass;
-
-export const embeddedTweetAuthorClass = "flex flex-wrap items-center gap-1.5";
-
-export const embeddedTweetCopyClass = embeddedCardCopyClass;
-
-/* DM legacy aliases (still used by DmWorkspace until rewrite). */
-export const dmGridClass = dmShellClass;
-
-export const dmListItemNonActive = "";
-
-export const dmListCopyClass = dmListBodyClass;
-
-export const dmPreviewTextClass = dmListPreviewClass;
-
-export const threadShellClass = dmThreadClass;
-
-export const threadHeaderClass = dmThreadHeaderClass;
-
-export const threadTitleClass = dmThreadNameClass;
-
-export const threadSubtitleClass = dmThreadSubtitleClass;
-
-export const threadBioClass = "text-[14px] text-[var(--ink-soft)]";
-
-export const threadDetailColumnClass =
-	"flex flex-col gap-3 rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)] p-4";
-
-export const threadDetailHeaderClass = "flex items-center gap-3";
-
-export const messageStackClass = dmMessagesClass;
-
-export const messageRowClass = dmMessageRowClass;
-
-export const messageRowOutboundClass = dmMessageRowOutboundClass;
-
-export const messageMetaClass = dmMessageMetaClass;
-
-export const messageBubbleClass = dmMessageBubbleClass;
-
-export const messageBubbleInboundClass = dmMessageBubbleInboundClass;
-
-export const messageBubbleOutboundClass = dmMessageBubbleOutboundClass;
-
-export const contextHandleClass = "text-[14px] text-[var(--ink-soft)]";
-
-export const contextBioClass = "text-[14px] leading-[1.4] text-[var(--ink)]";
-
-export const contextStatsClass = "flex flex-col gap-0";
 
 export const contextStatRowClass =
 	"grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 border-t border-[var(--line)] py-2 first:border-t-0 first:pt-0";

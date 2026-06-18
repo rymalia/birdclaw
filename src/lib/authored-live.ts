@@ -2,7 +2,7 @@ import type { Database } from "./sqlite";
 import { Effect } from "effect";
 import { databaseWriteEffect } from "./database-writer";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { liveTransportGateway } from "./live-transport-gateway";
 import { resolveLiveSyncAccount } from "./live-sync-engine";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
@@ -118,17 +118,6 @@ const AUTHORED_MEDIA_FIELDS = [
 	"height",
 	"alt_text",
 ];
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
 
 function assertXurlLimit(limit: number) {
 	if (
@@ -290,10 +279,9 @@ function findArchiveAuthoredSinceSeed(db: Database, accountId: string) {
 	          and e.tweet_id = t.id
 	          and e.kind = 'authored'
 	          and e.source = 'archive'
-	      )
+      )
       or (
-        t.kind = 'home'
-        and exists (
+        exists (
           select 1
           from tweet_account_edges e2
           where e2.account_id = ?
@@ -607,18 +595,11 @@ function mergeAuthoredPayloadIntoLocalStore({
 	const upsertTweet = db.prepare(
 		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, author_profile_id, text, created_at, is_replied, reply_to_id,
+      like_count, media_count, entities_json, media_json, quoted_tweet_id
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
-      account_id = tweets.account_id,
       author_profile_id = excluded.author_profile_id,
-      kind = case
-        when tweets.kind in ('home', 'mention', 'authored') then tweets.kind
-        when excluded.kind in ('home', 'mention', 'authored') then excluded.kind
-        else coalesce(nullif(tweets.kind, ''), excluded.kind)
-      end,
       text = excluded.text,
       created_at = excluded.created_at,
       like_count = excluded.like_count,
@@ -627,13 +608,11 @@ function mergeAuthoredPayloadIntoLocalStore({
       media_json = excluded.media_json,
       is_replied = max(tweets.is_replied, excluded.is_replied),
       reply_to_id = coalesce(excluded.reply_to_id, tweets.reply_to_id),
-      quoted_tweet_id = coalesce(excluded.quoted_tweet_id, tweets.quoted_tweet_id),
-      bookmarked = tweets.bookmarked,
-      liked = tweets.liked
+      quoted_tweet_id = coalesce(excluded.quoted_tweet_id, tweets.quoted_tweet_id)
     `,
 	);
 
-	const writeTweet = (tweet: XurlMentionData, kind: "authored" | "thread") => {
+	const writeTweet = (tweet: XurlMentionData) => {
 		const author =
 			usersById.get(tweet.author_id) ??
 			({
@@ -653,17 +632,13 @@ function mergeAuthoredPayloadIntoLocalStore({
 		const media = toLocalMedia(tweet, mediaByKey);
 		upsertTweet.run(
 			tweet.id,
-			accountId,
 			profileId,
-			kind,
 			tweet.text,
 			tweet.created_at,
 			replyToId ? 1 : 0,
 			replyToId,
 			Number(tweet.public_metrics?.like_count ?? 0),
 			getMediaCount(tweet, media),
-			0,
-			0,
 			JSON.stringify(toLocalEntities(tweet)),
 			JSON.stringify(media),
 			quotedTweetId,
@@ -674,10 +649,10 @@ function mergeAuthoredPayloadIntoLocalStore({
 	db.transaction(() => {
 		const seenAt = new Date().toISOString();
 		for (const includedTweet of payload.includes?.tweets ?? []) {
-			writeTweet(includedTweet, "thread");
+			writeTweet(includedTweet);
 		}
 		for (const tweet of payload.data) {
-			writeTweet(tweet, "authored");
+			writeTweet(tweet);
 			upsertTweetAccountEdge(db, {
 				accountId,
 				tweetId: tweet.id,

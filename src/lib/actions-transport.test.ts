@@ -15,8 +15,6 @@ const mocks = vi.hoisted(() => ({
 	unblockUserViaXurl: vi.fn(),
 	muteUserViaXurl: vi.fn(),
 	unmuteUserViaXurl: vi.fn(),
-	blockUserViaXWeb: vi.fn(),
-	unblockUserViaXWeb: vi.fn(),
 	lookupAuthenticatedUser: vi.fn(),
 }));
 
@@ -35,11 +33,6 @@ vi.mock("./xurl", () => ({
 	unmuteUserViaXurl: mocks.unmuteUserViaXurl,
 	lookupAuthenticatedUser: mocks.lookupAuthenticatedUser,
 	lookupAuthenticatedUserFresh: mocks.lookupAuthenticatedUser,
-}));
-
-vi.mock("./x-web", () => ({
-	blockUserViaXWeb: mocks.blockUserViaXWeb,
-	unblockUserViaXWeb: mocks.unblockUserViaXWeb,
 }));
 
 describe("actions transport", () => {
@@ -63,8 +56,6 @@ describe("actions transport", () => {
 		mocks.unblockUserViaXurl.mockReset();
 		mocks.muteUserViaXurl.mockReset();
 		mocks.unmuteUserViaXurl.mockReset();
-		mocks.blockUserViaXWeb.mockReset();
-		mocks.unblockUserViaXWeb.mockReset();
 		mocks.lookupAuthenticatedUser.mockReset();
 		mocks.lookupAuthenticatedUser.mockResolvedValue({ id: "1" });
 		mocks.blockUserViaBird.mockResolvedValue({
@@ -102,14 +93,6 @@ describe("actions transport", () => {
 		mocks.unmuteUserViaXurl.mockResolvedValue({
 			ok: true,
 			output: "xurl unmute ok",
-		});
-		mocks.blockUserViaXWeb.mockResolvedValue({
-			ok: true,
-			output: "x-web block ok",
-		});
-		mocks.unblockUserViaXWeb.mockResolvedValue({
-			ok: true,
-			output: "x-web unblock ok",
 		});
 	});
 
@@ -230,7 +213,7 @@ describe("actions transport", () => {
 		expect(mocks.blockUserViaXurl).toHaveBeenCalledWith("1", "7");
 	});
 
-	it("does not fall back to unverified x-web block in auto mode", async () => {
+	it("stops after xurl rejects a block in auto mode", async () => {
 		mocks.blockUserViaBird.mockResolvedValue({
 			ok: false,
 			output: "bird unavailable",
@@ -252,10 +235,9 @@ describe("actions transport", () => {
 			output: "bird: bird unavailable\nxurl: xurl rejected",
 			transport: "xurl",
 		});
-		expect(mocks.blockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
-	it("does not fall back to unverified x-web unblock in auto mode", async () => {
+	it("stops after xurl rejects an unblock in auto mode", async () => {
 		mocks.unblockUserViaBird.mockResolvedValue({
 			ok: false,
 			output: "bird unavailable",
@@ -277,10 +259,9 @@ describe("actions transport", () => {
 			output: "bird: bird unavailable\nxurl: xurl rejected",
 			transport: "xurl",
 		});
-		expect(mocks.unblockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
-	it("does not fall through to x-web when live writes are disabled", async () => {
+	it("reports both transport failures when live writes are disabled", async () => {
 		process.env.BIRDCLAW_DISABLE_LIVE_WRITES = "1";
 		mocks.blockUserViaBird.mockResolvedValue({
 			ok: false,
@@ -304,7 +285,6 @@ describe("actions transport", () => {
 			output: "bird: live writes disabled\nxurl: live writes disabled",
 			transport: "xurl",
 		});
-		expect(mocks.blockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
 	it("reports missing target ids for forced xurl actions", async () => {

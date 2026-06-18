@@ -8,6 +8,7 @@ import {
 import { type ActionsTransport, resolveActionsTransport } from "./config";
 import { Effect } from "effect";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { profileHandleKey } from "./profile-row";
 import type {
 	ModerationAction,
 	ModerationActionTransportResult,
@@ -56,10 +57,6 @@ function liveWritesDisabled() {
 	return process.env.BIRDCLAW_DISABLE_LIVE_WRITES === "1";
 }
 
-function normalizeHandle(value: string | null | undefined) {
-	return value?.replace(/^@/, "").toLowerCase() ?? "";
-}
-
 function verifyExpectedAccountEffect(
 	expectedAccount: ExpectedActionAccount | undefined,
 ) {
@@ -72,10 +69,10 @@ function verifyExpectedAccountEffect(
 			sourceUser && typeof sourceUser.id === "string" ? sourceUser.id : "";
 		const sourceUsername =
 			sourceUser && typeof sourceUser.username === "string"
-				? normalizeHandle(sourceUser.username)
+				? profileHandleKey(sourceUser.username)
 				: "";
 		const expectedExternalUserId = expectedAccount.externalUserId?.trim() ?? "";
-		const expectedHandle = normalizeHandle(expectedAccount.handle);
+		const expectedHandle = profileHandleKey(expectedAccount.handle);
 
 		if (expectedExternalUserId) {
 			if (sourceUserId === expectedExternalUserId) return sourceUserId;

@@ -29,17 +29,24 @@ function insertTweet(
 	createdAt = "2026-05-01T12:00:00.000Z",
 	mediaCount = media.length,
 ) {
-	getNativeDb({ seedDemoData: false })
-		.prepare(
-			`
+	const db = getNativeDb({ seedDemoData: false });
+	db.prepare(
+		`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'home', ?, ?, 0, null, 0, ?, 0, 0, '{}', ?, null)
-    `,
-		)
-		.run(id, `tweet ${id}`, createdAt, mediaCount, JSON.stringify(media));
+		id, author_profile_id, text, created_at,
+		is_replied, reply_to_id, like_count, media_count,
+		entities_json, media_json, quoted_tweet_id
+	  ) values (?, 'profile_me', ?, ?, 0, null, 0, ?, '{}', ?, null)
+	`,
+	).run(id, `tweet ${id}`, createdAt, mediaCount, JSON.stringify(media));
+	db.prepare(
+		`
+		insert into tweet_account_edges (
+		  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+		  seen_count, source, raw_json, updated_at
+		) values ('acct_primary', ?, 'home', ?, ?, 1, 'test', '{}', ?)
+		`,
+	).run(id, createdAt, createdAt, createdAt);
 }
 
 function pbs(name: string) {
@@ -144,7 +151,7 @@ describe("media fetch", () => {
 			.run(
 				"acct_studio",
 				"tweet_1",
-				"like",
+				"home",
 				"2026-05-01T12:00:00.000Z",
 				"2026-05-01T12:00:00.000Z",
 				"2026-05-01T12:00:00.000Z",
@@ -152,7 +159,7 @@ describe("media fetch", () => {
 
 		const result = await fetchTweetMedia({
 			account: "acct_studio",
-			kind: "like",
+			kind: "home",
 			dryRun: true,
 		});
 

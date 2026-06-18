@@ -1,6 +1,7 @@
 import { Effect } from "effect";
 import { getNativeDb } from "./db";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { nullableProfileFromDbRow } from "./profile-row";
 import type { Database } from "./sqlite";
 import {
 	normalizeUrlExpansionForIndex,
@@ -15,7 +16,6 @@ import type {
 	LinkIndexItem,
 	LinkOccurrenceItem,
 	LinkSearchItem,
-	ProfileRecord,
 	TimelineItem,
 	TweetEntities,
 	TweetMediaItem,
@@ -201,8 +201,16 @@ function rebuildOccurrences(
 				? []
 				: (db
 						.prepare(`
-      select id, account_id, created_at, text, entities_json
-      from tweets
+      select
+        tweet.id,
+        coalesce(
+          (select edge.account_id from tweet_account_edges edge where edge.tweet_id = tweet.id order by edge.last_seen_at desc limit 1),
+          (select collection.account_id from tweet_collections collection where collection.tweet_id = tweet.id order by collection.updated_at desc limit 1)
+        ) as account_id,
+        tweet.created_at,
+        tweet.text,
+        tweet.entities_json
+      from tweets tweet
       where text like '%://%' or entities_json like '%://%'
     `)
 						.all() as Array<Record<string, unknown>>);
@@ -219,7 +227,7 @@ function rebuildOccurrences(
 					String(row.id),
 					index,
 					entry.url,
-					String(row.account_id),
+					typeof row.account_id === "string" ? row.account_id : null,
 					null,
 					null,
 					String(row.created_at),
@@ -380,44 +388,17 @@ function likePattern(value: string) {
 	return `%${value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_").toLowerCase()}%`;
 }
 
-function toProfile(
-	row: Record<string, unknown>,
-	prefix: string,
-): ProfileRecord | null {
-	if (!row[`${prefix}id`]) {
-		return null;
-	}
-	return {
-		id: String(row[`${prefix}id`]),
-		handle: String(row[`${prefix}handle`]),
-		displayName: String(row[`${prefix}display_name`]),
-		bio: String(row[`${prefix}bio`]),
-		followersCount: Number(row[`${prefix}followers_count`]),
-		followingCount: Number(row[`${prefix}following_count`]),
-		avatarHue: Number(row[`${prefix}avatar_hue`]),
-		avatarUrl: getString(row[`${prefix}avatar_url`]),
-		location: getString(row[`${prefix}location`]),
-		url: getString(row[`${prefix}url`]),
-		verifiedType: getString(row[`${prefix}verified_type`]),
-		entities: parseJsonField<Record<string, unknown>>(
-			row[`${prefix}entities_json`],
-			{},
-		),
-		createdAt: String(row[`${prefix}created_at`]),
-	};
-}
-
 function toLinkedTweet(row: Record<string, unknown>): TimelineItem | null {
-	const author = toProfile(row, "linked_author_");
+	const author = nullableProfileFromDbRow(row, "linked_author_");
 	if (!row.linked_id || !author) {
 		return null;
 	}
 
 	return {
 		id: String(row.linked_id),
-		accountId: String(row.linked_account_id),
+		accountId: String(row.linked_account_id ?? ""),
 		accountHandle: String(row.linked_account_handle ?? ""),
-		kind: String(row.linked_kind) as TimelineItem["kind"],
+		kind: String(row.linked_kind ?? "thread") as TimelineItem["kind"],
 		text: String(row.linked_text),
 		createdAt: String(row.linked_created_at),
 		isReplied: Boolean(row.linked_is_replied),
@@ -460,8 +441,8 @@ function toLinkSearchItem(row: Record<string, unknown>): LinkSearchItem {
 			updatedAt: String(row.updated_at),
 		},
 		sourceText: String(row.source_text),
-		sourceAuthor: toProfile(row, "source_author_"),
-		participant: toProfile(row, "participant_"),
+		sourceAuthor: nullableProfileFromDbRow(row, "source_author_"),
+		participant: nullableProfileFromDbRow(row, "participant_"),
 		linkedTweet: toLinkedTweet(row),
 	};
 }
@@ -587,16 +568,23 @@ export function searchLinks(query: string, options: LinkSearchOptions = {}) {
       participant.entities_json as participant_entities_json,
       participant.created_at as participant_created_at,
       linked.id as linked_id,
-      linked.account_id as linked_account_id,
-      linked_account.handle as linked_account_handle,
-      linked.kind as linked_kind,
+			coalesce(
+				o.account_id,
+				(select edge.account_id from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				(select collection.account_id from tweet_collections collection where collection.tweet_id = linked.id order by collection.updated_at desc limit 1)
+			) as linked_account_id,
+			linked_account.handle as linked_account_handle,
+			coalesce(
+				(select edge.kind from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				'thread'
+			) as linked_kind,
       linked.text as linked_text,
       linked.created_at as linked_created_at,
       linked.is_replied as linked_is_replied,
       linked.like_count as linked_like_count,
       linked.media_count as linked_media_count,
-      linked.bookmarked as linked_bookmarked,
-      linked.liked as linked_liked,
+			exists(select 1 from tweet_collections collection where collection.tweet_id = linked.id and collection.kind = 'bookmarks') as linked_bookmarked,
+			exists(select 1 from tweet_collections collection where collection.tweet_id = linked.id and collection.kind = 'likes') as linked_liked,
       linked.entities_json as linked_entities_json,
       linked.media_json as linked_media_json,
       linked_author.id as linked_author_id,
@@ -627,8 +615,12 @@ export function searchLinks(query: string, options: LinkSearchOptions = {}) {
       on source_author.id = source_tweet.author_profile_id
     left join tweets linked
       on linked.id = e.expanded_tweet_id
-    left join accounts linked_account
-      on linked_account.id = linked.account_id
+		left join accounts linked_account
+			on linked_account.id = coalesce(
+				o.account_id,
+				(select edge.account_id from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				(select collection.account_id from tweet_collections collection where collection.tweet_id = linked.id order by collection.updated_at desc limit 1)
+			)
     left join profiles linked_author
       on linked_author.id = linked.author_profile_id
     ${conditions.length > 0 ? `where ${conditions.join(" and ")}` : ""}

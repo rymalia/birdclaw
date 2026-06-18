@@ -2,7 +2,7 @@ import type { Database } from "./sqlite";
 import { Effect } from "effect";
 import { databaseWriteEffect } from "./database-writer";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { liveTransportGateway } from "./live-transport-gateway";
 import { resolveLiveSyncAccount } from "./live-sync-engine";
 import { runSyncPlanEffect } from "./sync-plan";
@@ -13,6 +13,10 @@ import type {
 	XurlMediaItem,
 	XurlTweetsResponse,
 } from "./types";
+import {
+	type TweetAccountEdgeKind,
+	upsertTweetAccountEdge,
+} from "./tweet-account-edges";
 import { ingestTweetPayload } from "./tweet-repository";
 
 const DEFAULT_LIMIT = 30;
@@ -81,17 +85,6 @@ function parseMode(value: string | undefined): MentionThreadsMode {
 		throw new Error("--mode must be bird or xurl");
 	}
 	return mode;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
 }
 
 function getRemainingThreadTimeoutMs(
@@ -199,21 +192,6 @@ function listRecentMentions(
         from tweet_account_edges edge
         join tweets t on t.id = edge.tweet_id
         where edge.kind = 'mention' and edge.account_id = ?
-        union all
-        select
-          t.id,
-          t.created_at as createdAt,
-          t.reply_to_id as replyToId,
-          '{}' as rawJson
-        from tweets t
-        where t.kind = 'mention' and t.account_id = ?
-          and not exists (
-            select 1
-            from tweet_account_edges edge
-            where edge.account_id = t.account_id
-              and edge.tweet_id = t.id
-              and edge.kind = 'mention'
-          )
       )
       select id, createdAt, replyToId, rawJson
       from local_mentions
@@ -221,7 +199,7 @@ function listRecentMentions(
       limit ?
       `,
 		)
-		.all(accountId, accountId, limit) as Array<{
+		.all(accountId, limit) as Array<{
 		id: string;
 		createdAt: string;
 		replyToId: string | null;
@@ -264,20 +242,16 @@ function listMentionsByIds(
         t.reply_to_id as replyToId,
         coalesce(edge.raw_json, '{}') as rawJson
       from tweets t
-      left join tweet_account_edges edge
+		join tweet_account_edges edge
         on edge.tweet_id = t.id
         and edge.account_id = ?
         and edge.kind = 'mention'
       where t.id in (${placeholders})
-        and (
-          edge.tweet_id is not null
-          or (t.kind = 'mention' and t.account_id = ?)
-        )
       order by t.created_at desc
       limit ?
       `,
 		)
-		.all(accountId, ...ids, accountId, limit) as Array<{
+		.all(accountId, ...ids, limit) as Array<{
 		id: string;
 		createdAt: string;
 		replyToId: string | null;
@@ -335,15 +309,28 @@ function mergeMentionThreadIntoLocalStore({
 	}
 	for (const [kind, data] of groups) {
 		if (data.length === 0) continue;
+		const classificationEdge: TweetAccountEdgeKind =
+			kind === "thread" ? "thread_context" : kind;
 		ingestTweetPayload(db, {
 			accountId,
 			payload: { ...payload, data },
-			kind,
-			edgeKind: writeThreadContextEdges ? "thread_context" : undefined,
+			edgeKind: classificationEdge,
 			markRepliesAsReplied: true,
-			replaceSecondaryKind: true,
 			source,
 		});
+		if (writeThreadContextEdges && classificationEdge !== "thread_context") {
+			const observedAt = new Date().toISOString();
+			for (const tweet of data) {
+				upsertTweetAccountEdge(db, {
+					accountId,
+					tweetId: tweet.id,
+					kind: "thread_context",
+					source,
+					seenAt: observedAt,
+					rawJson: JSON.stringify(tweet),
+				});
+			}
+		}
 	}
 }
 

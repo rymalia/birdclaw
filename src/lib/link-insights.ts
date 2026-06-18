@@ -1,11 +1,15 @@
 import { getNativeDb } from "./db";
+import type { LinkInsightResponse } from "./api-contracts";
+import {
+	normalizeProfileHandle,
+	nullableProfileFromDbRow,
+} from "./profile-row";
 import type {
 	LinkInsightItem,
 	LinkInsightKind,
 	LinkInsightMention,
 	LinkInsightQuery,
 	LinkInsightRange,
-	LinkInsightResponse,
 	LinkInsightSort,
 	ProfileRecord,
 	TweetMediaItem,
@@ -45,6 +49,7 @@ const SQL_URL_EXPRESSION =
 	"lower(coalesce(nullif(e.final_url, ''), nullif(e.expanded_url, ''), e.short_url))";
 
 interface LinkInsightRow {
+	[key: string]: string | number | null;
 	source_kind: "dm" | "tweet";
 	source_id: string;
 	source_position: number;
@@ -202,38 +207,6 @@ function parseJsonField<T>(value: unknown, fallback: T): T {
 	} catch {
 		return fallback;
 	}
-}
-
-function getString(value: unknown) {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function toProfile(
-	row: LinkInsightRow,
-	prefix: "dm_sender_" | "linked_author_" | "participant_" | "source_author_",
-): ProfileRecord | null {
-	const id = row[`${prefix}id`];
-	if (!id) {
-		return null;
-	}
-	return {
-		id: String(id),
-		handle: String(row[`${prefix}handle`] ?? ""),
-		displayName: String(row[`${prefix}display_name`] ?? ""),
-		bio: String(row[`${prefix}bio`] ?? ""),
-		followersCount: Number(row[`${prefix}followers_count`] ?? 0),
-		followingCount: Number(row[`${prefix}following_count`] ?? 0),
-		avatarHue: Number(row[`${prefix}avatar_hue`] ?? 0),
-		avatarUrl: getString(row[`${prefix}avatar_url`]),
-		location: getString(row[`${prefix}location`]),
-		url: getString(row[`${prefix}url`]),
-		verifiedType: getString(row[`${prefix}verified_type`]),
-		entities: parseJsonField<Record<string, unknown>>(
-			row[`${prefix}entities_json`],
-			{},
-		),
-		createdAt: String(row[`${prefix}created_at`] ?? ""),
-	};
 }
 
 function isHostMatch(host: string, suffixes: string[], exact: Set<string>) {
@@ -442,7 +415,7 @@ function buildTweetUrl(
 	handle: string | null | undefined,
 	tweetId: string | null,
 ) {
-	const cleanHandle = handle?.replace(/^@/, "").trim();
+	const cleanHandle = normalizeProfileHandle(handle);
 	if (!cleanHandle || !tweetId) {
 		return null;
 	}
@@ -459,11 +432,13 @@ function sourceLabel(row: LinkInsightRow) {
 function buildMention(row: LinkInsightRow, normalized: NormalizedUrl) {
 	const sharedBy =
 		row.source_kind === "tweet"
-			? toProfile(row, "source_author_")
-			: toProfile(row, "dm_sender_");
+			? nullableProfileFromDbRow(row, "source_author_")
+			: nullableProfileFromDbRow(row, "dm_sender_");
 	const participant =
-		row.source_kind === "dm" ? toProfile(row, "participant_") : null;
-	const contentAuthor = toProfile(row, "linked_author_");
+		row.source_kind === "dm"
+			? nullableProfileFromDbRow(row, "participant_")
+			: null;
+	const contentAuthor = nullableProfileFromDbRow(row, "linked_author_");
 	const rawText = String(row.source_text ?? "");
 	const text = stripUrls(rawText, [
 		row.short_url,

@@ -1,160 +1,41 @@
-import { useCallback, useEffect, useSyncExternalStore } from "react";
-import type { ReactNode } from "react";
-import { Effect } from "effect";
-import type { EmbeddedTweet } from "#/lib/types";
+import { queryOptions, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+	createContext,
+	createElement,
+	type ReactNode,
+	useCallback,
+	useContext,
+	useMemo,
+	useState,
+} from "react";
+import { tweetConversationResponseSchema } from "#/lib/api-contracts";
+import { fetchJsonEffect } from "#/lib/api-client";
 import { runEffectPromise } from "./effect-runtime";
+import { queryKeys } from "./query-client";
 
 type ConversationStatus = "idle" | "loading" | "ready" | "error";
 
-interface ConversationRecord {
-	error: string | null;
-	items: EmbeddedTweet[];
-	status: ConversationStatus;
+interface ConversationSurfaceState {
+	expandedSurfaceId: string | null;
+	setExpandedSurfaceId: (surfaceId: string | null) => void;
 }
 
-interface ConversationSurfaceSnapshot {
-	expandedTweetId: string | null;
-	records: ReadonlyMap<string, ConversationRecord>;
-}
+const ConversationSurfaceContext =
+	createContext<ConversationSurfaceState | null>(null);
 
-type Listener = () => void;
-
-const emptyRecord: ConversationRecord = {
-	error: null,
-	items: [],
-	status: "idle",
-};
-
-let snapshot: ConversationSurfaceSnapshot = {
-	expandedTweetId: null,
-	records: new Map(),
-};
-const listeners = new Set<Listener>();
-const inFlight = new Set<string>();
-let activeScopes = 0;
-let generation = 0;
-
-function emit() {
-	for (const listener of listeners) {
-		listener();
-	}
-}
-
-function setSnapshot(next: ConversationSurfaceSnapshot) {
-	snapshot = next;
-	emit();
-}
-
-function updateRecord(tweetId: string, record: ConversationRecord) {
-	const records = new Map(snapshot.records);
-	records.set(tweetId, record);
-	setSnapshot({ ...snapshot, records });
-}
-
-function subscribe(listener: Listener) {
-	listeners.add(listener);
-	return () => {
-		listeners.delete(listener);
-	};
-}
-
-function getSnapshot() {
-	return snapshot;
-}
-
-function fetchConversationItemsEffect(tweetId: string) {
-	return Effect.gen(function* () {
-		const response = yield* Effect.tryPromise({
-			try: () =>
-				fetch(`/api/conversation?tweetId=${encodeURIComponent(tweetId)}`),
-			catch: (error) => error,
-		});
-		const data = (yield* Effect.tryPromise({
-			try: () => response.json(),
-			catch: (error) => error,
-		})) as {
-			error?: string;
-			items?: EmbeddedTweet[];
-			ok?: boolean;
-		};
-		if (!response.ok || data.ok === false) {
-			return yield* Effect.fail(
-				new Error(data.error ?? "Conversation unavailable"),
-			);
-		}
-		return (data.items ?? []).filter(Boolean);
-	});
-}
-
-export function loadConversationEffect(
-	surfaceId: string,
-	tweetId = surfaceId,
-): Effect.Effect<void, never> {
-	return Effect.gen(function* () {
-		const current = snapshot.records.get(surfaceId);
-		if (current?.status === "ready" || inFlight.has(surfaceId)) {
-			return;
-		}
-
-		const loadGeneration = generation;
-		inFlight.add(surfaceId);
-		yield* Effect.gen(function* () {
-			updateRecord(surfaceId, {
-				error: null,
-				items: current?.items ?? [],
-				status: "loading",
-			});
-
-			const result = yield* fetchConversationItemsEffect(tweetId).pipe(
-				Effect.match({
-					onFailure: (error) => ({ error, ok: false as const }),
-					onSuccess: (items) => ({ items, ok: true as const }),
-				}),
-			);
-
-			if (loadGeneration !== generation) {
-				return;
-			}
-			if (result.ok) {
-				updateRecord(surfaceId, {
-					error: null,
-					items: result.items,
-					status: "ready",
-				});
-			} else {
-				updateRecord(surfaceId, {
-					error:
-						result.error instanceof Error
-							? result.error.message
-							: "Conversation unavailable",
-					items: [],
-					status: "error",
-				});
-			}
-		}).pipe(Effect.ensuring(Effect.sync(() => inFlight.delete(surfaceId))));
-	});
-}
-
-function loadConversation(surfaceId: string, tweetId = surfaceId) {
-	return runEffectPromise(loadConversationEffect(surfaceId, tweetId));
-}
-
-export function retainConversationSurfaceScope() {
-	activeScopes += 1;
-	return () => {
-		activeScopes = Math.max(0, activeScopes - 1);
-		if (activeScopes === 0) {
-			resetConversationSurface();
-		}
-	};
-}
-
-export function resetConversationSurface() {
-	generation += 1;
-	inFlight.clear();
-	setSnapshot({
-		expandedTweetId: null,
-		records: new Map(),
+export function conversationQueryOptions(tweetId: string) {
+	return queryOptions({
+		queryKey: [...queryKeys.conversations, tweetId] as const,
+		queryFn: () =>
+			runEffectPromise(
+				fetchJsonEffect(
+					`/api/conversation?tweetId=${encodeURIComponent(tweetId)}`,
+					undefined,
+					tweetConversationResponseSchema,
+					"Conversation unavailable",
+				),
+			).then((data) => data.items),
+		staleTime: Number.POSITIVE_INFINITY,
 	});
 }
 
@@ -163,43 +44,56 @@ export function ConversationSurfaceScope({
 }: {
 	children: ReactNode;
 }) {
-	useEffect(() => retainConversationSurfaceScope(), []);
-	return children;
+	const [expandedSurfaceId, setExpandedSurfaceId] = useState<string | null>(
+		null,
+	);
+	const value = useMemo(
+		() => ({ expandedSurfaceId, setExpandedSurfaceId }),
+		[expandedSurfaceId],
+	);
+	return createElement(
+		ConversationSurfaceContext.Provider,
+		{ value },
+		children,
+	);
 }
 
 export function useConversationSurface(surfaceId: string, tweetId = surfaceId) {
-	const currentSnapshot = useSyncExternalStore(
-		subscribe,
-		getSnapshot,
-		getSnapshot,
-	);
-	const record = currentSnapshot.records.get(surfaceId) ?? emptyRecord;
-	const isOpen = currentSnapshot.expandedTweetId === surfaceId;
+	const scope = useContext(ConversationSurfaceContext);
+	const [localExpandedSurfaceId, setLocalExpandedSurfaceId] = useState<
+		string | null
+	>(null);
+	const expandedSurfaceId = scope?.expandedSurfaceId ?? localExpandedSurfaceId;
+	const setExpandedSurfaceId =
+		scope?.setExpandedSurfaceId ?? setLocalExpandedSurfaceId;
+	const isOpen = expandedSurfaceId === surfaceId;
+	const queryClient = useQueryClient();
+	const query = useQuery({
+		...conversationQueryOptions(tweetId),
+		enabled: isOpen,
+	});
 
 	const toggle = useCallback(() => {
-		const nextExpanded =
-			snapshot.expandedTweetId === surfaceId ? null : surfaceId;
-		setSnapshot({ ...snapshot, expandedTweetId: nextExpanded });
-		if (nextExpanded) {
-			void loadConversation(surfaceId, tweetId);
-		}
-	}, [surfaceId, tweetId]);
-
+		setExpandedSurfaceId(isOpen ? null : surfaceId);
+	}, [isOpen, setExpandedSurfaceId, surfaceId]);
 	const prefetch = useCallback(() => {
-		const current = snapshot.records.get(surfaceId);
-		if (current?.status === "ready" || current?.status === "loading") {
-			return;
-		}
-		void loadConversation(surfaceId, tweetId);
-	}, [surfaceId, tweetId]);
+		void queryClient.prefetchQuery(conversationQueryOptions(tweetId));
+	}, [queryClient, tweetId]);
+	const status: ConversationStatus = query.isError
+		? "error"
+		: query.isFetching
+			? "loading"
+			: query.data
+				? "ready"
+				: "idle";
 
 	return {
-		error: record.error,
+		error: query.error instanceof Error ? query.error.message : null,
 		isOpen,
-		items: record.items,
-		loading: record.status === "loading",
+		items: query.data ?? [],
+		loading: query.isFetching,
 		prefetch,
-		status: record.status,
+		status,
 		toggle,
 	};
 }

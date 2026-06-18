@@ -1,11 +1,20 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { promisify } from "node:util";
 import { Data, Effect } from "effect";
 import type { Database } from "./sqlite";
+import {
+	BACKUP_TABLE_CODECS,
+	adaptLegacyTweetState,
+	backupCodecForPath,
+	buildBackupShardsFromRowSets,
+	countBackupFiles,
+	createBackupImportRows,
+	type BackupImportRows,
+	type BackupJsonRecord as JsonRecord,
+	type BackupJsonValue as JsonValue,
+} from "./backup-table-codecs";
 import { getBirdclawConfig } from "./config";
 import { getNativeDb } from "./db";
 import { databaseWriteEffect } from "./database-writer";
@@ -15,25 +24,15 @@ import {
 	collectIngestionSourcesEffect,
 	streamJsonLines,
 } from "./streaming-ingestion";
-import { safeHttpUrl } from "./url-safety";
+import { runSubprocessEffect, SubprocessError } from "./subprocess";
 
-const execFileAsync = promisify(execFile);
-const BACKUP_SCHEMA_VERSION = 1;
+const BACKUP_SCHEMA_VERSION = 2;
+const MIN_SUPPORTED_BACKUP_SCHEMA_VERSION = 1;
 const MANIFEST_PATH = "manifest.json";
 const DATA_DIR = "data";
 const AUTO_SYNC_CACHE_KEY = "backup:auto-sync";
 const DEFAULT_STALE_AFTER_SECONDS = 15 * 60;
 let autoUpdateInFlight: Promise<BackupAutoUpdateResult> | null = null;
-
-type JsonValue =
-	| null
-	| boolean
-	| number
-	| string
-	| JsonValue[]
-	| { [key: string]: JsonValue };
-
-type JsonRecord = Record<string, JsonValue>;
 
 export interface BackupFileManifest {
 	path: string;
@@ -138,14 +137,6 @@ function trySync<T>(try_: () => T) {
 	});
 }
 
-function getErrorOutput(error: unknown, key: "stdout" | "stderr") {
-	if (!error || typeof error !== "object" || !(key in error)) {
-		return undefined;
-	}
-	const output = (error as Record<"stdout" | "stderr", unknown>)[key];
-	return typeof output === "string" ? output : undefined;
-}
-
 function redactSecretUrl(value: string) {
 	return value.replace(
 		/([a-z][a-z0-9+.-]*:\/\/)([^/@:\s]+)(?::([^/@\s]+))?@/gi,
@@ -155,25 +146,29 @@ function redactSecretUrl(value: string) {
 }
 
 function gitCommandError(args: readonly string[], cause: unknown) {
-	const redactedArgs = args.map((arg) => redactSecretUrl(arg));
+	const redactedArgs =
+		cause instanceof SubprocessError
+			? cause.args
+			: args.map((arg) => redactSecretUrl(arg));
 	const command = `git ${redactedArgs.join(" ")}`;
-	const message = redactSecretUrl(
-		cause instanceof Error ? cause.message : `${command} failed`,
-	);
 	return new BackupGitCommandError({
-		message,
+		message:
+			cause instanceof Error
+				? redactSecretUrl(cause.message)
+				: `${command} failed`,
 		args: redactedArgs,
-		stdout: redactSecretUrl(getErrorOutput(cause, "stdout") ?? ""),
-		stderr: redactSecretUrl(getErrorOutput(cause, "stderr") ?? ""),
+		stdout: cause instanceof SubprocessError ? cause.stdout : "",
+		stderr: cause instanceof SubprocessError ? cause.stderr : "",
 		cause,
 	});
 }
 
 function gitEffect(args: string[]) {
-	return Effect.tryPromise({
-		try: () => execFileAsync("git", args),
-		catch: (cause) => gitCommandError(args, cause),
-	});
+	return runSubprocessEffect({
+		command: "git",
+		args,
+		redact: redactSecretUrl,
+	}).pipe(Effect.mapError((cause) => gitCommandError(args, cause)));
 }
 
 function canonicalStringify(value: JsonValue): string {
@@ -225,17 +220,6 @@ function jsonlStringify(row: JsonRecord): string {
 		.join(",")}}`;
 }
 
-function yearFromTimestamp(value: unknown) {
-	if (typeof value !== "string") {
-		return "unknown";
-	}
-	const match = /^(\d{4})/.exec(value);
-	if (!match || match[1] === "1970") {
-		return "unknown";
-	}
-	return match[1];
-}
-
 function rowsForQuery(db: Database, sql: string, params: unknown[] = []) {
 	return (db.prepare(sql).all(...params) as Record<string, unknown>[]).map(
 		toJsonRecord,
@@ -243,361 +227,14 @@ function rowsForQuery(db: Database, sql: string, params: unknown[] = []) {
 }
 
 function getExportRowSets(db: Database) {
-	const rowSets: Array<{ logicalName: string; rows: JsonRecord[] }> = [
-		{
-			logicalName: "accounts",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, name, handle, external_user_id, transport, is_default, created_at
-        from accounts
-        order by id
-        `,
-			),
-		},
-		{
-			logicalName: "profiles",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, handle, display_name, bio, followers_count,
-          following_count, public_metrics_json, avatar_hue, avatar_url,
-          location, url, verified_type, entities_json, raw_json, created_at
-        from profiles
-        order by id
-        `,
-			),
-		},
-		{
-			logicalName: "profile_affiliations",
-			rows: rowsForQuery(
-				db,
-				`
-        select subject_profile_id, organization_profile_id, organization_name,
-          organization_handle, badge_url, url, label, source, is_active,
-          first_seen_at, last_seen_at, raw_json, updated_at
-        from profile_affiliations
-        order by subject_profile_id, organization_profile_id
-        `,
-			),
-		},
-		{
-			logicalName: "profile_snapshots",
-			rows: rowsForQuery(
-				db,
-				`
-        select profile_id, snapshot_hash, observed_at, last_seen_at, source,
-          handle, display_name, bio, location, url, verified_type,
-          followers_count, following_count, affiliations_json, raw_json
-        from profile_snapshots
-        order by profile_id, last_seen_at, snapshot_hash
-        `,
-			),
-		},
-		{
-			logicalName: "profile_bio_entities",
-			rows: rowsForQuery(
-				db,
-				`
-        select profile_id, kind, value, source, is_active, first_seen_at,
-          last_seen_at, raw_json
-        from profile_bio_entities
-        order by profile_id, kind, value
-        `,
-			),
-		},
-		{
-			logicalName: "tweets",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, account_id, author_profile_id, kind, text, created_at, is_replied,
-          reply_to_id, like_count, media_count, bookmarked, liked, entities_json,
-          media_json, quoted_tweet_id
-        from tweets
-        order by created_at, id
-        `,
-			),
-		},
-		{
-			logicalName: "tweet_collections",
-			rows: rowsForQuery(
-				db,
-				`
-        select account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
-        from tweet_collections
-        order by kind, account_id, coalesce(collected_at, ''), tweet_id
-        `,
-			),
-		},
-		{
-			logicalName: "tweet_account_edges",
-			rows: rowsForQuery(
-				db,
-				`
-        select account_id, tweet_id, kind, first_seen_at, last_seen_at,
-          seen_count, source, raw_json, updated_at
-        from tweet_account_edges
-        order by kind, account_id, last_seen_at, tweet_id
-        `,
-			),
-		},
-		{
-			logicalName: "dm_conversations",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, account_id, participant_profile_id, title, inbox_kind,
-          last_message_at, unread_count, needs_reply
-        from dm_conversations
-        order by last_message_at, id
-        `,
-			),
-		},
-		{
-			logicalName: "dm_messages",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, conversation_id, sender_profile_id, text, created_at, direction,
-          is_replied, media_count
-        from dm_messages
-        order by conversation_id, created_at, id
-				`,
-			),
-		},
-		{
-			logicalName: "url_expansions",
-			rows: rowsForQuery(
-				db,
-				`
-        select short_url, expanded_url, final_url, status, expanded_tweet_id,
-          expanded_handle, title, description, image_url, site_name, error,
-          source, updated_at
-        from url_expansions
-        order by short_url
-        `,
-			),
-		},
-		{
-			logicalName: "link_occurrences",
-			rows: rowsForQuery(
-				db,
-				`
-        select source_kind, source_id, source_position, short_url, account_id,
-          conversation_id, direction, created_at
-        from link_occurrences
-        order by source_kind, source_id, source_position, short_url
-        `,
-			),
-		},
-		{
-			logicalName: "blocks",
-			rows: rowsForQuery(
-				db,
-				`
-        select account_id, profile_id, source, created_at
-        from blocks
-        order by account_id, profile_id
-        `,
-			),
-		},
-		{
-			logicalName: "mutes",
-			rows: rowsForQuery(
-				db,
-				`
-        select account_id, profile_id, source, created_at
-        from mutes
-        order by account_id, profile_id
-        `,
-			),
-		},
-		{
-			logicalName: "tweet_actions",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, account_id, tweet_id, kind, body, created_at
-        from tweet_actions
-        order by created_at, id
-        `,
-			),
-		},
-		{
-			logicalName: "ai_scores",
-			rows: rowsForQuery(
-				db,
-				`
-        select entity_kind, entity_id, model, score, summary, reasoning, updated_at
-        from ai_scores
-        order by entity_kind, entity_id, model
-        `,
-			),
-		},
-		{
-			logicalName: "follow_snapshots",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, account_id, direction, source, status, page_count,
-          result_count, started_at, completed_at, raw_meta_json
-        from follow_snapshots
-        order by account_id, direction, completed_at, id
-        `,
-			),
-		},
-		{
-			logicalName: "follow_snapshot_members",
-			rows: rowsForQuery(
-				db,
-				`
-        select snapshot_id, profile_id, external_user_id, position
-        from follow_snapshot_members
-        order by snapshot_id, position, profile_id
-        `,
-			),
-		},
-		{
-			logicalName: "follow_edges",
-			rows: rowsForQuery(
-				db,
-				`
-        select account_id, direction, profile_id, external_user_id, source,
-          current, first_seen_at, last_seen_at, ended_at, updated_at
-        from follow_edges
-        order by account_id, direction, profile_id
-        `,
-			),
-		},
-		{
-			logicalName: "follow_events",
-			rows: rowsForQuery(
-				db,
-				`
-        select id, account_id, direction, profile_id, external_user_id, kind,
-          event_at, snapshot_id
-        from follow_events
-        order by account_id, direction, event_at, kind, profile_id, id
-        `,
-			),
-		},
-	];
-	return rowSets;
-}
-
-function addRows(
-	shards: Map<string, JsonRecord[]>,
-	relativePath: string,
-	rows: JsonRecord[],
-) {
-	if (rows.length === 0) {
-		return;
-	}
-	const existing = shards.get(relativePath) ?? [];
-	existing.push(...rows);
-	shards.set(relativePath, existing);
+	return BACKUP_TABLE_CODECS.map((codec) => ({
+		logicalName: codec.name,
+		rows: rowsForQuery(db, codec.exportSql),
+	}));
 }
 
 function buildShards(db: Database) {
-	const shards = new Map<string, JsonRecord[]>();
-	const rowSets = getExportRowSets(db);
-
-	for (const rowSet of rowSets) {
-		switch (rowSet.logicalName) {
-			case "accounts":
-				addRows(shards, "data/accounts.jsonl", rowSet.rows);
-				break;
-			case "profiles":
-				addRows(shards, "data/profiles.jsonl", rowSet.rows);
-				break;
-			case "profile_affiliations":
-				addRows(shards, "data/profile_affiliations.jsonl", rowSet.rows);
-				break;
-			case "profile_snapshots":
-				addRows(shards, "data/profile_snapshots.jsonl", rowSet.rows);
-				break;
-			case "profile_bio_entities":
-				addRows(shards, "data/profile_bio_entities.jsonl", rowSet.rows);
-				break;
-			case "tweets":
-				for (const row of rowSet.rows) {
-					addRows(
-						shards,
-						`data/tweets/${yearFromTimestamp(row.created_at)}.jsonl`,
-						[row],
-					);
-				}
-				break;
-			case "tweet_collections":
-				for (const row of rowSet.rows) {
-					const kind =
-						row.kind === "likes" || row.kind === "bookmarks"
-							? row.kind
-							: "unknown";
-					addRows(shards, `data/collections/${kind}.jsonl`, [row]);
-				}
-				break;
-			case "tweet_account_edges":
-				for (const row of rowSet.rows) {
-					const kind =
-						row.kind === "home" ||
-						row.kind === "mention" ||
-						row.kind === "authored" ||
-						row.kind === "search"
-							? row.kind
-							: "unknown";
-					addRows(shards, `data/timeline_edges/${kind}.jsonl`, [row]);
-				}
-				break;
-			case "dm_conversations":
-				addRows(shards, "data/dms/conversations.jsonl", rowSet.rows);
-				break;
-			case "dm_messages":
-				for (const row of rowSet.rows) {
-					addRows(
-						shards,
-						`data/dms/${yearFromTimestamp(row.created_at)}.jsonl`,
-						[row],
-					);
-				}
-				break;
-			case "url_expansions":
-				addRows(shards, "data/links/url_expansions.jsonl", rowSet.rows);
-				break;
-			case "link_occurrences":
-				addRows(shards, "data/links/occurrences.jsonl", rowSet.rows);
-				break;
-			case "blocks":
-			case "mutes":
-				addRows(
-					shards,
-					`data/moderation/${rowSet.logicalName}.jsonl`,
-					rowSet.rows,
-				);
-				break;
-			case "tweet_actions":
-				addRows(shards, "data/actions/tweet_actions.jsonl", rowSet.rows);
-				break;
-			case "ai_scores":
-				addRows(shards, "data/ai_scores.jsonl", rowSet.rows);
-				break;
-			case "follow_snapshots":
-				addRows(shards, "data/follow_snapshots.jsonl", rowSet.rows);
-				break;
-			case "follow_snapshot_members":
-				addRows(shards, "data/follow_snapshot_members.jsonl", rowSet.rows);
-				break;
-			case "follow_edges":
-				addRows(shards, "data/follow_edges.jsonl", rowSet.rows);
-				break;
-			case "follow_events":
-				addRows(shards, "data/follow_events.jsonl", rowSet.rows);
-				break;
-		}
-	}
-
-	return shards;
+	return buildBackupShardsFromRowSets(getExportRowSets(db));
 }
 
 function writeJsonlFileEffect(
@@ -706,40 +343,6 @@ function computeBackupHash(files: BackupFileManifest[]) {
 		.sort()
 		.join("\n");
 	return sha256(content);
-}
-
-function computeCounts(files: BackupFileManifest[]) {
-	const counts: Record<string, number> = {};
-	for (const file of files) {
-		const [first, second, third] = file.path.split("/");
-		if (first !== "data") {
-			continue;
-		}
-		const key =
-			second === "tweets"
-				? "tweets"
-				: second === "collections"
-					? `collections_${third?.replace(/\.jsonl$/, "") ?? "unknown"}`
-					: second === "timeline_edges"
-						? `timeline_edges_${third?.replace(/\.jsonl$/, "") ?? "unknown"}`
-						: second === "dms" && third === "conversations.jsonl"
-							? "dm_conversations"
-							: second === "dms"
-								? "dm_messages"
-								: second === "links"
-									? third === "url_expansions.jsonl"
-										? "url_expansions"
-										: third === "occurrences.jsonl"
-											? "link_occurrences"
-											: "links"
-									: second === "moderation"
-										? third?.replace(/\.jsonl$/, "") || "moderation"
-										: second === "actions"
-											? third?.replace(/\.jsonl$/, "") || "actions"
-											: second?.replace(/\.jsonl$/, "") || "unknown";
-		counts[key] = (counts[key] ?? 0) + file.rows;
-	}
-	return counts;
 }
 
 function ensureBackupReadmeEffect(
@@ -1076,7 +679,7 @@ export function exportBackupEffect({
 		);
 		yield* removeStaleBackupFilesEffect(resolvedRepoPath, expectedPaths);
 
-		const counts = yield* trySync(() => computeCounts(files));
+		const counts = yield* trySync(() => countBackupFiles(files));
 		const backupHash = yield* trySync(() => computeBackupHash(files));
 		const previousManifest =
 			yield* readPreviousManifestEffect(resolvedRepoPath);
@@ -1151,7 +754,10 @@ function readManifestEffect(
 				new Error("Backup manifest is not a birdclaw backup"),
 			);
 		}
-		if (parsed.schemaVersion !== BACKUP_SCHEMA_VERSION) {
+		if (
+			parsed.schemaVersion < MIN_SUPPORTED_BACKUP_SCHEMA_VERSION ||
+			parsed.schemaVersion > BACKUP_SCHEMA_VERSION
+		) {
 			return yield* Effect.fail(
 				new Error(
 					`Unsupported backup schema version ${String(parsed.schemaVersion)}`,
@@ -1293,42 +899,24 @@ function readJsonlFilesEffect(
 function readBackupImportRowsEffect(
 	resolvedRepoPath: string,
 	manifest: BackupManifest,
-): Effect.Effect<JsonRecord[][], unknown> {
-	const readRows = (predicate: (relativePath: string) => boolean) =>
-		readJsonlFilesEffect(
-			resolvedRepoPath,
-			rowsForManifestPath(manifest, predicate),
+): Effect.Effect<BackupImportRows, unknown> {
+	return Effect.gen(function* () {
+		yield* trySync(() => {
+			for (const file of manifest.files) {
+				if (file.path.startsWith("data/")) backupCodecForPath(file.path);
+			}
+		});
+		const entries = yield* Effect.forEach(
+			BACKUP_TABLE_CODECS,
+			(codec) =>
+				readJsonlFilesEffect(
+					resolvedRepoPath,
+					rowsForManifestPath(manifest, codec.matchesPath),
+				).pipe(Effect.map((rows) => [codec.name, rows] as const)),
+			{ concurrency: "unbounded" },
 		);
-
-	return Effect.all(
-		[
-			readRows((file) => file === "data/accounts.jsonl"),
-			readRows((file) => file === "data/profiles.jsonl"),
-			readRows((file) => file === "data/profile_affiliations.jsonl"),
-			readRows((file) => file === "data/profile_snapshots.jsonl"),
-			readRows((file) => file === "data/profile_bio_entities.jsonl"),
-			readRows((file) => file.startsWith("data/tweets/")),
-			readRows((file) => file.startsWith("data/collections/")),
-			readRows((file) => file.startsWith("data/timeline_edges/")),
-			readRows((file) => file === "data/dms/conversations.jsonl"),
-			readRows(
-				(file) =>
-					file.startsWith("data/dms/") &&
-					file !== "data/dms/conversations.jsonl",
-			),
-			readRows((file) => file === "data/moderation/blocks.jsonl"),
-			readRows((file) => file === "data/moderation/mutes.jsonl"),
-			readRows((file) => file === "data/actions/tweet_actions.jsonl"),
-			readRows((file) => file === "data/ai_scores.jsonl"),
-			readRows((file) => file === "data/links/url_expansions.jsonl"),
-			readRows((file) => file === "data/links/occurrences.jsonl"),
-			readRows((file) => file === "data/follow_snapshots.jsonl"),
-			readRows((file) => file === "data/follow_snapshot_members.jsonl"),
-			readRows((file) => file === "data/follow_edges.jsonl"),
-			readRows((file) => file === "data/follow_events.jsonl"),
-		],
-		{ concurrency: "unbounded" },
-	);
+		return Object.assign(createBackupImportRows(), Object.fromEntries(entries));
+	});
 }
 
 function rowsForManifestPath(
@@ -1339,85 +927,6 @@ function rowsForManifestPath(
 		.map((file) => file.path)
 		.filter(predicate)
 		.sort();
-}
-
-const JSON_URL_KEYS = new Set([
-	"url",
-	"expandedUrl",
-	"expanded_url",
-	"imageUrl",
-	"image_url",
-	"mediaUrl",
-	"media_url",
-	"media_url_https",
-	"thumbnailUrl",
-	"thumbnail_url",
-	"previewImageUrl",
-	"preview_image_url",
-]);
-
-function sanitizeJsonUrlValue(key: string, value: JsonValue): JsonValue {
-	if (!JSON_URL_KEYS.has(key)) return value;
-	if (typeof value !== "string" || value.length === 0) return value;
-	return safeHttpUrl(value) ?? "";
-}
-
-function sanitizeJsonUrls(value: JsonValue, key = ""): JsonValue {
-	if (Array.isArray(value)) {
-		return value.map((item) => sanitizeJsonUrls(item));
-	}
-	if (value && typeof value === "object") {
-		return Object.fromEntries(
-			Object.entries(value).map(([entryKey, entryValue]) => [
-				entryKey,
-				sanitizeJsonUrls(entryValue, entryKey),
-			]),
-		);
-	}
-	return sanitizeJsonUrlValue(key, value);
-}
-
-function sanitizeJsonTextUrls(value: JsonValue, fallback: JsonValue) {
-	if (typeof value !== "string" || value.length === 0) return value;
-	try {
-		return JSON.stringify(sanitizeJsonUrls(JSON.parse(value) as JsonValue));
-	} catch {
-		return JSON.stringify(fallback);
-	}
-}
-
-function sanitizeImportedTweets(rows: JsonRecord[]) {
-	return rows.map((row) => ({
-		...row,
-		entities_json: sanitizeJsonTextUrls(row.entities_json, {}),
-		media_json: sanitizeJsonTextUrls(row.media_json, []),
-	}));
-}
-
-function sanitizeImportedUrlExpansions(rows: JsonRecord[]) {
-	return rows.map((row) => {
-		const shortUrl =
-			typeof row.short_url === "string" ? safeHttpUrl(row.short_url) : null;
-		const expandedUrl =
-			typeof row.expanded_url === "string"
-				? safeHttpUrl(row.expanded_url)
-				: null;
-		const finalUrl =
-			typeof row.final_url === "string" ? safeHttpUrl(row.final_url) : null;
-		const safe = Boolean(shortUrl || expandedUrl || finalUrl);
-		return {
-			...row,
-			short_url: shortUrl ?? "",
-			expanded_url: expandedUrl ?? shortUrl ?? "",
-			final_url: finalUrl ?? expandedUrl ?? shortUrl ?? "",
-			status: safe ? row.status : "error",
-			error: safe ? row.error : "unsafe URL stripped from backup import",
-			image_url:
-				typeof row.image_url === "string"
-					? (safeHttpUrl(row.image_url) ?? "")
-					: row.image_url,
-		};
-	});
 }
 
 export function importBackupEffect({
@@ -1441,632 +950,59 @@ export function importBackupEffect({
 			);
 		}
 
-		const [
-			accounts,
-			profiles,
-			profileAffiliations,
-			profileSnapshots,
-			profileBioEntities,
-			tweets,
-			collections,
-			timelineEdges,
-			conversations,
-			messages,
-			blocks,
-			mutes,
-			actions,
-			scores,
-			urlExpansions,
-			linkOccurrences,
-			followSnapshots,
-			followSnapshotMembers,
-			followEdges,
-			followEvents,
-		] = yield* readBackupImportRowsEffect(resolvedRepoPath, manifest);
-		const sanitizedTweets = yield* trySync(() =>
-			sanitizeImportedTweets(tweets),
+		const importRows = yield* readBackupImportRowsEffect(
+			resolvedRepoPath,
+			manifest,
 		);
-		const sanitizedUrlExpansions = yield* trySync(() =>
-			sanitizeImportedUrlExpansions(urlExpansions),
+		yield* trySync(() => {
+			for (const codec of BACKUP_TABLE_CODECS) {
+				const transform = codec.merge.transform;
+				if (transform)
+					importRows[codec.name] = transform(importRows[codec.name]);
+			}
+		});
+		const canonicalTweetState = yield* trySync(() =>
+			adaptLegacyTweetState(
+				manifest.schemaVersion,
+				importRows.tweets,
+				importRows.tweet_collections,
+				importRows.tweet_account_edges,
+			),
 		);
+		importRows.tweet_collections = canonicalTweetState.collections;
+		importRows.tweet_account_edges = canonicalTweetState.timelineEdges;
 		const fingerprint = yield* databaseWriteEffect((writeDb) => {
 			const repository = getImportRepository(writeDb);
 			if (mode === "replace") {
 				repository.clearBackupImport();
 			}
-			const tweetFtsIds =
-				mode === "replace"
-					? new Set<string>()
-					: repository.readFtsIds({
-							table: "tweets_fts",
-							idColumn: "tweet_id",
-						});
-			const dmFtsIds =
-				mode === "replace"
-					? new Set<string>()
-					: repository.readFtsIds({
-							table: "dm_fts",
-							idColumn: "message_id",
-						});
-			repository.insertRows(
-				`
-      insert into accounts (id, name, handle, external_user_id, transport, is_default, created_at)
-      values (?, ?, ?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        name = coalesce(nullif(excluded.name, ''), accounts.name),
-        handle = coalesce(nullif(excluded.handle, ''), accounts.handle),
-        external_user_id = coalesce(excluded.external_user_id, accounts.external_user_id),
-        transport = coalesce(nullif(excluded.transport, ''), accounts.transport),
-        is_default = max(accounts.is_default, excluded.is_default),
-        created_at = min(accounts.created_at, excluded.created_at)
-      `,
-				accounts,
-				[
-					"id",
-					"name",
-					"handle",
-					"external_user_id",
-					"transport",
-					"is_default",
-					"created_at",
-				],
+			const existingFtsIds = new Map<string, Set<string>>();
+			for (const codec of BACKUP_TABLE_CODECS) {
+				const fts = codec.merge.fts;
+				if (!fts) continue;
+				existingFtsIds.set(
+					codec.name,
+					mode === "replace"
+						? new Set<string>()
+						: repository.readFtsIds(fts.target),
+				);
+			}
+			const mergeCodecs = [...BACKUP_TABLE_CODECS].sort(
+				(left, right) => left.merge.order - right.merge.order,
 			);
-			repository.insertRows(
-				`
-      insert into profile_snapshots (
-        profile_id, snapshot_hash, observed_at, last_seen_at, source, handle,
-        display_name, bio, location, url, verified_type, followers_count,
-        following_count, affiliations_json, raw_json
-      ) values (?, ?, ?, ?, coalesce(?, 'backup'), ?, ?, ?, ?, ?, ?, coalesce(?, 0), coalesce(?, 0), coalesce(?, '[]'), coalesce(?, '{}'))
-      on conflict(profile_id, snapshot_hash) do update set
-        last_seen_at = max(profile_snapshots.last_seen_at, excluded.last_seen_at),
-        source = excluded.source,
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else profile_snapshots.raw_json
-        end
-      `,
-				profileSnapshots,
-				[
-					"profile_id",
-					"snapshot_hash",
-					"observed_at",
-					"last_seen_at",
-					"source",
-					"handle",
-					"display_name",
-					"bio",
-					"location",
-					"url",
-					"verified_type",
-					"followers_count",
-					"following_count",
-					"affiliations_json",
-					"raw_json",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into profile_bio_entities (
-        profile_id, kind, value, source, is_active, first_seen_at, last_seen_at, raw_json
-      ) values (?, ?, ?, coalesce(?, 'backup'), coalesce(?, 1), ?, ?, coalesce(?, '{}'))
-      on conflict(profile_id, kind, value) do update set
-        source = excluded.source,
-        is_active = excluded.is_active,
-        last_seen_at = max(profile_bio_entities.last_seen_at, excluded.last_seen_at),
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else profile_bio_entities.raw_json
-        end
-      `,
-				profileBioEntities,
-				[
-					"profile_id",
-					"kind",
-					"value",
-					"source",
-					"is_active",
-					"first_seen_at",
-					"last_seen_at",
-					"raw_json",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into profiles (
-        id, handle, display_name, bio, followers_count, following_count,
-        public_metrics_json, avatar_hue, avatar_url, location, url,
-        verified_type, entities_json, raw_json, created_at
-      ) values (?, ?, ?, ?, ?, coalesce(?, 0), coalesce(?, '{}'), ?, ?, ?, ?, ?, coalesce(?, '{}'), coalesce(?, '{}'), ?)
-      on conflict(id) do update set
-        handle = coalesce(nullif(excluded.handle, ''), profiles.handle),
-        display_name = coalesce(nullif(excluded.display_name, ''), profiles.display_name),
-        bio = coalesce(nullif(excluded.bio, ''), profiles.bio),
-        followers_count = max(profiles.followers_count, excluded.followers_count),
-        following_count = max(profiles.following_count, excluded.following_count),
-        public_metrics_json = case
-          when excluded.public_metrics_json not in ('', '{}', 'null') then excluded.public_metrics_json
-          else profiles.public_metrics_json
-        end,
-        avatar_hue = case when profiles.avatar_hue = 0 then excluded.avatar_hue else profiles.avatar_hue end,
-        avatar_url = coalesce(excluded.avatar_url, profiles.avatar_url),
-        location = coalesce(excluded.location, profiles.location),
-        url = coalesce(excluded.url, profiles.url),
-        verified_type = coalesce(excluded.verified_type, profiles.verified_type),
-        entities_json = case
-          when excluded.entities_json not in ('', '{}', 'null') then excluded.entities_json
-          else profiles.entities_json
-        end,
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else profiles.raw_json
-        end,
-        created_at = min(profiles.created_at, excluded.created_at)
-      `,
-				profiles,
-				[
-					"id",
-					"handle",
-					"display_name",
-					"bio",
-					"followers_count",
-					"following_count",
-					"public_metrics_json",
-					"avatar_hue",
-					"avatar_url",
-					"location",
-					"url",
-					"verified_type",
-					"entities_json",
-					"raw_json",
-					"created_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into profile_affiliations (
-        subject_profile_id, organization_profile_id, organization_name,
-        organization_handle, badge_url, url, label, source, is_active,
-        first_seen_at, last_seen_at, raw_json, updated_at
-      ) values (?, ?, ?, ?, ?, ?, ?, coalesce(?, 'backup'), coalesce(?, 1), ?, ?, coalesce(?, '{}'), ?)
-      on conflict(subject_profile_id, organization_profile_id) do update set
-        organization_name = coalesce(excluded.organization_name, profile_affiliations.organization_name),
-        organization_handle = coalesce(excluded.organization_handle, profile_affiliations.organization_handle),
-        badge_url = coalesce(excluded.badge_url, profile_affiliations.badge_url),
-        url = coalesce(excluded.url, profile_affiliations.url),
-        label = coalesce(excluded.label, profile_affiliations.label),
-        source = excluded.source,
-        is_active = excluded.is_active,
-        last_seen_at = max(profile_affiliations.last_seen_at, excluded.last_seen_at),
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else profile_affiliations.raw_json
-        end,
-        updated_at = excluded.updated_at
-      `,
-				profileAffiliations,
-				[
-					"subject_profile_id",
-					"organization_profile_id",
-					"organization_name",
-					"organization_handle",
-					"badge_url",
-					"url",
-					"label",
-					"source",
-					"is_active",
-					"first_seen_at",
-					"last_seen_at",
-					"raw_json",
-					"updated_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into follow_snapshots (
-        id, account_id, direction, source, status, page_count, result_count,
-        started_at, completed_at, raw_meta_json
-      ) values (?, ?, ?, coalesce(?, 'backup'), ?, coalesce(?, 0), coalesce(?, 0), ?, ?, coalesce(?, '{}'))
-      on conflict(id) do update set
-        account_id = coalesce(nullif(excluded.account_id, ''), follow_snapshots.account_id),
-        direction = coalesce(nullif(excluded.direction, ''), follow_snapshots.direction),
-        source = coalesce(nullif(excluded.source, ''), follow_snapshots.source),
-        status = coalesce(nullif(excluded.status, ''), follow_snapshots.status),
-        page_count = max(follow_snapshots.page_count, excluded.page_count),
-        result_count = max(follow_snapshots.result_count, excluded.result_count),
-        started_at = min(follow_snapshots.started_at, excluded.started_at),
-        completed_at = max(follow_snapshots.completed_at, excluded.completed_at),
-        raw_meta_json = case
-          when excluded.raw_meta_json not in ('', '{}', 'null') then excluded.raw_meta_json
-          else follow_snapshots.raw_meta_json
-        end
-      `,
-				followSnapshots,
-				[
-					"id",
-					"account_id",
-					"direction",
-					"source",
-					"status",
-					"page_count",
-					"result_count",
-					"started_at",
-					"completed_at",
-					"raw_meta_json",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into follow_snapshot_members (
-        snapshot_id, profile_id, external_user_id, position
-      ) values (?, ?, ?, coalesce(?, 0))
-      on conflict(snapshot_id, profile_id) do update set
-        external_user_id = coalesce(nullif(excluded.external_user_id, ''), follow_snapshot_members.external_user_id),
-        position = excluded.position
-      `,
-				followSnapshotMembers,
-				["snapshot_id", "profile_id", "external_user_id", "position"],
-			);
-			repository.insertRows(
-				`
-      insert into follow_edges (
-        account_id, direction, profile_id, external_user_id, source, current,
-        first_seen_at, last_seen_at, ended_at, updated_at
-      ) values (?, ?, ?, ?, coalesce(?, 'backup'), coalesce(?, 1), ?, ?, ?, ?)
-      on conflict(account_id, direction, profile_id) do update set
-        external_user_id = coalesce(nullif(excluded.external_user_id, ''), follow_edges.external_user_id),
-        source = coalesce(nullif(excluded.source, ''), follow_edges.source),
-        current = case
-          when excluded.updated_at >= follow_edges.updated_at then excluded.current
-          else follow_edges.current
-        end,
-        first_seen_at = min(follow_edges.first_seen_at, excluded.first_seen_at),
-        last_seen_at = max(follow_edges.last_seen_at, excluded.last_seen_at),
-        ended_at = case
-          when excluded.updated_at >= follow_edges.updated_at then excluded.ended_at
-          else follow_edges.ended_at
-        end,
-        updated_at = max(follow_edges.updated_at, excluded.updated_at)
-      `,
-				followEdges,
-				[
-					"account_id",
-					"direction",
-					"profile_id",
-					"external_user_id",
-					"source",
-					"current",
-					"first_seen_at",
-					"last_seen_at",
-					"ended_at",
-					"updated_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into follow_events (
-        id, account_id, direction, profile_id, external_user_id, kind, event_at,
-        snapshot_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        account_id = coalesce(nullif(excluded.account_id, ''), follow_events.account_id),
-        direction = coalesce(nullif(excluded.direction, ''), follow_events.direction),
-        profile_id = coalesce(nullif(excluded.profile_id, ''), follow_events.profile_id),
-        external_user_id = coalesce(nullif(excluded.external_user_id, ''), follow_events.external_user_id),
-        kind = coalesce(nullif(excluded.kind, ''), follow_events.kind),
-        event_at = coalesce(nullif(excluded.event_at, ''), follow_events.event_at),
-        snapshot_id = coalesce(nullif(excluded.snapshot_id, ''), follow_events.snapshot_id)
-      `,
-				followEvents,
-				[
-					"id",
-					"account_id",
-					"direction",
-					"profile_id",
-					"external_user_id",
-					"kind",
-					"event_at",
-					"snapshot_id",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked, entities_json,
-        media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        account_id = coalesce(nullif(excluded.account_id, ''), tweets.account_id),
-        author_profile_id = coalesce(nullif(excluded.author_profile_id, ''), tweets.author_profile_id),
-        kind = case
-          when tweets.kind in ('home', 'mention', 'authored', 'search') then tweets.kind
-          when excluded.kind in ('home', 'mention', 'authored', 'search') then excluded.kind
-          else coalesce(nullif(excluded.kind, ''), tweets.kind)
-        end,
-        text = coalesce(nullif(excluded.text, ''), tweets.text),
-        created_at = min(tweets.created_at, excluded.created_at),
-        is_replied = max(tweets.is_replied, excluded.is_replied),
-        reply_to_id = coalesce(excluded.reply_to_id, tweets.reply_to_id),
-        like_count = max(tweets.like_count, excluded.like_count),
-        media_count = max(tweets.media_count, excluded.media_count),
-        bookmarked = max(tweets.bookmarked, excluded.bookmarked),
-        liked = max(tweets.liked, excluded.liked),
-        entities_json = case
-          when excluded.entities_json not in ('', '{}', 'null') then excluded.entities_json
-          else tweets.entities_json
-        end,
-        media_json = case
-          when excluded.media_json not in ('', '[]', 'null') then excluded.media_json
-          else tweets.media_json
-        end,
-        quoted_tweet_id = coalesce(excluded.quoted_tweet_id, tweets.quoted_tweet_id)
-      `,
-				sanitizedTweets,
-				[
-					"id",
-					"account_id",
-					"author_profile_id",
-					"kind",
-					"text",
-					"created_at",
-					"is_replied",
-					"reply_to_id",
-					"like_count",
-					"media_count",
-					"bookmarked",
-					"liked",
-					"entities_json",
-					"media_json",
-					"quoted_tweet_id",
-				],
-			);
-			repository.insertFtsRows({
-				target: { table: "tweets_fts", idColumn: "tweet_id" },
-				rows: sanitizedTweets,
-				idKey: "id",
-				textKey: "text",
-				existingIds: tweetFtsIds,
-			});
-			repository.insertRows(
-				`
-      insert into tweet_collections (
-        account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
-      ) values (?, ?, ?, ?, ?, ?, ?)
-      on conflict(account_id, tweet_id, kind) do update set
-        collected_at = coalesce(tweet_collections.collected_at, excluded.collected_at),
-        source = coalesce(nullif(excluded.source, ''), tweet_collections.source),
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else tweet_collections.raw_json
-        end,
-        updated_at = max(tweet_collections.updated_at, excluded.updated_at)
-      `,
-				collections,
-				[
-					"account_id",
-					"tweet_id",
-					"kind",
-					"collected_at",
-					"source",
-					"raw_json",
-					"updated_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into tweet_account_edges (
-        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
-        source, raw_json, updated_at
-      ) values (?, ?, ?, ?, ?, coalesce(?, 1), coalesce(?, 'backup'), coalesce(?, '{}'), ?)
-      on conflict(account_id, tweet_id, kind) do update set
-        first_seen_at = min(tweet_account_edges.first_seen_at, excluded.first_seen_at),
-        last_seen_at = max(tweet_account_edges.last_seen_at, excluded.last_seen_at),
-        seen_count = max(tweet_account_edges.seen_count, excluded.seen_count),
-        source = coalesce(nullif(excluded.source, ''), tweet_account_edges.source),
-        raw_json = case
-          when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json
-          else tweet_account_edges.raw_json
-        end,
-        updated_at = max(tweet_account_edges.updated_at, excluded.updated_at)
-      `,
-				timelineEdges,
-				[
-					"account_id",
-					"tweet_id",
-					"kind",
-					"first_seen_at",
-					"last_seen_at",
-					"seen_count",
-					"source",
-					"raw_json",
-					"updated_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into dm_conversations (
-        id, account_id, participant_profile_id, title, inbox_kind, last_message_at, unread_count, needs_reply
-      ) values (?, ?, ?, ?, coalesce(?, 'accepted'), ?, ?, ?)
-      on conflict(id) do update set
-        account_id = coalesce(nullif(excluded.account_id, ''), dm_conversations.account_id),
-        participant_profile_id = coalesce(nullif(excluded.participant_profile_id, ''), dm_conversations.participant_profile_id),
-        title = coalesce(nullif(excluded.title, ''), dm_conversations.title),
-        inbox_kind = case
-          when excluded.last_message_at > dm_conversations.last_message_at
-            then coalesce(nullif(excluded.inbox_kind, ''), dm_conversations.inbox_kind)
-          else dm_conversations.inbox_kind
-        end,
-        last_message_at = max(dm_conversations.last_message_at, excluded.last_message_at),
-        unread_count = max(dm_conversations.unread_count, excluded.unread_count),
-        needs_reply = max(dm_conversations.needs_reply, excluded.needs_reply)
-      `,
-				conversations,
-				[
-					"id",
-					"account_id",
-					"participant_profile_id",
-					"title",
-					"inbox_kind",
-					"last_message_at",
-					"unread_count",
-					"needs_reply",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into dm_messages (
-        id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
-      ) values (?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        conversation_id = coalesce(nullif(excluded.conversation_id, ''), dm_messages.conversation_id),
-        sender_profile_id = coalesce(nullif(excluded.sender_profile_id, ''), dm_messages.sender_profile_id),
-        text = coalesce(nullif(excluded.text, ''), dm_messages.text),
-        created_at = min(dm_messages.created_at, excluded.created_at),
-        direction = coalesce(nullif(excluded.direction, ''), dm_messages.direction),
-        is_replied = max(dm_messages.is_replied, excluded.is_replied),
-        media_count = max(dm_messages.media_count, excluded.media_count)
-      `,
-				messages,
-				[
-					"id",
-					"conversation_id",
-					"sender_profile_id",
-					"text",
-					"created_at",
-					"direction",
-					"is_replied",
-					"media_count",
-				],
-			);
-			repository.insertFtsRows({
-				target: { table: "dm_fts", idColumn: "message_id" },
-				rows: messages,
-				idKey: "id",
-				textKey: "text",
-				existingIds: dmFtsIds,
-			});
-			repository.insertRows(
-				`
-      insert into url_expansions (
-        short_url, expanded_url, final_url, status, expanded_tweet_id,
-        expanded_handle, title, description, image_url, site_name, error, source,
-        updated_at
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(short_url) do update set
-        expanded_url = excluded.expanded_url,
-        final_url = excluded.final_url,
-        status = excluded.status,
-        expanded_tweet_id = excluded.expanded_tweet_id,
-        expanded_handle = excluded.expanded_handle,
-        title = excluded.title,
-        description = excluded.description,
-        image_url = excluded.image_url,
-        site_name = excluded.site_name,
-        error = excluded.error,
-        source = excluded.source,
-        updated_at = excluded.updated_at
-      `,
-				sanitizedUrlExpansions,
-				[
-					"short_url",
-					"expanded_url",
-					"final_url",
-					"status",
-					"expanded_tweet_id",
-					"expanded_handle",
-					"title",
-					"description",
-					"image_url",
-					"site_name",
-					"error",
-					"source",
-					"updated_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into link_occurrences (
-        source_kind, source_id, source_position, short_url, account_id,
-        conversation_id, direction, created_at
-      ) values (?, ?, ?, ?, ?, ?, ?, ?)
-      on conflict(source_kind, source_id, source_position, short_url) do update set
-        account_id = excluded.account_id,
-        conversation_id = excluded.conversation_id,
-        direction = excluded.direction,
-        created_at = excluded.created_at
-      `,
-				linkOccurrences,
-				[
-					"source_kind",
-					"source_id",
-					"source_position",
-					"short_url",
-					"account_id",
-					"conversation_id",
-					"direction",
-					"created_at",
-				],
-			);
-			repository.insertRows(
-				`
-      insert into blocks (account_id, profile_id, source, created_at)
-      values (?, ?, ?, ?)
-      on conflict(account_id, profile_id) do update set
-        source = coalesce(nullif(excluded.source, ''), blocks.source),
-        created_at = min(blocks.created_at, excluded.created_at)
-      `,
-				blocks,
-				["account_id", "profile_id", "source", "created_at"],
-			);
-			repository.insertRows(
-				`
-      insert into mutes (account_id, profile_id, source, created_at)
-      values (?, ?, ?, ?)
-      on conflict(account_id, profile_id) do update set
-        source = coalesce(nullif(excluded.source, ''), mutes.source),
-        created_at = min(mutes.created_at, excluded.created_at)
-      `,
-				mutes,
-				["account_id", "profile_id", "source", "created_at"],
-			);
-			repository.insertRows(
-				`
-      insert into tweet_actions (id, account_id, tweet_id, kind, body, created_at)
-      values (?, ?, ?, ?, ?, ?)
-      on conflict(id) do update set
-        account_id = coalesce(nullif(excluded.account_id, ''), tweet_actions.account_id),
-        tweet_id = coalesce(excluded.tweet_id, tweet_actions.tweet_id),
-        kind = coalesce(nullif(excluded.kind, ''), tweet_actions.kind),
-        body = coalesce(nullif(excluded.body, ''), tweet_actions.body),
-        created_at = min(tweet_actions.created_at, excluded.created_at)
-      `,
-				actions,
-				["id", "account_id", "tweet_id", "kind", "body", "created_at"],
-			);
-			repository.insertRows(
-				`
-      insert into ai_scores (
-        entity_kind, entity_id, model, score, summary, reasoning, updated_at
-      ) values (?, ?, ?, ?, ?, ?, ?)
-      on conflict(entity_kind, entity_id) do update set
-        model = coalesce(nullif(excluded.model, ''), ai_scores.model),
-        score = max(ai_scores.score, excluded.score),
-        summary = coalesce(nullif(excluded.summary, ''), ai_scores.summary),
-        reasoning = coalesce(nullif(excluded.reasoning, ''), ai_scores.reasoning),
-        updated_at = max(ai_scores.updated_at, excluded.updated_at)
-      `,
-				scores,
-				[
-					"entity_kind",
-					"entity_id",
-					"model",
-					"score",
-					"summary",
-					"reasoning",
-					"updated_at",
-				],
-			);
+			for (const codec of mergeCodecs) {
+				const rows = importRows[codec.name];
+				repository.insertRows(codec.merge.sql, rows, codec.merge.columns);
+				const fts = codec.merge.fts;
+				if (!fts) continue;
+				repository.insertFtsRows({
+					target: fts.target,
+					rows,
+					idKey: fts.idKey,
+					textKey: fts.textKey,
+					existingIds: existingFtsIds.get(codec.name),
+				});
+			}
 			return getBackupDatabaseFingerprint(writeDb);
 		}, db);
 
@@ -2191,12 +1127,6 @@ export function updateBackupFromGitEffect({
 			...(importResult ? { importResult } : {}),
 		};
 	});
-}
-
-export function updateBackupFromGit(
-	options: UpdateBackupFromGitOptions,
-): Promise<UpdateBackupFromGitResult> {
-	return runEffectPromise(updateBackupFromGitEffect(options));
 }
 
 function readAutoSyncState(db: Database) {
@@ -2609,7 +1539,15 @@ export function validateBackupEffect(
 			}
 		}
 
-		const counts = computeCounts(files);
+		const counts = yield* trySync(() => countBackupFiles(files)).pipe(
+			Effect.match({
+				onFailure: (error) => {
+					errors.push(error instanceof Error ? error.message : String(error));
+					return {};
+				},
+				onSuccess: (value) => value,
+			}),
+		);
 		const backupHash = computeBackupHash(files);
 		if (backupHash !== manifest.backupHash) {
 			errors.push(`backup hash ${backupHash} != ${manifest.backupHash}`);

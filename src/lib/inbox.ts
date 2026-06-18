@@ -4,7 +4,8 @@ import { runEffectPromise } from "./effect-runtime";
 import { scoreInboxItemWithOpenAIEffect } from "./openai";
 import { listDmConversations } from "./dm-read-model";
 import { listTimelineItems } from "./timeline-read-model";
-import type { InboxItem, InboxQuery, InboxResponse } from "./types";
+import type { InboxResponse } from "./api-contracts";
+import type { InboxItem, InboxQuery } from "./types";
 
 function heuristicSummary(kind: InboxItem["entityKind"]) {
 	return kind === "dm"

@@ -1,4 +1,5 @@
 import { getNativeDb } from "./db";
+import type { NetworkMapResponse } from "./api-contracts";
 import {
 	geocodeLocation,
 	GeocodeRateLimitError,
@@ -30,27 +31,6 @@ export interface NetworkMapFeature {
 	type: "Feature";
 	geometry: { type: "Point"; coordinates: [number, number] };
 	properties: NetworkMapProfileProperties;
-}
-
-export interface NetworkMapResponse {
-	type: "FeatureCollection";
-	features: NetworkMapFeature[];
-	meta: {
-		accountId: string;
-		type: NetworkMapKind;
-		totalProfiles: number;
-		profilesWithLocation: number;
-		meaningfulProfiles: number;
-		locatedProfiles: number;
-		missingGeocodes: number;
-		geocodedThisRun: number;
-		suppressedGeocodes: number;
-		opencageConfigured: boolean;
-		mapboxTokenConfigured: boolean;
-	};
-	config: {
-		mapboxToken: string | null;
-	};
 }
 
 interface ProfileLocationRow {

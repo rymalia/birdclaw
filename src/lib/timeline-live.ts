@@ -9,7 +9,7 @@ import {
 	resolveLiveSyncAccount,
 	runCachedLiveSyncEffect,
 } from "./live-sync-engine";
-import { collectPaginatedEffect } from "./paginated-sync";
+import { runSyncPlanEffect } from "./sync-plan";
 import type {
 	XurlMediaItem,
 	XurlMentionUser,
@@ -129,7 +129,6 @@ function mergeHomeTimelineIntoLocalStore(
 	ingestTweetPayload(db, {
 		accountId,
 		payload,
-		kind: "home",
 		edgeKind: "home",
 		source,
 	});
@@ -192,7 +191,7 @@ export function syncHomeTimelineEffect({
 				);
 			}
 			const pageSizes = new Map<number, number>();
-			const result = yield* collectPaginatedEffect({
+			const result = yield* runSyncPlanEffect({
 				fetchPage: ({ cursor, fetched, pageIndex }) => {
 					const remaining = Number.isFinite(effectiveLimit)
 						? Math.max(1, effectiveLimit - fetched)

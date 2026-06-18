@@ -5,6 +5,7 @@ import { runEffectPromise } from "./effect-runtime";
 import { syncIdentitySearchIndexForProfileIds } from "./identity-search-index";
 import { syncProfileBioEntitiesForProfileId } from "./profile-bio-entities";
 import { recordProfileSnapshot } from "./profile-history";
+import { normalizeProfileHandle } from "./profile-row";
 import { upsertProfileFromXUser } from "./x-profile";
 
 export interface ProfileAffiliationHydrationResult {
@@ -35,11 +36,6 @@ function trySync<T>(try_: () => T) {
 		try: try_,
 		catch: toError,
 	});
-}
-
-function normalizeHandle(value: string | null) {
-	const handle = value?.trim().replace(/^@/, "");
-	return handle && handle.length > 0 ? handle : null;
 }
 
 function replaceSyntheticAffiliation(
@@ -156,7 +152,7 @@ export function hydrateProfileAffiliationOrganizationsEffect(
 		};
 
 		for (const row of rows) {
-			const handle = normalizeHandle(row.organization_handle);
+			const handle = normalizeProfileHandle(row.organization_handle) || null;
 			if (!handle) {
 				result.skipped += 1;
 				continue;

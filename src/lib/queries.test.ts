@@ -96,6 +96,70 @@ function setupTempHome() {
 	resetDatabaseForTests();
 }
 
+type TestDatabase = ReturnType<typeof getNativeDb>;
+
+function insertTestTweet(
+	db: TestDatabase,
+	options: {
+		id: string;
+		text: string;
+		createdAt: string;
+		authorProfileId?: string;
+		replyToId?: string | null;
+		likeCount?: number;
+		mediaCount?: number;
+		entitiesJson?: string;
+		mediaJson?: string;
+		quotedTweetId?: string | null;
+	},
+) {
+	db.prepare(`
+		insert into tweets (
+			id, author_profile_id, text, created_at, is_replied, reply_to_id,
+			like_count, media_count, entities_json, media_json, quoted_tweet_id
+		) values (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+	`).run(
+		options.id,
+		options.authorProfileId ?? "profile_me",
+		options.text,
+		options.createdAt,
+		options.replyToId ?? null,
+		options.likeCount ?? 0,
+		options.mediaCount ?? 0,
+		options.entitiesJson ?? "{}",
+		options.mediaJson ?? "[]",
+		options.quotedTweetId ?? null,
+	);
+}
+
+function insertTestEdge(
+	db: TestDatabase,
+	tweetId: string,
+	createdAt: string,
+	kind = "home",
+	rawJson = "{}",
+) {
+	db.prepare(`
+		insert into tweet_account_edges (
+			account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+			source, raw_json, updated_at
+		) values ('acct_primary', ?, ?, ?, ?, 1, 'test', ?, ?)
+	`).run(tweetId, kind, createdAt, createdAt, rawJson, createdAt);
+}
+
+function insertTestCollection(
+	db: TestDatabase,
+	tweetId: string,
+	kind: "bookmarks" | "likes",
+	createdAt: string,
+) {
+	db.prepare(`
+		insert into tweet_collections (
+			account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+		) values ('acct_primary', ?, ?, ?, 'test', '{}', ?)
+	`).run(tweetId, kind, createdAt, createdAt);
+}
+
 afterEach(() => {
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
@@ -612,39 +676,19 @@ describe("birdclaw queries", () => {
       delete from tweets_fts;
       delete from tweets;
     `);
-		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', ?, ?, ?, 0, null, 0, 0, 0, 0, '{}', '[]', null)
-    `);
-		const insertEdge = db.prepare(`
-      insert into tweet_account_edges (
-        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
-        source, raw_json, updated_at
-      ) values ('acct_primary', ?, 'home', ?, ?, 1, 'test', '{}', ?)
-    `);
-		insertTweet.run(
-			"tweet_old_home",
-			"home",
-			"old but valid home item",
-			"2026-01-01T00:00:00.000Z",
-		);
-		insertEdge.run(
-			"tweet_old_home",
-			"2026-01-01T00:00:00.000Z",
-			"2026-01-01T00:00:00.000Z",
-			"2026-01-01T00:00:00.000Z",
-		);
+		insertTestTweet(db, {
+			id: "tweet_old_home",
+			text: "old but valid home item",
+			createdAt: "2026-01-01T00:00:00.000Z",
+		});
+		insertTestEdge(db, "tweet_old_home", "2026-01-01T00:00:00.000Z");
 		db.transaction(() => {
 			for (let index = 0; index < 5000; index += 1) {
-				insertTweet.run(
-					`tweet_new_like_${String(index)}`,
-					"like",
-					`newer non-timeline tweet ${String(index)}`,
-					`2026-02-${String(Math.floor(index / 200) + 1).padStart(2, "0")}T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
-				);
+				insertTestTweet(db, {
+					id: `tweet_new_like_${String(index)}`,
+					text: `newer non-timeline tweet ${String(index)}`,
+					createdAt: `2026-02-${String(Math.floor(index / 200) + 1).padStart(2, "0")}T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+				});
 			}
 		})();
 
@@ -656,15 +700,17 @@ describe("birdclaw queries", () => {
 	it("filters timeline items by liked and bookmarked state across collections", () => {
 		setupTempHome();
 		const db = getNativeDb();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values ('tweet_saved_live', 'acct_primary', 'profile_me', 'bookmark', 'saved live item', '2026-03-09T00:00:00.000Z', 0, null, 0, 0, 1, 0, '{}', '[]', null)
-      `,
-		).run();
+		insertTestTweet(db, {
+			id: "tweet_saved_live",
+			text: "saved live item",
+			createdAt: "2026-03-09T00:00:00.000Z",
+		});
+		insertTestCollection(
+			db,
+			"tweet_saved_live",
+			"bookmarks",
+			"2026-03-09T00:00:00.000Z",
+		);
 
 		const liked = listTimelineItems({ resource: "home", likedOnly: true });
 		const bookmarked = listTimelineItems({
@@ -686,17 +732,20 @@ describe("birdclaw queries", () => {
       delete from tweets_fts;
       delete from tweets;
     `);
-		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'bookmark', ?, ?, 0, null, 0, 0, 1, 0, '{}', '[]', null)
-    `);
 		const boundary = "2026-03-09T00:00:00.000Z";
 		// Two bookmarks with an identical created_at; tweet_b sorts after tweet_a by id.
-		insertTweet.run("tweet_a", "shared-timestamp a", boundary);
-		insertTweet.run("tweet_b", "shared-timestamp b", boundary);
+		insertTestTweet(db, {
+			id: "tweet_a",
+			text: "shared-timestamp a",
+			createdAt: boundary,
+		});
+		insertTestTweet(db, {
+			id: "tweet_b",
+			text: "shared-timestamp b",
+			createdAt: boundary,
+		});
+		insertTestCollection(db, "tweet_a", "bookmarks", boundary);
+		insertTestCollection(db, "tweet_b", "bookmarks", boundary);
 
 		const firstPage = listTimelineItems({
 			resource: "home",
@@ -732,49 +781,35 @@ describe("birdclaw queries", () => {
 	it("hides low-quality timeline noise for summary queries", () => {
 		setupTempHome();
 		const db = getNativeDb();
-		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'home', ?, ?, 0, null, ?, ?, 0, 0, '{}', '[]', null)
-    `);
-
-		insertTweet.run(
-			"tweet_low_reply",
-			"@sam yes",
-			"2026-03-08T13:00:00.000Z",
-			0,
-			0,
-		);
-		insertTweet.run(
-			"tweet_low_link",
-			"Wow https://t.co/noise",
-			"2026-03-08T13:01:00.000Z",
-			1,
-			0,
-		);
-		insertTweet.run(
-			"tweet_low_rt",
-			"RT @someone: borrowed context",
-			"2026-03-08T13:02:00.000Z",
-			120,
-			0,
-		);
-		insertTweet.run(
-			"tweet_good_short",
-			"OMG PC GUY",
-			"2026-03-08T13:03:00.000Z",
-			100,
-			0,
-		);
-		insertTweet.run(
-			"tweet_good_media",
-			"https://t.co/screenshot",
-			"2026-03-08T13:04:00.000Z",
-			0,
-			1,
-		);
+		const qualityTweets = [
+			["tweet_low_reply", "@sam yes", "2026-03-08T13:00:00.000Z", 0, 0],
+			[
+				"tweet_low_link",
+				"Wow https://t.co/noise",
+				"2026-03-08T13:01:00.000Z",
+				1,
+				0,
+			],
+			[
+				"tweet_low_rt",
+				"RT @someone: borrowed context",
+				"2026-03-08T13:02:00.000Z",
+				120,
+				0,
+			],
+			["tweet_good_short", "OMG PC GUY", "2026-03-08T13:03:00.000Z", 100, 0],
+			[
+				"tweet_good_media",
+				"https://t.co/screenshot",
+				"2026-03-08T13:04:00.000Z",
+				0,
+				1,
+			],
+		] as const;
+		for (const [id, text, createdAt, likeCount, mediaCount] of qualityTweets) {
+			insertTestTweet(db, { id, text, createdAt, likeCount, mediaCount });
+			insertTestEdge(db, id, createdAt);
+		}
 
 		const items = listTimelineItems({
 			resource: "home",
@@ -826,35 +861,33 @@ describe("birdclaw queries", () => {
 	it("includes quality reasons only when requested", () => {
 		setupTempHome();
 		const db = getNativeDb();
-		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'home', ?, ?, 0, null, ?, ?, 0, 0, '{}', '[]', null)
-    `);
-
-		insertTweet.run(
-			"tweet_reason_rt",
-			"RT @someone: borrowed context",
-			"2026-03-08T15:00:00.000Z",
-			120,
-			0,
-		);
-		insertTweet.run(
-			"tweet_reason_media",
-			"https://t.co/screenshot",
-			"2026-03-08T15:01:00.000Z",
-			0,
-			1,
-		);
-		insertTweet.run(
-			"tweet_reason_liked",
-			"short but liked",
-			"2026-03-08T15:02:00.000Z",
-			100,
-			0,
-		);
+		const reasonTweets = [
+			[
+				"tweet_reason_rt",
+				"RT @someone: borrowed context",
+				"2026-03-08T15:00:00.000Z",
+				120,
+				0,
+			],
+			[
+				"tweet_reason_media",
+				"https://t.co/screenshot",
+				"2026-03-08T15:01:00.000Z",
+				0,
+				1,
+			],
+			[
+				"tweet_reason_liked",
+				"short but liked",
+				"2026-03-08T15:02:00.000Z",
+				100,
+				0,
+			],
+		] as const;
+		for (const [id, text, createdAt, likeCount, mediaCount] of reasonTweets) {
+			insertTestTweet(db, { id, text, createdAt, likeCount, mediaCount });
+			insertTestEdge(db, id, createdAt);
+		}
 
 		const plainItems = listTimelineItems({
 			resource: "home",
@@ -910,58 +943,30 @@ describe("birdclaw queries", () => {
         )
       `,
 		).run();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (
-        'tweet_raw_url', 'acct_primary', 'profile_me', 'home',
-        'Check it: https://t.co/peek', '2026-03-09T12:00:00.000Z',
-        0, null, 0, 0, 0, 0, '{}', '[]', null
-      )
-      `,
-		).run();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (
-        'tweet_raw_mention', 'acct_primary', 'profile_me', 'home',
-        '@Dimillian Any ideas for Mac apps?', '2026-03-09T12:01:00.000Z',
-        0, null, 0, 0, 0, 0, '{}', '[]', null
-      )
-      `,
-		).run();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (
-        'tweet_retweeted_original', 'acct_primary', 'profile_dimillian', 'thread',
-        'Actual original tweet content', '2026-03-09T11:59:00.000Z',
-        0, null, 19, 0, 0, 0, '{}', '[]', null
-      )
-      `,
-		).run();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (
-        'tweet_retweet_ref', 'acct_primary', 'profile_me', 'home',
-        'RT @Dimillian: Actual original tweet content', '2026-03-09T12:02:00.000Z',
-        0, null, 0, 0, 0, 0, '{}', '[]', null
-      )
-      `,
-		).run();
+		insertTestTweet(db, {
+			id: "tweet_raw_url",
+			text: "Check it: https://t.co/peek",
+			createdAt: "2026-03-09T12:00:00.000Z",
+		});
+		insertTestEdge(db, "tweet_raw_url", "2026-03-09T12:00:00.000Z");
+		insertTestTweet(db, {
+			id: "tweet_raw_mention",
+			text: "@Dimillian Any ideas for Mac apps?",
+			createdAt: "2026-03-09T12:01:00.000Z",
+		});
+		insertTestEdge(db, "tweet_raw_mention", "2026-03-09T12:01:00.000Z");
+		insertTestTweet(db, {
+			id: "tweet_retweeted_original",
+			authorProfileId: "profile_dimillian",
+			text: "Actual original tweet content",
+			createdAt: "2026-03-09T11:59:00.000Z",
+			likeCount: 19,
+		});
+		insertTestTweet(db, {
+			id: "tweet_retweet_ref",
+			text: "RT @Dimillian: Actual original tweet content",
+			createdAt: "2026-03-09T12:02:00.000Z",
+		});
 		db.prepare(
 			`
       insert into tweet_account_edges (
@@ -975,19 +980,11 @@ describe("birdclaw queries", () => {
       )
       `,
 		).run();
-		db.prepare(
-			`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (
-        'tweet_retweet_missing_ref', 'acct_primary', 'profile_me', 'home',
-        'RT @Dimillian: Missing original tweet content', '2026-03-09T12:03:00.000Z',
-        0, null, 0, 0, 0, 0, '{}', '[]', null
-      )
-      `,
-		).run();
+		insertTestTweet(db, {
+			id: "tweet_retweet_missing_ref",
+			text: "RT @Dimillian: Missing original tweet content",
+			createdAt: "2026-03-09T12:03:00.000Z",
+		});
 		db.prepare(
 			`
       insert into tweet_account_edges (
@@ -1081,12 +1078,11 @@ describe("birdclaw queries", () => {
 		setupTempHome();
 		const db = getNativeDb();
 		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'home', ?, ?, 0, ?, 0, 0, 0, 0, '{}', '[]', null)
-    `);
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, reply_to_id,
+				like_count, media_count, entities_json, media_json, quoted_tweet_id
+			) values (?, 'profile_me', ?, ?, 0, ?, 0, 0, '{}', '[]', null)
+		`);
 
 		insertTweet.run(
 			"conv_root",
@@ -1122,12 +1118,11 @@ describe("birdclaw queries", () => {
 		setupTempHome();
 		const db = getNativeDb();
 		const insertTweet = db.prepare(`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_me', 'home', ?, ?, 0, ?, 0, 0, 0, 0, '{}', '[]', null)
-    `);
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, reply_to_id,
+				like_count, media_count, entities_json, media_json, quoted_tweet_id
+			) values (?, 'profile_me', ?, ?, 0, ?, 0, 0, '{}', '[]', null)
+		`);
 
 		insertTweet.run("deep_root", "Root", "2026-03-10T10:00:00.000Z", null);
 		for (let index = 0; index < 20; index += 1) {
@@ -1364,7 +1359,12 @@ describe("birdclaw queries", () => {
 			.prepare("select kind, body from tweet_actions where tweet_id = ?")
 			.get(result.tweetId) as { kind: string; body: string } | undefined;
 		const post = db
-			.prepare("select text, kind from tweets where id = ?")
+			.prepare(`
+				select t.text, e.kind
+				from tweets t
+				join tweet_account_edges e on e.tweet_id = t.id
+				where t.id = ? and e.account_id = 'acct_primary'
+			`)
 			.get(result.tweetId) as { text: string; kind: string } | undefined;
 
 		expect(result.ok).toBe(true);

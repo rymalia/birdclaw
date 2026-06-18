@@ -93,26 +93,22 @@ function insertTweet(
 ) {
 	db.prepare(`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at, is_replied,
-      reply_to_id, like_count, media_count, bookmarked, liked,
+      id, author_profile_id, text, created_at, is_replied,
+      reply_to_id, like_count, media_count,
       entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-		options.id,
+    ) values (?, ?, ?, ?, 0, null, 1, 0, '{}', '[]', null)
+  `).run(options.id, options.authorProfileId, options.text, options.createdAt);
+	db.prepare(`
+		insert into tweet_account_edges (
+			account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+			source, raw_json, updated_at
+		) values (?, ?, 'home', ?, ?, 1, 'test', '{}', ?)
+	`).run(
 		options.accountId ?? "acct_primary",
-		options.authorProfileId,
-		"home",
-		options.text,
+		options.id,
 		options.createdAt,
-		0,
-		null,
-		1,
-		0,
-		0,
-		0,
-		"{}",
-		"[]",
-		null,
+		options.createdAt,
+		options.createdAt,
 	);
 }
 

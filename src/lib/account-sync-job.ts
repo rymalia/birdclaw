@@ -1,14 +1,22 @@
-import { execFile } from "node:child_process";
-import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import { maybeAutoSyncBackup, type BackupAutoUpdateResult } from "./backup";
 import { ensureBirdclawDirs, getBirdclawPaths } from "./config";
 import { getNativeDb } from "./db";
 import { syncDirectMessagesViaCachedBird } from "./dms-live";
+import {
+	buildLaunchAgent,
+	buildLaunchProgramArguments,
+	installLaunchAgent,
+	resolveUserPath,
+	type LaunchAgentInstallResult,
+} from "./launchd";
 import { syncMentionThreads } from "./mention-threads-live";
 import { syncMentions } from "./mentions-live";
+import {
+	acquireScheduledJobLock,
+	appendScheduledJobAudit,
+	startScheduledJobRun,
+} from "./scheduled-job";
 import type { Database } from "./sqlite";
 import {
 	syncTimelineCollection,
@@ -17,13 +25,10 @@ import {
 } from "./timeline-collections-live";
 import { syncHomeTimeline } from "./timeline-live";
 
-const execFileAsync = promisify(execFile);
 const DEFAULT_ACCOUNT_SYNC_INTERVAL_SECONDS = 30 * 60;
 const DEFAULT_ACCOUNT_SYNC_LIMIT = 100;
 const DEFAULT_ACCOUNT_SYNC_MAX_PAGES = 3;
 const DEFAULT_ACCOUNT_SYNC_LABEL = "com.steipete.birdclaw.account-sync";
-const DEFAULT_LAUNCHD_PATH =
-	"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 const DEFAULT_LOCK_STALE_MS = 60 * 60 * 1000;
 
 export type AccountSyncStepKind =
@@ -100,18 +105,7 @@ export interface AccountSyncLaunchAgentOptions {
 	load?: boolean;
 }
 
-export interface AccountSyncLaunchAgentInstallResult {
-	ok: true;
-	label: string;
-	plistPath: string;
-	loaded: boolean;
-	programArguments: string[];
-	logPath: string;
-	stdoutPath: string;
-	stderrPath: string;
-	intervalSeconds: number;
-	envFile?: string;
-}
+export interface AccountSyncLaunchAgentInstallResult extends LaunchAgentInstallResult {}
 
 const DEFAULT_STEPS: AccountSyncStepKind[] = [
 	"timeline",
@@ -121,16 +115,6 @@ const DEFAULT_STEPS: AccountSyncStepKind[] = [
 	"bookmarks",
 	"dms",
 ];
-
-function expandHome(input: string) {
-	return input === "~" || input.startsWith("~/")
-		? path.join(os.homedir(), input.slice(2))
-		: input;
-}
-
-function resolvePath(input: string) {
-	return path.resolve(expandHome(input));
-}
 
 export function getDefaultAccountSyncAuditLogPath() {
 	return path.join(getBirdclawPaths().rootDir, "audit", "account-sync.jsonl");
@@ -142,45 +126,6 @@ export function getDefaultAccountSyncLockPath() {
 
 function messageFromError(error: unknown) {
 	return error instanceof Error ? error.message : String(error);
-}
-
-async function appendAuditEntry(logPath: string, entry: AccountSyncAuditEntry) {
-	await fs.mkdir(path.dirname(logPath), { recursive: true });
-	await fs.appendFile(logPath, `${JSON.stringify(entry)}\n`, "utf8");
-}
-
-async function acquireLock(lockPath: string) {
-	await fs.mkdir(path.dirname(lockPath), { recursive: true });
-	try {
-		const handle = await fs.open(lockPath, "wx");
-		await handle.writeFile(
-			`${JSON.stringify({
-				pid: process.pid,
-				host: os.hostname(),
-				startedAt: new Date().toISOString(),
-			})}\n`,
-			"utf8",
-		);
-		await handle.close();
-		return async () => {
-			await fs.rm(lockPath, { force: true });
-		};
-	} catch (error) {
-		if (
-			typeof error === "object" &&
-			error !== null &&
-			"code" in error &&
-			error.code === "EEXIST"
-		) {
-			const stats = await fs.stat(lockPath).catch(() => undefined);
-			if (stats && Date.now() - stats.mtimeMs > DEFAULT_LOCK_STALE_MS) {
-				await fs.rm(lockPath, { force: true });
-				return acquireLock(lockPath);
-			}
-			return undefined;
-		}
-		throw error;
-	}
 }
 
 function readNumber(value: unknown, key: string): number {
@@ -387,14 +332,13 @@ export async function runAccountSyncJob({
 }: AccountSyncJobOptions = {}): Promise<AccountSyncAuditEntry> {
 	ensureBirdclawDirs();
 	const database = db ?? getNativeDb({ seedDemoData: false });
-	const resolvedLogPath = resolvePath(
+	const resolvedLogPath = resolveUserPath(
 		logPath ?? getDefaultAccountSyncAuditLogPath(),
 	);
-	const resolvedLockPath = resolvePath(
+	const resolvedLockPath = resolveUserPath(
 		lockPath ?? getDefaultAccountSyncLockPath(),
 	);
-	const started = Date.now();
-	const startedAt = new Date(started).toISOString();
+	const run = startScheduledJobRun();
 	const options = {
 		...(account ? { account } : {}),
 		steps,
@@ -409,22 +353,20 @@ export async function runAccountSyncJob({
 		!isExplicitNonDefaultAccount(database, account) ||
 		Boolean(allowBirdAccount);
 
-	const releaseLock = await acquireLock(resolvedLockPath);
+	const releaseLock = await acquireScheduledJobLock(
+		resolvedLockPath,
+		DEFAULT_LOCK_STALE_MS,
+	);
 	if (!releaseLock) {
-		const finished = Date.now();
 		const entry: AccountSyncAuditEntry = {
 			job: "account-sync",
 			ok: true,
-			startedAt,
-			finishedAt: new Date(finished).toISOString(),
-			durationMs: finished - started,
-			host: os.hostname(),
-			pid: process.pid,
+			...run.finish(),
 			options,
 			steps: [],
 			skipped: "already-running",
 		};
-		await appendAuditEntry(resolvedLogPath, entry);
+		await appendScheduledJobAudit(resolvedLogPath, entry);
 		return entry;
 	}
 
@@ -445,55 +387,30 @@ export async function runAccountSyncJob({
 			);
 		}
 		const backup = await maybeAutoSyncBackup(database);
-		const finished = Date.now();
 		const entry: AccountSyncAuditEntry = {
 			job: "account-sync",
 			ok: stepResults.every((step) => step.ok),
-			startedAt,
-			finishedAt: new Date(finished).toISOString(),
-			durationMs: finished - started,
-			host: os.hostname(),
-			pid: process.pid,
+			...run.finish(),
 			options,
 			steps: stepResults,
 			backup,
 		};
-		await appendAuditEntry(resolvedLogPath, entry);
+		await appendScheduledJobAudit(resolvedLogPath, entry);
 		return entry;
 	} catch (error) {
-		const finished = Date.now();
 		const entry: AccountSyncAuditEntry = {
 			job: "account-sync",
 			ok: false,
-			startedAt,
-			finishedAt: new Date(finished).toISOString(),
-			durationMs: finished - started,
-			host: os.hostname(),
-			pid: process.pid,
+			...run.finish(),
 			options,
 			steps: stepResults,
 			error: messageFromError(error),
 		};
-		await appendAuditEntry(resolvedLogPath, entry);
+		await appendScheduledJobAudit(resolvedLogPath, entry);
 		return entry;
 	} finally {
 		await releaseLock();
 	}
-}
-
-function xmlEscape(value: string) {
-	return value
-		.replaceAll("&", "&amp;")
-		.replaceAll("<", "&lt;")
-		.replaceAll(">", "&gt;");
-}
-
-function stringEntry(value: string) {
-	return `<string>${xmlEscape(value)}</string>`;
-}
-
-function shellQuote(value: string) {
-	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function buildProgramArguments({
@@ -509,11 +426,7 @@ function buildProgramArguments({
 	logPath,
 	envFile,
 }: AccountSyncLaunchAgentOptions) {
-	const args =
-		path.isAbsolute(program) || program.includes("/")
-			? [program]
-			: ["/usr/bin/env", program];
-	args.push(
+	const args = [
 		"--json",
 		"jobs",
 		"sync-account",
@@ -524,8 +437,8 @@ function buildProgramArguments({
 		"--max-pages",
 		String(maxPages),
 		"--log",
-		resolvePath(logPath ?? getDefaultAccountSyncAuditLogPath()),
-	);
+		resolveUserPath(logPath ?? getDefaultAccountSyncAuditLogPath()),
+	];
 	if (account) {
 		args.push("--account", account);
 	}
@@ -541,20 +454,7 @@ function buildProgramArguments({
 	if (cacheTtlSeconds !== undefined) {
 		args.push("--cache-ttl", String(cacheTtlSeconds));
 	}
-	if (envFile) {
-		const resolvedEnvFile = resolvePath(envFile);
-		return [
-			"/bin/bash",
-			"-lc",
-			[
-				"set -a",
-				`[ ! -f ${shellQuote(resolvedEnvFile)} ] || . ${shellQuote(resolvedEnvFile)}`,
-				"set +a",
-				`exec ${args.map(shellQuote).join(" ")}`,
-			].join("; "),
-		];
-	}
-	return args;
+	return buildLaunchProgramArguments({ program, args, envFile });
 }
 
 export function buildAccountSyncLaunchAgentPlist(
@@ -563,54 +463,27 @@ export function buildAccountSyncLaunchAgentPlist(
 	const label = options.label ?? DEFAULT_ACCOUNT_SYNC_LABEL;
 	const intervalSeconds =
 		options.intervalSeconds ?? DEFAULT_ACCOUNT_SYNC_INTERVAL_SECONDS;
-	const logPath = resolvePath(
+	const logPath = resolveUserPath(
 		options.logPath ?? getDefaultAccountSyncAuditLogPath(),
 	);
-	const stdoutPath = resolvePath(
+	const stdoutPath = resolveUserPath(
 		options.stdoutPath ??
 			path.join(getBirdclawPaths().rootDir, "logs", "account-sync.out.log"),
 	);
-	const stderrPath = resolvePath(
+	const stderrPath = resolveUserPath(
 		options.stderrPath ??
 			path.join(getBirdclawPaths().rootDir, "logs", "account-sync.err.log"),
 	);
 	const programArguments = buildProgramArguments({ ...options, logPath });
-	const plist = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  ${stringEntry(label)}
-  <key>ProgramArguments</key>
-  <array>
-    ${programArguments.map(stringEntry).join("\n    ")}
-  </array>
-  <key>StartInterval</key>
-  <integer>${String(intervalSeconds)}</integer>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  ${stringEntry(stdoutPath)}
-  <key>StandardErrorPath</key>
-  ${stringEntry(stderrPath)}
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    ${stringEntry(DEFAULT_LAUNCHD_PATH)}
-  </dict>
-</dict>
-</plist>
-`;
-	return {
+	return buildLaunchAgent({
 		label,
 		intervalSeconds,
 		logPath,
-		...(options.envFile ? { envFile: resolvePath(options.envFile) } : {}),
 		stdoutPath,
 		stderrPath,
 		programArguments,
-		plist,
-	};
+		envFile: options.envFile,
+	});
 }
 
 export async function installAccountSyncLaunchAgent(
@@ -618,35 +491,7 @@ export async function installAccountSyncLaunchAgent(
 ): Promise<AccountSyncLaunchAgentInstallResult> {
 	ensureBirdclawDirs();
 	const agent = buildAccountSyncLaunchAgentPlist(options);
-	const launchAgentsDir = resolvePath(
-		options.launchAgentsDir ?? "~/Library/LaunchAgents",
-	);
-	const plistPath = path.join(launchAgentsDir, `${agent.label}.plist`);
-	await fs.mkdir(launchAgentsDir, { recursive: true });
-	await fs.mkdir(path.dirname(agent.logPath), { recursive: true });
-	await fs.mkdir(path.dirname(agent.stdoutPath), { recursive: true });
-	await fs.mkdir(path.dirname(agent.stderrPath), { recursive: true });
-	await fs.writeFile(plistPath, agent.plist, "utf8");
-
-	let loaded = false;
-	if (options.load !== false) {
-		await execFileAsync("launchctl", ["unload", plistPath]).catch(() => {});
-		await execFileAsync("launchctl", ["load", "-w", plistPath]);
-		loaded = true;
-	}
-
-	return {
-		ok: true,
-		label: agent.label,
-		plistPath,
-		loaded,
-		programArguments: agent.programArguments,
-		logPath: agent.logPath,
-		stdoutPath: agent.stdoutPath,
-		stderrPath: agent.stderrPath,
-		intervalSeconds: agent.intervalSeconds,
-		...(agent.envFile ? { envFile: agent.envFile } : {}),
-	};
+	return installLaunchAgent(agent, options);
 }
 
 export function parseAccountSyncSteps(value: string | undefined) {

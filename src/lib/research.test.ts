@@ -69,26 +69,20 @@ function seedResearchThread() {
 		"2026-05-01T00:00:00.000Z",
 	);
 
-	db.prepare(
-		`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-	).run(
+	const insertTweet = db.prepare(`
+    insert into tweets (
+      id, author_profile_id, text, created_at, is_replied, reply_to_id,
+      like_count, media_count, entities_json, media_json, quoted_tweet_id
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, '[]', null)
+  `);
+	insertTweet.run(
 		"tweet_root",
-		"acct_research",
 		"profile_research_sam",
-		"bookmark",
 		"Check https://t.co/demo with @researchlee",
 		"2026-05-01T10:00:00.000Z",
 		0,
 		null,
 		12,
-		0,
-		1,
 		0,
 		JSON.stringify({
 			mentions: [
@@ -109,86 +103,50 @@ function seedResearchThread() {
 				},
 			],
 		}),
-		"[]",
-		null,
 	);
-
-	db.prepare(
-		`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-	).run(
+	insertTweet.run(
 		"tweet_reply_1",
-		"acct_research",
 		"profile_research_lee",
-		"home",
 		"I agree",
 		"2026-05-01T10:05:00.000Z",
 		1,
 		"tweet_root",
 		2,
 		0,
-		0,
-		0,
 		"{}",
-		"[]",
-		null,
 	);
-
-	db.prepare(
-		`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-	).run(
+	insertTweet.run(
 		"tweet_reply_2",
-		"acct_research",
 		"profile_research_jules",
-		"home",
 		"Follow-up with details",
 		"2026-05-01T10:10:00.000Z",
 		1,
 		"tweet_reply_1",
 		3,
 		0,
-		0,
-		0,
 		"{}",
-		"[]",
-		null,
 	);
-
-	db.prepare(
-		`
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-	).run(
+	insertTweet.run(
 		"tweet_reply_3",
-		"acct_research",
 		"profile_research_lee",
-		"home",
 		"Another branch",
 		"2026-05-01T10:06:00.000Z",
 		1,
 		"tweet_root",
 		1,
 		0,
-		0,
-		0,
 		"{}",
-		"[]",
-		null,
+	);
+
+	db.prepare(
+		`insert into tweet_collections (
+			account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+		) values (?, ?, 'bookmarks', ?, 'fixture', '{}', ?)`,
+	).run(
+		"acct_research",
+		"tweet_root",
+		"2026-05-01T10:00:00.000Z",
+		"2026-05-01T10:00:00.000Z",
 	);
 }
 

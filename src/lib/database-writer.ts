@@ -58,12 +58,6 @@ export function databaseWriteEffect<T>(
 	});
 }
 
-export async function drainDatabaseWrites() {
-	while (writeTails.size > 0) {
-		await Promise.all(writeTails.values());
-	}
-}
-
 export function resetDatabaseWriterForTests() {
 	writeTails = new Map();
 }

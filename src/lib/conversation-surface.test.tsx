@@ -1,19 +1,15 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
-import { Effect } from "effect";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	conversationQueryOptions,
 	ConversationSurfaceScope,
-	loadConversationEffect,
-	resetConversationSurface,
 	useConversationSurface,
 } from "./conversation-surface";
 import type { EmbeddedTweet } from "./types";
+import {
+	createTestQueryClient,
+	renderWithQueryClient as render,
+} from "../test/render";
 
 interface ConversationResponse {
 	json: () => Promise<{ items: EmbeddedTweet[]; ok: true }>;
@@ -67,7 +63,6 @@ function Probe({
 describe("conversation surface", () => {
 	afterEach(() => {
 		cleanup();
-		resetConversationSurface();
 		vi.unstubAllGlobals();
 	});
 
@@ -153,24 +148,25 @@ describe("conversation surface", () => {
 		await waitFor(() => {
 			expect(screen.getByTestId("row_a-status")).toHaveTextContent("ready");
 		});
-		expect(screen.getByTestId("row_b-status")).toHaveTextContent("idle");
+		expect(screen.getByTestId("row_b-status")).toHaveTextContent("ready");
 	});
 
-	it("exposes conversation loading as a lazy Effect program", async () => {
+	it("exposes a lazy React Query definition", async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
 			json: async () => ({ items: [tweet], ok: true }),
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
-		const effect = loadConversationEffect("tweet_1");
+		const options = conversationQueryOptions("tweet_1");
+		const queryClient = createTestQueryClient();
 
 		expect(fetchMock).not.toHaveBeenCalled();
-		await expect(Effect.runPromise(effect)).resolves.toBeUndefined();
+		await expect(queryClient.fetchQuery(options)).resolves.toEqual([tweet]);
 		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_1");
 	});
 
-	it("stores load errors and ignores results after reset", async () => {
+	it("stores load errors and retries failed prefetches", async () => {
 		let resolveStale!: (value: ConversationResponse) => void;
 		const staleResponse = new Promise<ConversationResponse>((resolve) => {
 			resolveStale = resolve;
@@ -199,15 +195,18 @@ describe("conversation surface", () => {
 		);
 
 		fireEvent.click(screen.getByRole("button", { name: "prefetch tweet_404" }));
-		expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("loading");
-		resetConversationSurface();
+		await waitFor(() => {
+			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent(
+				"loading",
+			);
+		});
 		resolveStale({
 			ok: true,
 			json: async () => ({ items: [tweet], ok: true }),
 		});
 
 		await waitFor(() => {
-			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("idle");
+			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("ready");
 		});
 	});
 });

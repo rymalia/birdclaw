@@ -4,6 +4,7 @@ import { syncIdentitySearchIndexForProfileIds } from "./identity-search-index";
 import { syncProfileBioEntitiesForProfileId } from "./profile-bio-entities";
 import { syncProfileAffiliationsFromUser } from "./profile-affiliations";
 import { recordProfileSnapshot } from "./profile-history";
+import { normalizeProfileHandle, profileFromDbRow } from "./profile-row";
 import type { ProfileRecord, XurlMentionUser } from "./types";
 
 export interface ResolvedXProfile {
@@ -28,47 +29,6 @@ export function randomAvatarHue(input: string) {
 			.split("")
 			.reduce((sum, character) => sum + character.charCodeAt(0), 0) % 360
 	);
-}
-
-function toProfile(row: Record<string, unknown>): ProfileRecord {
-	const followingCount = Number(row.following_count ?? 0);
-	const entities = parseJsonRecord(row.entities_json);
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count),
-		...(Number.isFinite(followingCount) ? { followingCount } : {}),
-		avatarHue: Number(row.avatar_hue),
-		avatarUrl:
-			typeof row.avatar_url === "string" ? String(row.avatar_url) : undefined,
-		...(typeof row.location === "string" && row.location.length > 0
-			? { location: row.location }
-			: {}),
-		...(typeof row.url === "string" && row.url.length > 0
-			? { url: row.url }
-			: {}),
-		...(typeof row.verified_type === "string" && row.verified_type.length > 0
-			? { verifiedType: row.verified_type }
-			: {}),
-		...(entities ? { entities } : {}),
-		createdAt: String(row.created_at),
-	};
-}
-
-function parseJsonRecord(value: unknown) {
-	if (typeof value !== "string" || value.length === 0) {
-		return undefined;
-	}
-	try {
-		const parsed = JSON.parse(value) as unknown;
-		return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-			? (parsed as Record<string, unknown>)
-			: undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 function getString(value: unknown) {
@@ -129,7 +89,7 @@ function updateExistingProfileFromUser(
 	profileId: string,
 	user: XurlMentionUser,
 ): ResolvedXProfile {
-	const username = String(user.username ?? "").replace(/^@/, "");
+	const username = normalizeProfileHandle(String(user.username ?? ""));
 	const displayName = String(user.name ?? "").trim() || username;
 	const followersCount = Number(user.public_metrics?.followers_count ?? 0);
 	const hasFollowingCount =
@@ -195,7 +155,7 @@ function updateExistingProfileFromUser(
 		.get(profileId) as Record<string, unknown>;
 
 	return {
-		profile: toProfile(row),
+		profile: profileFromDbRow(row),
 		externalUserId: String(user.id),
 	};
 }
@@ -209,7 +169,7 @@ export function upsertProfileFromXUser(
 		throw new Error("Resolved user is missing an id");
 	}
 
-	const username = String(user.username ?? "").replace(/^@/, "");
+	const username = normalizeProfileHandle(String(user.username ?? ""));
 	if (!username) {
 		throw new Error("Resolved user is missing a username");
 	}
@@ -332,7 +292,7 @@ export function ensureStubProfileForXUser(
 
 	if (existingRow) {
 		return {
-			profile: toProfile(existingRow),
+			profile: profileFromDbRow(existingRow),
 			externalUserId,
 		};
 	}

@@ -1,5 +1,6 @@
 import type { Database } from "./sqlite";
 import { fetchProfileAffiliations } from "./profile-affiliations";
+import { normalizeProfileHandle, profileFromDbRow } from "./profile-row";
 import type { ProfileBioEntity, ProfileRecord } from "./types";
 
 interface ExtractedBioEntity {
@@ -41,7 +42,7 @@ function addHandleDerivedCompany(
 	handle: string,
 	source: string,
 ) {
-	const cleaned = handle.replace(/^@/, "").trim();
+	const cleaned = normalizeProfileHandle(handle);
 	if (cleaned.length < 3) {
 		return;
 	}
@@ -140,7 +141,7 @@ export function extractProfileBioEntities(profile: ProfileRecord) {
 			});
 		}
 		if (affiliation.organizationHandle) {
-			const handle = `@${affiliation.organizationHandle.replace(/^@/, "")}`;
+			const handle = `@${normalizeProfileHandle(affiliation.organizationHandle)}`;
 			addEntity(entities, {
 				kind: "handle",
 				value: handle,
@@ -179,40 +180,7 @@ function getProfileRecord(
 	if (!row) {
 		return null;
 	}
-	let parsedEntities: Record<string, unknown> | undefined;
-	if (typeof row.entities_json === "string" && row.entities_json.length > 0) {
-		try {
-			const parsed = JSON.parse(row.entities_json) as unknown;
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				parsedEntities = parsed as Record<string, unknown>;
-			}
-		} catch {
-			parsedEntities = undefined;
-		}
-	}
-	const profile: ProfileRecord = {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count ?? 0),
-		followingCount: Number(row.following_count ?? 0),
-		avatarHue: Number(row.avatar_hue ?? 0),
-		...(typeof row.avatar_url === "string"
-			? { avatarUrl: String(row.avatar_url) }
-			: {}),
-		...(typeof row.location === "string" && row.location.length > 0
-			? { location: row.location }
-			: {}),
-		...(typeof row.url === "string" && row.url.length > 0
-			? { url: row.url }
-			: {}),
-		...(typeof row.verified_type === "string" && row.verified_type.length > 0
-			? { verifiedType: row.verified_type }
-			: {}),
-		...(parsedEntities ? { entities: parsedEntities } : {}),
-		createdAt: String(row.created_at),
-	};
+	const profile = profileFromDbRow(row);
 	const affiliations = fetchProfileAffiliations(db, [profileId]).get(profileId);
 	return affiliations && affiliations.length > 0
 		? { ...profile, affiliations, primaryAffiliation: affiliations[0] }

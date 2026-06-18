@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { XurlRateLimitSnapshot } from "./api-contracts";
 import { getNativeDb } from "./db";
 import type { Database } from "./sqlite";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
@@ -37,26 +38,6 @@ export interface XurlRateLimitEndpointSnapshot {
 	lastRateLimitAt: string | null;
 	estimatedResetAt: string | null;
 	status: "healthy" | "warning" | "critical" | "quiet";
-}
-
-export interface XurlRateLimitSnapshot {
-	generatedAt: string;
-	windowMs: number;
-	docsUrl: string;
-	summary: {
-		totalCallsLastWindow: number;
-		rateLimitedLastWindow: number;
-		errorLastWindow: number;
-		criticalEndpoints: number;
-		lastEventAt: string | null;
-	};
-	endpoints: XurlRateLimitEndpointSnapshot[];
-	events: XurlRateLimitEvent[];
-	throttle: {
-		conversationDelayMs: number;
-		rateLimitRetryMs: number;
-		rateLimitMaxRetries: number;
-	};
 }
 
 interface StoredXurlRateLimitEvents {

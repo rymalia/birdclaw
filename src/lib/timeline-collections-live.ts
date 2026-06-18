@@ -1,7 +1,7 @@
 import type { Database } from "./sqlite";
 import { Effect } from "effect";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { liveTransportGateway } from "./live-transport-gateway";
 import {
 	createLiveTransportAdapter,
@@ -9,6 +9,7 @@ import {
 	resolveLiveSyncAccount,
 	runCachedLiveSyncEffect,
 } from "./live-sync-engine";
+import { runSyncPlanEffect } from "./sync-plan";
 import type {
 	XurlMentionData,
 	XurlMentionsResponse,
@@ -17,7 +18,8 @@ import type {
 } from "./types";
 import { ingestTweetPayload } from "./tweet-repository";
 
-export type TimelineCollectionKind = "likes" | "bookmarks";
+import type { TimelineCollectionKind } from "./api-enums";
+export type { TimelineCollectionKind } from "./api-enums";
 export type TimelineCollectionMode = "auto" | "xurl" | "bird";
 export interface SyncTimelineCollectionOptions {
 	kind: TimelineCollectionKind;
@@ -35,17 +37,6 @@ const DEFAULT_COLLECTION_CACHE_TTL_MS = 2 * 60_000;
 const DEFAULT_EARLY_STOP_MAX_PAGES = 10;
 const MIN_XURL_LIMIT = 5;
 const MAX_XURL_LIMIT = 100;
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
 
 function parseMaxPages(value?: number) {
 	if (value === undefined) {
@@ -174,14 +165,11 @@ function mergeTimelineCollectionIntoLocalStore(
 	payload: XurlMentionsResponse,
 	source: "xurl" | "bird",
 ) {
-	const tweetKind = kind === "likes" ? "like" : "bookmark";
 	ingestTweetPayload(db, {
 		accountId,
 		payload,
-		kind: tweetKind,
 		collectionKind: kind,
 		markRepliesAsReplied: true,
-		replaceSecondaryKind: true,
 		source,
 	});
 }
@@ -220,53 +208,64 @@ function fetchXurlCollectionEffect({
 			resolvedUserId = String(accountUser.id);
 		}
 
-		const pages: XurlMentionsResponse[] = [];
-		let nextToken: string | undefined;
-		let pageCount = 0;
 		let saturatedAtPage: number | undefined;
-		do {
-			const payload = yield* kind === "likes"
-				? liveTransportGateway.xurl.listLikes({
-						maxResults: limit,
-						username,
-						userId: resolvedUserId,
-						paginationToken: nextToken,
-					})
-				: liveTransportGateway.xurl.listBookmarks({
-						maxResults: limit,
-						username,
-						userId: resolvedUserId,
-						isPaginatedWalk: all,
-						paginationToken: nextToken,
-					});
-			pageCount += 1;
-			if (earlyStop) {
-				const tweetIds = payload.data.map((tweet) => tweet.id);
-				const { existingTweetIds, uniqueTweetCount } = yield* trySync(() =>
-					getCollectionPageDedupe(db, accountId, kind, tweetIds),
-				);
-				if (tweetIds.length > 0 && existingTweetIds.size === uniqueTweetCount) {
-					saturatedAtPage = pageCount;
-					console.error(
-						`${kind} saturated at page ${pageCount} (100% existing rows)`,
+		const result = yield* runSyncPlanEffect({
+			fetchPage: ({ cursor, pageIndex }) =>
+				Effect.gen(function* () {
+					const payload = yield* kind === "likes"
+						? liveTransportGateway.xurl.listLikes({
+								maxResults: limit,
+								username,
+								userId: resolvedUserId,
+								paginationToken: cursor,
+							})
+						: liveTransportGateway.xurl.listBookmarks({
+								maxResults: limit,
+								username,
+								userId: resolvedUserId,
+								isPaginatedWalk: all,
+								paginationToken: cursor,
+							});
+					if (!earlyStop) {
+						return { payload, persistedPayload: payload, saturated: false };
+					}
+					const tweetIds = payload.data.map((tweet) => tweet.id);
+					const { existingTweetIds, uniqueTweetCount } = yield* trySync(() =>
+						getCollectionPageDedupe(db, accountId, kind, tweetIds),
 					);
-					break;
+					const saturated =
+						tweetIds.length > 0 && existingTweetIds.size === uniqueTweetCount;
+					if (saturated) saturatedAtPage = pageIndex + 1;
+					return {
+						payload,
+						persistedPayload: filterExistingCollectionTweets(
+							payload,
+							existingTweetIds,
+						),
+						saturated,
+					};
+				}),
+			getItemCount: (page) => page.payload.data.length,
+			getNextCursor: (page) =>
+				typeof page.payload.meta?.next_token === "string"
+					? page.payload.meta.next_token
+					: undefined,
+			maxPages: all || earlyStop ? (maxPages ?? undefined) : 1,
+			shouldStop: ({ page }) => page.saturated,
+			onPage: ({ page, pageNumber }) => {
+				if (page.saturated) {
+					console.error(
+						`${kind} saturated at page ${pageNumber} (100% existing rows)`,
+					);
 				}
-				pages.push(filterExistingCollectionTweets(payload, existingTweetIds));
-			} else {
-				pages.push(payload);
-			}
-			nextToken =
-				typeof payload.meta?.next_token === "string"
-					? payload.meta.next_token
-					: undefined;
-		} while (
-			(all || earlyStop) &&
-			nextToken &&
-			(maxPages === null || pageCount < maxPages)
-		);
+			},
+		});
 
-		const merged = mergePayloads(pages);
+		const merged = mergePayloads(
+			result.pages
+				.filter((page) => !page.saturated)
+				.map((page) => page.persistedPayload),
+		);
 		// A saturated page may expose another token, but our walk is complete.
 		const saturationMeta =
 			saturatedAtPage === undefined
@@ -274,7 +273,7 @@ function fetchXurlCollectionEffect({
 				: { saturated_at_page: saturatedAtPage, next_token: null };
 		merged.meta = {
 			...merged.meta,
-			page_count: pageCount,
+			page_count: result.pages.length,
 			...saturationMeta,
 		};
 		return merged;

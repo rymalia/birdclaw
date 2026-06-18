@@ -1,7 +1,9 @@
 import { Data, Effect } from "effect";
 import { z } from "zod";
 import {
-	actionResponseSchema,
+	actionResponseSchemaFor,
+	type ActionRequest,
+	type ActionResponseFor,
 	queryEnvelopeSchema,
 	queryResponseSchema,
 	webSyncJobSchema,
@@ -69,7 +71,8 @@ export function fetchJsonEffect<T>(
 ) {
 	return Effect.gen(function* () {
 		const response = yield* Effect.tryPromise({
-			try: () => runtime.fetch(input, init),
+			try: () =>
+				init === undefined ? runtime.fetch(input) : runtime.fetch(input, init),
 			catch: (cause) => apiFetchErrorFromCause(cause, fallbackMessage),
 		});
 		const data = yield* readJsonEffect(response);
@@ -134,11 +137,15 @@ export function fetchQueryResponseEffect(
 	return fetchJsonEffect(input, init, queryResponseSchema, "Query unavailable");
 }
 
-export function postAction(body: Record<string, unknown>) {
+export function postAction<K extends ActionRequest["kind"]>(
+	body: Extract<ActionRequest, { kind: K }>,
+): Promise<ActionResponseFor<K>> {
 	return runApiEffect(postActionEffect(body));
 }
 
-export function postActionEffect(body: Record<string, unknown>) {
+export function postActionEffect<K extends ActionRequest["kind"]>(
+	body: Extract<ActionRequest, { kind: K }>,
+) {
 	return fetchJsonEffect(
 		"/api/action",
 		{
@@ -146,7 +153,7 @@ export function postActionEffect(body: Record<string, unknown>) {
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify(body),
 		},
-		actionResponseSchema,
+		actionResponseSchemaFor(body.kind),
 		"Action failed",
 	);
 }
@@ -213,8 +220,4 @@ export function waitForWebSyncJobEffect(job: WebSyncJobSnapshot) {
 		}
 		return current.result;
 	});
-}
-
-export function waitForWebSyncJob(job: WebSyncJobSnapshot) {
-	return runApiEffect(waitForWebSyncJobEffect(job));
 }

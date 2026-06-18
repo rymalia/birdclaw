@@ -202,7 +202,7 @@ describe("moderation target helpers", () => {
 		]);
 		const { resolveProfileEffect } = await import("./moderation-target");
 		const { resolveModerationTargetEffect } =
-			await import("./moderation-write");
+			await import("./moderation-state");
 
 		const profileEffect = resolveProfileEffect("@amelia");
 		expect(mocks.lookupUsersByHandles).not.toHaveBeenCalled();

@@ -239,7 +239,6 @@ function collectLiveSearchTweets(
               and collection.tweet_id = t.id
               and collection.kind = 'bookmarks'
           ) then 1
-          when t.account_id = ? and t.bookmarked = 1 then 1
           else 0
         end as bookmarked,
         case
@@ -249,7 +248,6 @@ function collectLiveSearchTweets(
               and collection.tweet_id = t.id
               and collection.kind = 'likes'
           ) then 1
-          when t.account_id = ? and t.liked = 1 then 1
           else 0
         end as liked,
         p.id as profile_id,
@@ -265,9 +263,7 @@ function collectLiveSearchTweets(
       join profiles p on p.id = t.author_profile_id
       where t.id in (${placeholders})
     `)
-		.all(accountId, accountId, accountId, accountId, ...ids) as Array<
-		Record<string, unknown>
-	>;
+		.all(accountId, accountId, ...ids) as Array<Record<string, unknown>>;
 
 	return rows
 		.sort(

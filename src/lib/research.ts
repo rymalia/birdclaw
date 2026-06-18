@@ -58,9 +58,6 @@ export interface ResearchOptions {
 
 interface ResearchRow {
 	id: string;
-	account_id: string;
-	account_handle: string;
-	kind: string;
 	text: string;
 	created_at: string;
 	is_replied: number;
@@ -215,15 +212,18 @@ function getTweetRowById(tweetId: string): ResearchRow | null {
 			`
       select
         t.id,
-        t.account_id,
-        a.handle as account_handle,
-        t.kind,
         t.text,
         t.created_at,
         t.is_replied,
         t.like_count,
-        t.bookmarked,
-        t.liked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'bookmarks'
+		) as bookmarked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'likes'
+		) as liked,
         t.reply_to_id,
         t.quoted_tweet_id,
         t.entities_json,
@@ -236,7 +236,6 @@ function getTweetRowById(tweetId: string): ResearchRow | null {
         p.avatar_url as author_avatar_url,
         p.created_at as author_created_at
       from tweets t
-      join accounts a on a.id = t.account_id
       join profiles p on p.id = t.author_profile_id
       where t.id = ?
       `,
@@ -267,15 +266,18 @@ function getTweetDescendants(
       )
       select
         t.id,
-        t.account_id,
-        a.handle as account_handle,
-        t.kind,
         t.text,
         t.created_at,
         t.is_replied,
         t.like_count,
-        t.bookmarked,
-        t.liked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'bookmarks'
+		) as bookmarked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'likes'
+		) as liked,
         t.reply_to_id,
         t.quoted_tweet_id,
         t.entities_json,
@@ -290,7 +292,6 @@ function getTweetDescendants(
         thread.depth as thread_depth
       from thread
       join tweets t on t.id = thread.id
-      join accounts a on a.id = t.account_id
       join profiles p on p.id = t.author_profile_id
       order by t.created_at asc, t.id asc
       `,

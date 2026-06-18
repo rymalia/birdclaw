@@ -1,7 +1,6 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { Effect } from "effect";
 import { runEffectPromise } from "./effect-runtime";
+import { runSubprocessEffect, SubprocessError } from "./subprocess";
 import type {
 	FollowDirection,
 	LiveDataSourceAccount,
@@ -15,7 +14,6 @@ import type {
 	XurlUserTweetsResponse,
 } from "./types";
 
-const execFileAsync = promisify(execFile);
 const TRANSPORT_STATUS_TTL_MS = 5 * 60_000;
 const AUTHENTICATED_USER_TTL_MS = 60_000;
 const JSON_RETRY_LIMIT = 6;
@@ -177,20 +175,13 @@ function capTimelineCollectionMaxResults(
 		: maxResults;
 }
 
-export function resetTransportStatusCache() {
-	transportStatusCache = undefined;
-}
-
 export function resetAuthenticatedUserCache() {
 	authenticatedUserCache = undefined;
 	oauth2CandidateCache.clear();
 }
 
 function hasXurlEffect() {
-	return Effect.tryPromise({
-		try: () => execFileAsync("xurl", ["version"]),
-		catch: normalizeError,
-	}).pipe(
+	return runSubprocessEffect({ command: "xurl", args: ["version"] }).pipe(
 		Effect.as(true),
 		Effect.catchAll(() => Effect.succeed(false)),
 	);
@@ -213,9 +204,9 @@ function readTransportStatusEffect(): Effect.Effect<TransportStatus, never> {
 			};
 		}
 
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", ["auth", "status"]),
-			catch: (cause) => cause,
+		return yield* runSubprocessEffect({
+			command: "xurl",
+			args: ["auth", "status"],
 		}).pipe(
 			Effect.map(({ stdout }) => {
 				const rawStatus = stdout.trim();
@@ -242,7 +233,10 @@ function readTransportStatusEffect(): Effect.Effect<TransportStatus, never> {
 					installed: true,
 					availableTransport: "local" as const,
 					statusText: `xurl detected but auth unavailable: ${
-						error instanceof Error ? error.message : "unknown error"
+						error instanceof Error &&
+						!(error instanceof SubprocessError && !error.causeWasError)
+							? error.message
+							: "unknown error"
 					}`,
 				}),
 			),
@@ -303,10 +297,7 @@ function runShortcutEffect(args: string[]) {
 			return { ok: false, output: "live writes disabled" };
 		}
 
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", args),
-			catch: normalizeError,
-		}).pipe(
+		return yield* runSubprocessEffect({ command: "xurl", args }).pipe(
 			Effect.map(({ stdout, stderr }) => ({
 				ok: true,
 				output: stdout || stderr,
@@ -326,45 +317,11 @@ function execXurlJsonEffect(
 	timeoutMs?: number,
 	signal?: AbortSignal,
 ): Effect.Effect<{ stdout: string; stderr: string }, Error> {
-	return Effect.tryPromise({
-		try: () => {
-			const controller =
-				(typeof timeoutMs === "number" &&
-					Number.isFinite(timeoutMs) &&
-					timeoutMs > 0) ||
-				signal
-					? new AbortController()
-					: undefined;
-			if (
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs <= 0
-			) {
-				throw new Error("xurl command timed out");
-			}
-			if (signal?.aborted) {
-				throw new Error("xurl command aborted");
-			}
-			const onAbort = () => controller?.abort();
-			signal?.addEventListener("abort", onAbort, { once: true });
-			const timeout =
-				controller &&
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs > 0
-					? setTimeout(() => controller.abort(), timeoutMs)
-					: undefined;
-			const result = controller
-				? execFileAsync("xurl", args, { signal: controller.signal })
-				: execFileAsync("xurl", args);
-			return result.finally(() => {
-				signal?.removeEventListener("abort", onAbort);
-				if (timeout) {
-					clearTimeout(timeout);
-				}
-			});
-		},
-		catch: normalizeError,
+	return runSubprocessEffect({
+		command: "xurl",
+		args,
+		timeoutMs,
+		signal,
 	});
 }
 
@@ -381,28 +338,16 @@ function execXurlTextEffect(
 	args: string[],
 	deadlineMs?: number,
 ): Effect.Effect<{ stdout: string; stderr: string }, Error> {
-	return Effect.tryPromise({
-		try: () => {
-			const timeoutMs = getRemainingTimeoutMs(deadlineMs);
-			const controller =
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs > 0
-					? new AbortController()
-					: undefined;
-			const timeout = controller
-				? setTimeout(() => controller.abort(), timeoutMs)
-				: undefined;
-			const result = controller
-				? execFileAsync("xurl", args, { signal: controller.signal })
-				: execFileAsync("xurl", args);
-			return result.finally(() => {
-				if (timeout) {
-					clearTimeout(timeout);
-				}
+	return Effect.suspend(() => {
+		try {
+			return runSubprocessEffect({
+				command: "xurl",
+				args,
+				timeoutMs: getRemainingTimeoutMs(deadlineMs),
 			});
-		},
-		catch: normalizeError,
+		} catch (error) {
+			return Effect.fail(normalizeError(error));
+		}
 	});
 }
 
@@ -538,10 +483,6 @@ export function readXurlOAuth2AccountsEffect(): Effect.Effect<
 			})),
 		),
 	);
-}
-
-export function readXurlOAuth2Accounts(): Promise<LiveDataSourceAccount[]> {
-	return runEffectPromise(readXurlOAuth2AccountsEffect());
 }
 
 function lookupOAuth2UsernameForAccountEffect(
@@ -728,10 +669,7 @@ function runMutationCommandEffect(args: string[]) {
 			return { ok: false, output: "live writes disabled" };
 		}
 
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", args),
-			catch: normalizeError,
-		}).pipe(
+		return yield* runSubprocessEffect({ command: "xurl", args }).pipe(
 			Effect.map(({ stdout, stderr }) => ({
 				ok: true,
 				output: stdout || stderr || "ok",

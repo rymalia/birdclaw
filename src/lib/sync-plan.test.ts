@@ -4,6 +4,44 @@ import { runEffectPromise } from "./effect-runtime";
 import { runSyncPlanEffect, type SyncPlanPageContext } from "./sync-plan";
 
 describe("runSyncPlanEffect", () => {
+	it("collects pages and reports exhaustion", async () => {
+		const pages = [
+			{ items: ["one"], next: "page-2" },
+			{ items: ["two"], next: undefined },
+		];
+		const result = await runEffectPromise(
+			runSyncPlanEffect({
+				fetchPage: ({ pageIndex }) => Effect.succeed(pages[pageIndex]!),
+				getItemCount: (page) => page.items.length,
+				getNextCursor: (page) => page.next,
+			}),
+		);
+
+		expect(result).toMatchObject({
+			complete: true,
+			fetched: 2,
+			stopReason: "exhausted",
+		});
+		expect(result.pages).toEqual(pages);
+	});
+
+	it("breaks repeated cursor loops", async () => {
+		const result = await runEffectPromise(
+			runSyncPlanEffect({
+				fetchPage: ({ cursor }) =>
+					Effect.succeed({ items: [cursor ?? "first"], next: "same" }),
+				getNextCursor: (page) => page.next,
+			}),
+		);
+
+		expect(result).toMatchObject({
+			complete: false,
+			nextCursor: "same",
+			stopReason: "repeated-cursor",
+		});
+		expect(result.pages).toHaveLength(2);
+	});
+
 	it("persists each page and reports page-limit cursors", async () => {
 		type Page = { items: Array<string | undefined>; next: string };
 		const persistPage = vi.fn(

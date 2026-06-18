@@ -75,6 +75,23 @@ describe("api client", () => {
 				createRuntimeServices({ fetch }),
 			),
 		).resolves.toEqual({ ok: true });
-		expect(fetch).toHaveBeenCalledWith("/api/test", undefined);
+		expect(fetch).toHaveBeenCalledWith("/api/test");
+	});
+
+	it("rejects malformed successful responses at the shared boundary", async () => {
+		const fetch = vi.fn(async () => Response.json({ ok: "yes" }));
+
+		await expect(
+			fetchJson(
+				"/api/test",
+				undefined,
+				z.object({ ok: z.boolean() }),
+				"Malformed response",
+				createRuntimeServices({ fetch }),
+			),
+		).rejects.toMatchObject({
+			_tag: "ApiFetchError",
+			message: "Malformed response",
+		});
 	});
 });

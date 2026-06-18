@@ -387,26 +387,17 @@ function buildScopeClause(
 			clauses.push(
 				`exists (select 1 from tweet_collections collection where collection.tweet_id = t.id and collection.kind = ?${accountClause("collection")})`,
 			);
-			const legacyColumn = savedKind === "likes" ? "liked" : "bookmarked";
-			pushAccount();
-			clauses.push(
-				`t.${legacyColumn} = 1${account ? " and t.account_id = ?" : ""}`,
-			);
 		}
-		params.push(kind);
-		pushAccount();
-		clauses.push(`t.kind = ?${account ? " and t.account_id = ?" : ""}`);
 		return clauses.join(" or ");
 	}
 	if (account) {
-		params.push(account, account, account);
+		params.push(account, account);
 		clauses.push(
 			"exists (select 1 from tweet_account_edges edge where edge.tweet_id = t.id and edge.account_id = ?)",
 		);
 		clauses.push(
 			"exists (select 1 from tweet_collections collection where collection.tweet_id = t.id and collection.account_id = ?)",
 		);
-		clauses.push("t.account_id = ?");
 	}
 	return clauses.join(" or ");
 }

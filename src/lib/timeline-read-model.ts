@@ -1,11 +1,8 @@
 import type { Database } from "./sqlite";
 import { getReadDb } from "./db";
+import { profileFromDbRow, profileHandleKey } from "./profile-row";
 import { displayUrlForLink, enrichFallbackUrlEntities } from "./tweet-render";
-import {
-	parseJsonField,
-	toFtsSearchQuery,
-	toProfile,
-} from "./query-read-model-shared";
+import { parseJsonField, toFtsSearchQuery } from "./query-read-model-shared";
 import type {
 	EmbeddedTweet,
 	ProfileRecord,
@@ -13,21 +10,14 @@ import type {
 	TimelineItem,
 	TimelineQualityFilter,
 	TimelineQuery,
-	TweetConversationResponse,
+	TweetConversation,
 	TweetEntities,
 	TweetMediaItem,
 	TweetUrlEntity,
 } from "./types";
 
-export type {
-	TimelineItem,
-	TimelineQuery,
-	TweetConversationResponse,
-} from "./types";
-
-function normalizeProfileHandle(handle: string) {
-	return handle.replace(/^@/, "").toLowerCase();
-}
+export type { TimelineItem, TimelineQuery } from "./types";
+export type { TweetConversation } from "./types";
 
 function avatarHueForHandle(handle: string) {
 	let hash = 0;
@@ -38,7 +28,7 @@ function avatarHueForHandle(handle: string) {
 }
 
 function fallbackProfileForHandle(handle: string): ProfileRecord {
-	const normalized = normalizeProfileHandle(handle);
+	const normalized = profileHandleKey(handle);
 	return {
 		id: `profile_handle_${normalized}`,
 		handle: normalized,
@@ -58,9 +48,9 @@ function getProfileByHandle(
 	handle: string,
 	profiles: Record<string, ProfileRecord> = {},
 ) {
-	const normalized = normalizeProfileHandle(handle);
+	const normalized = profileHandleKey(handle);
 	const inlineProfile = Object.values(profiles).find(
-		(profile) => normalizeProfileHandle(profile.handle) === normalized,
+		(profile) => profileHandleKey(profile.handle) === normalized,
 	);
 	if (inlineProfile) {
 		return inlineProfile;
@@ -80,7 +70,7 @@ function getProfileByHandle(
       `,
 		)
 		.get(normalized) as Record<string, unknown> | undefined;
-	const profile = row ? toProfile(row) : null;
+	const profile = row ? profileFromDbRow(row) : null;
 	cache.set(normalized, profile);
 	return profile ?? fallbackProfileForHandle(normalized);
 }
@@ -153,8 +143,8 @@ function enrichEntities(
 			(mention.id ? profiles[mention.id] : undefined) ??
 			Object.values(profiles).find(
 				(candidate) =>
-					normalizeProfileHandle(candidate.handle) ===
-					normalizeProfileHandle(mention.username),
+					profileHandleKey(candidate.handle) ===
+					profileHandleKey(mention.username),
 			) ??
 			resolveProfileByHandle?.(mention.username);
 		return profile ? { ...mention, profile } : mention;
@@ -250,7 +240,7 @@ function buildEmbeddedTweet(
 		return null;
 	}
 
-	const author = toProfile({
+	const author = profileFromDbRow({
 		id: row[`${prefix}profile_id`],
 		handle: row[`${prefix}handle`],
 		display_name: row[`${prefix}display_name`],
@@ -520,27 +510,16 @@ export function listTimelineItems({
 		normalizeLowQualityThreshold(lowQualityThreshold);
 	const shouldDedupeAcrossAccounts = !account || account === "all";
 	let timelineEdgesCte = `
-      with timeline_edges as (
-        select account_id, tweet_id, kind, raw_json
-        from tweet_account_edges
-        where kind = ?
-        union all
-        select legacy.account_id, legacy.id as tweet_id, legacy.kind, '{}' as raw_json
-        from tweets legacy
-        where legacy.kind = ?
-          and not exists (
-            select 1
-            from tweet_account_edges edge
-            where edge.account_id = legacy.account_id
-              and edge.tweet_id = legacy.id
-              and edge.kind = legacy.kind
-          )
-      )
-    `;
+	      with timeline_edges as (
+	        select account_id, tweet_id, kind, raw_json
+	        from tweet_account_edges
+	        where kind = ?
+	      )
+	    `;
 	const unwindowedTimelineEdgesCte = timelineEdgesCte;
 	let usedRecentEdgeWindow = false;
 	let join = "";
-	let where = "where t.kind = ?";
+	let where = "where e.kind = ?";
 	let searchSnippetSelect = "";
 
 	const canUseRecentEdgeWindow =
@@ -560,47 +539,23 @@ export function listTimelineItems({
         with timeline_edges as (
           select likes.account_id, likes.tweet_id, 'home' as kind, likes.raw_json
           from tweet_collections likes
-          join tweet_collections bookmarks
+	          join tweet_collections bookmarks
             on bookmarks.account_id = likes.account_id
             and bookmarks.tweet_id = likes.tweet_id
-            and bookmarks.kind = 'bookmarks'
-          where likes.kind = 'likes'
-          union all
-          select legacy.account_id, legacy.id as tweet_id, 'home' as kind, '{}' as raw_json
-          from tweets legacy
-          where legacy.liked = 1
-            and legacy.bookmarked = 1
-            and not exists (
-              select 1
-              from tweet_collections collection
-              where collection.account_id = legacy.account_id
-                and collection.tweet_id = legacy.id
-                and collection.kind in ('likes', 'bookmarks')
-            )
-        )
-      `;
+	            and bookmarks.kind = 'bookmarks'
+	          where likes.kind = 'likes'
+	        )
+	      `;
 		} else {
 			const collectionKind = likedOnly ? "likes" : "bookmarks";
-			const legacyColumn = likedOnly ? "liked" : "bookmarked";
 			timelineEdgesCte = `
-        with timeline_edges as (
-          select account_id, tweet_id, 'home' as kind, raw_json
-          from tweet_collections
-          where kind = ?
-          union all
-          select legacy.account_id, legacy.id as tweet_id, 'home' as kind, '{}' as raw_json
-          from tweets legacy
-          where legacy.${legacyColumn} = 1
-            and not exists (
-              select 1
-              from tweet_collections collection
-              where collection.account_id = legacy.account_id
-                and collection.tweet_id = legacy.id
-                and collection.kind = ?
-            )
-        )
-			`;
-			params.push(collectionKind, collectionKind);
+	        with timeline_edges as (
+	          select account_id, tweet_id, 'home' as kind, raw_json
+	          from tweet_collections
+	          where kind = ?
+	        )
+				`;
+			params.push(collectionKind);
 		}
 		where = "where 1 = 1";
 	} else if (canUseRecentEdgeWindow) {
@@ -610,40 +565,23 @@ export function listTimelineItems({
         select account_id, tweet_id, kind, raw_json
         from tweet_account_edges
         where kind = ?
-          and tweet_id in (
+	          and tweet_id in (
             select id
             from tweets
             order by created_at desc
-            limit ?
-          )
-        union all
-        select legacy.account_id, legacy.id as tweet_id, legacy.kind, '{}' as raw_json
-        from tweets legacy
-        where legacy.kind = ?
-          and legacy.id in (
-            select id
-            from tweets
-            order by created_at desc
-            limit ?
-          )
-          and not exists (
-            select 1
-            from tweet_account_edges edge
-            where edge.account_id = legacy.account_id
-              and edge.tweet_id = legacy.id
-              and edge.kind = legacy.kind
-          )
-      )
-    `;
+	            limit ?
+	          )
+	      )
+	    `;
 		const candidateLimit = Math.max(
 			RECENT_TIMELINE_EDGE_CANDIDATES,
 			limit * 50,
 		);
-		params.push(kind, candidateLimit, kind, candidateLimit);
+		params.push(kind, candidateLimit);
 		where = "where e.kind = ?";
 		params.push(kind);
 	} else {
-		params.push(kind, kind);
+		params.push(kind);
 		where = "where e.kind = ?";
 		params.push(kind);
 	}
@@ -733,7 +671,6 @@ export function listTimelineItems({
               and collection.tweet_id = t.id
               and collection.kind = 'bookmarks'
           ) then 1
-          when t.account_id = e.account_id and t.bookmarked = 1 then 1
           else 0
         end as bookmarked,
         case
@@ -743,7 +680,6 @@ export function listTimelineItems({
               and collection.tweet_id = t.id
               and collection.kind = 'likes'
           ) then 1
-          when t.account_id = e.account_id and t.liked = 1 then 1
           else 0
         end as liked,
         t.entities_json,
@@ -814,7 +750,7 @@ export function listTimelineItems({
 	if (usedRecentEdgeWindow && rows.length < limit) {
 		rows = db
 			.prepare(buildTimelineSelectSql(unwindowedTimelineEdgesCte))
-			.all(kind, kind, kind, limit) as Array<Record<string, unknown>>;
+			.all(kind, kind, limit) as Array<Record<string, unknown>>;
 	}
 
 	const urlExpansionCache: UrlExpansionCache = new Map();
@@ -836,7 +772,7 @@ export function listTimelineItems({
 			[author.id]: author,
 			...(row.reply_profile_id
 				? {
-						[String(row.reply_profile_id)]: toProfile({
+						[String(row.reply_profile_id)]: profileFromDbRow({
 							id: row.reply_profile_id,
 							handle: row.reply_handle,
 							display_name: row.reply_display_name,
@@ -851,7 +787,7 @@ export function listTimelineItems({
 				: {}),
 			...(row.quoted_profile_id
 				? {
-						[String(row.quoted_profile_id)]: toProfile({
+						[String(row.quoted_profile_id)]: profileFromDbRow({
 							id: row.quoted_profile_id,
 							handle: row.quoted_handle,
 							display_name: row.quoted_display_name,
@@ -939,7 +875,6 @@ function conversationTweetSelect(accountId?: string) {
           and collection.tweet_id = t.id
           and collection.kind = 'bookmarks'
       ) then 1
-      when t.account_id = ? and t.bookmarked = 1 then 1
       else 0
     end as bookmarked,
     case
@@ -949,12 +884,17 @@ function conversationTweetSelect(accountId?: string) {
           and collection.tweet_id = t.id
           and collection.kind = 'likes'
       ) then 1
-      when t.account_id = ? and t.liked = 1 then 1
       else 0
     end as liked,`
 		: `
-    t.bookmarked,
-    t.liked,`;
+    exists (
+      select 1 from tweet_collections collection
+      where collection.tweet_id = t.id and collection.kind = 'bookmarks'
+    ) as bookmarked,
+    exists (
+      select 1 from tweet_collections collection
+      where collection.tweet_id = t.id and collection.kind = 'likes'
+    ) as liked,`;
 	return `
   select
     t.id,
@@ -988,9 +928,7 @@ function getTweetById(
 	resolveProfileByHandle?: (handle: string) => ProfileRecord,
 	accountId?: string,
 ): EmbeddedTweet | null {
-	const stateParams = accountId
-		? [accountId, accountId, accountId, accountId]
-		: [];
+	const stateParams = accountId ? [accountId, accountId] : [];
 	const row = db
 		.prepare(`${conversationTweetSelect(accountId)} where t.id = ?`)
 		.get(...stateParams, tweetId) as Record<string, unknown> | undefined;
@@ -1031,8 +969,7 @@ export function getTweetsByIds(
 					from tweets tweet
 					where tweet.id = ?
 						and (
-							tweet.account_id = ?
-							or exists (
+							exists (
 								select 1
 								from tweet_account_edges edge
 								where edge.account_id = ?
@@ -1048,7 +985,7 @@ export function getTweetsByIds(
 					limit 1
 					`,
 				)
-				.get(normalized, scopedAccountId, scopedAccountId, scopedAccountId)
+				.get(normalized, scopedAccountId, scopedAccountId)
 		) {
 			continue;
 		}
@@ -1124,7 +1061,7 @@ function appendConversationTweets(
 export function getTweetConversation(
 	tweetId: string,
 	limit = 80,
-): TweetConversationResponse | null {
+): TweetConversation | null {
 	const db = getReadDb();
 	const urlExpansionCache: UrlExpansionCache = new Map();
 	const profileByHandleCache: ProfileByHandleCache = new Map();

@@ -1,25 +1,45 @@
 import { Effect } from "effect";
-import type { Database } from "./sqlite";
 import { getNativeDb } from "./db";
 import { databaseWriteEffect } from "./database-writer";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { getAccountHandle, getDefaultAccountId } from "./moderation-target";
 import {
-	getAccountHandle,
-	getDefaultAccountId,
-	toProfile,
-} from "./moderation-target";
-import type { BlockItem, BlockListResponse, BlockSearchItem } from "./types";
+	createModerationActions,
+	listModerationState,
+	pruneRemoteModerationRows,
+	recordRemoteModerationRow,
+	searchModerationCandidates,
+} from "./moderation-state";
+import type { BlockListResponse } from "./api-contracts";
+import type { BlockItem, BlockSearchItem } from "./types";
 import { upsertProfileFromXUser } from "./x-profile";
 import { listBlockedUsers, lookupAuthenticatedUserFresh } from "./xurl";
 
-export {
-	addBlock,
-	addBlockEffect,
-	recordBlock,
-	recordBlockEffect,
-	removeBlock,
-	removeBlockEffect,
-} from "./blocks-write";
+const blockActions = createModerationActions("block");
+
+export function addBlock(...args: Parameters<typeof blockActions.add>) {
+	return blockActions.add(...args);
+}
+
+export function addBlockEffect(
+	...args: Parameters<typeof blockActions.addEffect>
+) {
+	return blockActions.addEffect(...args);
+}
+
+export function recordBlock(...args: Parameters<typeof blockActions.record>) {
+	return blockActions.record(...args);
+}
+
+export function removeBlock(...args: Parameters<typeof blockActions.remove>) {
+	return blockActions.remove(...args);
+}
+
+export function removeBlockEffect(
+	...args: Parameters<typeof blockActions.removeEffect>
+) {
+	return blockActions.removeEffect(...args);
+}
 
 function remoteBlockSyncDisabled() {
 	return process.env.BIRDCLAW_DISABLE_LIVE_WRITES === "1";
@@ -36,46 +56,6 @@ function trySync<T>(try_: () => T) {
 	});
 }
 
-function upsertRemoteBlock(
-	db: Database,
-	accountId: string,
-	profileId: string,
-	blockedAt: string,
-) {
-	db.prepare(
-		`
-    insert into blocks (account_id, profile_id, source, created_at)
-    values (?, ?, 'remote', ?)
-    on conflict(account_id, profile_id) do update set
-      source = excluded.source,
-      created_at = blocks.created_at
-    `,
-	).run(accountId, profileId, blockedAt);
-}
-
-function pruneRemoteBlocks(
-	db: Database,
-	accountId: string,
-	profileIds: string[],
-) {
-	if (profileIds.length === 0) {
-		db.prepare(
-			"delete from blocks where account_id = ? and source = 'remote'",
-		).run(accountId);
-		return;
-	}
-
-	const placeholders = profileIds.map(() => "?").join(", ");
-	db.prepare(
-		`
-    delete from blocks
-    where account_id = ?
-      and source = 'remote'
-      and profile_id not in (${placeholders})
-    `,
-	).run(accountId, ...profileIds);
-}
-
 export function listBlocks({
 	account,
 	search,
@@ -85,59 +65,7 @@ export function listBlocks({
 	search?: string;
 	limit?: number;
 } = {}): BlockItem[] {
-	const db = getNativeDb();
-	const params: Array<string | number> = [];
-	let where = "where 1 = 1";
-
-	if (account && account !== "all") {
-		where += " and b.account_id = ?";
-		params.push(account);
-	}
-
-	if (search?.trim()) {
-		where += " and (p.handle like ? or p.display_name like ? or p.bio like ?)";
-		params.push(
-			`%${search.trim()}%`,
-			`%${search.trim()}%`,
-			`%${search.trim()}%`,
-		);
-	}
-
-	params.push(limit);
-
-	const rows = db
-		.prepare(
-			`
-      select
-        b.account_id,
-        a.handle as account_handle,
-        b.source,
-        b.created_at as blocked_at,
-        p.id,
-        p.handle,
-        p.display_name,
-        p.bio,
-        p.followers_count,
-        p.avatar_hue,
-        p.avatar_url,
-        p.created_at
-      from blocks b
-      join accounts a on a.id = b.account_id
-      join profiles p on p.id = b.profile_id
-      ${where}
-      order by b.created_at desc
-      limit ?
-      `,
-		)
-		.all(...params) as Array<Record<string, unknown>>;
-
-	return rows.map((row) => ({
-		accountId: String(row.account_id),
-		accountHandle: String(row.account_handle),
-		source: String(row.source),
-		blockedAt: String(row.blocked_at),
-		profile: toProfile(row),
-	}));
+	return listModerationState("block", { account, search, limit });
 }
 
 export function searchBlockCandidates({
@@ -149,59 +77,7 @@ export function searchBlockCandidates({
 	search?: string;
 	limit?: number;
 }): BlockSearchItem[] {
-	const db = getNativeDb();
-	if (!search?.trim()) {
-		return [];
-	}
-
-	const accountHandle = getAccountHandle(db, accountId);
-	const rows = db
-		.prepare(
-			`
-      select
-        p.id,
-        p.handle,
-        p.display_name,
-        p.bio,
-        p.followers_count,
-        p.avatar_hue,
-        p.avatar_url,
-        p.created_at,
-        b.created_at as blocked_at
-      from profiles p
-      left join blocks b
-        on b.profile_id = p.id
-       and b.account_id = ?
-      where p.id != 'profile_me'
-        and p.handle != ?
-        and (
-          p.handle like ?
-          or p.display_name like ?
-          or p.bio like ?
-        )
-      order by
-        case when b.created_at is null then 1 else 0 end,
-        b.created_at desc,
-        p.followers_count desc,
-        p.display_name asc
-      limit ?
-      `,
-		)
-		.all(
-			accountId,
-			accountHandle,
-			`%${search.trim()}%`,
-			`%${search.trim()}%`,
-			`%${search.trim()}%`,
-			limit,
-		) as Array<Record<string, unknown>>;
-
-	return rows.map((row) => ({
-		profile: toProfile(row),
-		isBlocked: Boolean(row.blocked_at),
-		blockedAt:
-			typeof row.blocked_at === "string" ? String(row.blocked_at) : undefined,
-	}));
+	return searchModerationCandidates("block", { accountId, search, limit });
 }
 
 export function getBlocksResponse({
@@ -326,8 +202,9 @@ export function syncBlocksEffect(accountId: string) {
 				const pageProfileIds = yield* databaseWriteEffect((writeDb) => {
 					return page.items.map((user) => {
 						const resolved = upsertProfileFromXUser(writeDb, user);
-						upsertRemoteBlock(
+						recordRemoteModerationRow(
 							writeDb,
+							"block",
 							resolvedAccountId,
 							resolved.profile.id,
 							blockedAt,
@@ -344,7 +221,12 @@ export function syncBlocksEffect(accountId: string) {
 			if (completed) {
 				yield* databaseWriteEffect(
 					(writeDb) =>
-						pruneRemoteBlocks(writeDb, resolvedAccountId, remoteProfileIds),
+						pruneRemoteModerationRows(
+							writeDb,
+							"block",
+							resolvedAccountId,
+							remoteProfileIds,
+						),
 					db,
 				);
 			}

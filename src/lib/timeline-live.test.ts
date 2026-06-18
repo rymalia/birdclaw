@@ -94,10 +94,6 @@ describe("live home timeline sync", () => {
 	it("stores account-scoped home timeline edges without moving canonical tweets", async () => {
 		makeTempHome();
 		const db = getNativeDb();
-		db.prepare("update tweets set account_id = ? where id = ?").run(
-			"acct_primary",
-			"tweet_001",
-		);
 		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
 			data: [
 				{
@@ -122,8 +118,15 @@ describe("live home timeline sync", () => {
 		});
 
 		expect(
-			db.prepare("select account_id from tweets where id = ?").get("tweet_001"),
-		).toEqual({ account_id: "acct_primary" });
+			db.prepare("select id from tweets where id = ?").get("tweet_001"),
+		).toEqual({ id: "tweet_001" });
+		expect(
+			db
+				.prepare(
+					"select account_id, kind from tweet_account_edges where tweet_id = ? and account_id = ?",
+				)
+				.get("tweet_001", "acct_primary"),
+		).toEqual({ account_id: "acct_primary", kind: "home" });
 		expect(
 			db
 				.prepare(
@@ -163,10 +166,10 @@ describe("live home timeline sync", () => {
 		db.prepare(
 			`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_user_42', 'home', ?, ?, 0, null, 0, 1, 0, 0, '{}', ?, null)
+		id, author_profile_id, text, created_at,
+		is_replied, reply_to_id, like_count, media_count,
+		entities_json, media_json, quoted_tweet_id
+	  ) values (?, 'profile_user_42', ?, ?, 0, null, 0, 1, '{}', ?, null)
       `,
 		).run(
 			"home_partial_media",

@@ -248,20 +248,36 @@ describe("period digest", () => {
 	it("adds locally stored cited tweets to the result context for previews", async () => {
 		const db = getNativeDb();
 		const seed = db
-			.prepare("select account_id, author_profile_id from tweets limit 1")
+			.prepare(`
+				select edge.account_id, tweet.author_profile_id
+				from tweets tweet
+				join tweet_account_edges edge on edge.tweet_id = tweet.id
+				limit 1
+			`)
 			.get() as { account_id: string; author_profile_id: string };
 		const citedTweetId = "2065597531644743999";
 		db.prepare(
 			`
 			insert into tweets (
-				id, account_id, author_profile_id, kind, text, created_at
-			) values (?, ?, ?, 'home', ?, ?)
+				id, author_profile_id, text, created_at
+			) values (?, ?, ?, ?)
 			`,
 		).run(
 			citedTweetId,
-			seed.account_id,
 			seed.author_profile_id,
 			"Local citation outside the selected digest window.",
+			"2025-12-31T23:59:00.000Z",
+		);
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values (?, ?, 'home', ?, ?, 1, 'test', '{}', ?)
+		`).run(
+			seed.account_id,
+			citedTweetId,
+			"2025-12-31T23:59:00.000Z",
+			"2025-12-31T23:59:00.000Z",
 			"2025-12-31T23:59:00.000Z",
 		);
 		const streamed = [
@@ -293,7 +309,12 @@ describe("period digest", () => {
 	it("does not hydrate cited tweets from another selected account", async () => {
 		const db = getNativeDb();
 		const seed = db
-			.prepare("select account_id, author_profile_id from tweets limit 1")
+			.prepare(`
+				select edge.account_id, tweet.author_profile_id
+				from tweets tweet
+				join tweet_account_edges edge on edge.tweet_id = tweet.id
+				limit 1
+			`)
 			.get() as { account_id: string; author_profile_id: string };
 		const otherAccountId = "acct_other";
 		const citedTweetId = "2065597531644744000";
@@ -307,14 +328,25 @@ describe("period digest", () => {
 		db.prepare(
 			`
 			insert into tweets (
-				id, account_id, author_profile_id, kind, text, created_at
-			) values (?, ?, ?, 'home', ?, ?)
+				id, author_profile_id, text, created_at
+			) values (?, ?, ?, ?)
 			`,
 		).run(
 			citedTweetId,
-			otherAccountId,
 			seed.author_profile_id,
 			"Private citation from another account.",
+			"2025-12-31T23:59:00.000Z",
+		);
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values (?, ?, 'home', ?, ?, 1, 'test', '{}', ?)
+		`).run(
+			otherAccountId,
+			citedTweetId,
+			"2025-12-31T23:59:00.000Z",
+			"2025-12-31T23:59:00.000Z",
 			"2025-12-31T23:59:00.000Z",
 		);
 		const streamed = [

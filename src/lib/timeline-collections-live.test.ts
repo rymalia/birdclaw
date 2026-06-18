@@ -267,18 +267,32 @@ describe("live timeline collection sync", () => {
 			.prepare(
 				`
         insert into tweets (
-          id, account_id, author_profile_id, kind, text, created_at,
-          is_replied, like_count, media_count, bookmarked, liked,
-          entities_json, media_json
-        ) values (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, '{}', '[]')
-        `,
+		  id, author_profile_id, text, created_at,
+		  is_replied, like_count, media_count,
+		  entities_json, media_json
+		) values (?, ?, ?, ?, 0, 0, 0, '{}', '[]')
+		`,
 			)
 			.run(
 				"authored_liked_1",
-				"acct_primary",
 				"profile_user_42",
-				"authored",
 				"authored before likes sync",
+				"2026-04-26T13:43:34.000Z",
+			);
+		getNativeDb()
+			.prepare(
+				`
+				insert into tweet_account_edges (
+				  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+				  seen_count, source, raw_json, updated_at
+				) values (?, ?, 'authored', ?, ?, 1, 'test', '{}', ?)
+				`,
+			)
+			.run(
+				"acct_primary",
+				"authored_liked_1",
+				"2026-04-26T13:43:34.000Z",
+				"2026-04-26T13:43:34.000Z",
 				"2026-04-26T13:43:34.000Z",
 			);
 		mocks.listLikedTweetsViaXurl.mockResolvedValue({
@@ -296,8 +310,10 @@ describe("live timeline collection sync", () => {
 			refresh: true,
 		});
 		const row = getNativeDb()
-			.prepare("select kind from tweets where id = ?")
-			.get("authored_liked_1");
+			.prepare(
+				"select kind from tweet_account_edges where account_id = ? and tweet_id = ? and kind = ?",
+			)
+			.get("acct_primary", "authored_liked_1", "authored");
 
 		expect(row).toEqual({ kind: "authored" });
 	});
@@ -315,10 +331,10 @@ describe("live timeline collection sync", () => {
 			.prepare(
 				`
         insert into tweets (
-          id, account_id, author_profile_id, kind, text, created_at,
-          is_replied, like_count, media_count, bookmarked, liked,
-          entities_json, media_json
-        ) values (?, 'acct_primary', 'profile_user_42', 'like', ?, ?, 0, 0, 1, 0, 0, '{}', ?)
+		  id, author_profile_id, text, created_at,
+		  is_replied, like_count, media_count,
+		  entities_json, media_json
+		) values (?, 'profile_user_42', ?, ?, 0, 0, 1, '{}', ?)
         `,
 			)
 			.run(
@@ -816,12 +832,11 @@ describe("live timeline collection sync", () => {
 		});
 		expect(
 			getNativeDb()
-				.prepare("select account_id, liked from tweets where id = ?")
-				.get("tweet_003"),
-		).toEqual({
-			account_id: "acct_primary",
-			liked: 0,
-		});
+				.prepare(
+					"select account_id, kind from tweet_collections where tweet_id = ? order by account_id",
+				)
+				.all("tweet_003"),
+		).toEqual([{ account_id: "acct_studio", kind: "likes" }]);
 	});
 
 	it("uses bird directly for liked collections and caches the payload", async () => {

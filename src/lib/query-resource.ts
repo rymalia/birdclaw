@@ -1,8 +1,9 @@
 import { getConversationThread, listDmConversations } from "./dm-read-model";
 import { listTimelineItems } from "./timeline-read-model";
-import type { DmQuery, QueryResponse, TimelineQuery } from "./types";
+import type { QueryResponse } from "./api-contracts";
+import type { DmQuery, TimelineQuery } from "./types";
 
-export type { QueryResponse } from "./types";
+export type { QueryResponse } from "./api-contracts";
 
 export function queryResource(
 	resource: "home" | "mentions" | "authored" | "search" | "dms",

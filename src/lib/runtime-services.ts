@@ -6,7 +6,10 @@ export interface RuntimeServices {
 }
 
 export const defaultRuntimeServices: RuntimeServices = {
-	fetch: (input, init) => globalThis.fetch(input, init),
+	fetch: (input, init) =>
+		init === undefined
+			? globalThis.fetch(input)
+			: globalThis.fetch(input, init),
 	now: () => new Date(),
 	random: () => Math.random(),
 	env: (name) =>

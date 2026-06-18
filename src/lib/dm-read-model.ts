@@ -1,6 +1,7 @@
 import { getReadDb } from "./db";
 import { fetchProfileAffiliations } from "./profile-affiliations";
-import { toFtsSearchQuery, toProfile } from "./query-read-model-shared";
+import { profileFromDbRow } from "./profile-row";
+import { toFtsSearchQuery } from "./query-read-model-shared";
 import type { DmConversationItem, DmMessageItem, DmQuery } from "./types";
 
 export type { DmConversationItem, DmMessageItem, DmQuery } from "./types";
@@ -208,7 +209,7 @@ export function listDmConversations({
 	const items: DmConversationItem[] = rows.map((row) => {
 		const followersCount = Number(row.followers_count);
 		const influenceScore = getInfluenceScore(followersCount);
-		const participant = toProfile({
+		const participant = profileFromDbRow({
 			id: row.profile_id,
 			handle: row.handle,
 			display_name: row.display_name,
@@ -358,7 +359,7 @@ export function getConversationThread(
 			direction: row.direction as DmMessageItem["direction"],
 			isReplied: Boolean(row.is_replied),
 			mediaCount: Number(row.media_count),
-			sender: toProfile({
+			sender: profileFromDbRow({
 				id: row.profile_id,
 				handle: row.handle,
 				display_name: row.display_name,
@@ -389,7 +390,7 @@ function mapDmMessageRow(row: Record<string, unknown>): DmMessageItem {
 		direction: row.direction as DmMessageItem["direction"],
 		isReplied: Boolean(row.is_replied),
 		mediaCount: Number(row.media_count),
-		sender: toProfile({
+		sender: profileFromDbRow({
 			id: row.profile_id,
 			handle: row.handle,
 			display_name: row.display_name,

@@ -4,6 +4,7 @@ import { lookupProfileViaBird } from "./bird-actions";
 import { getNativeDb } from "./db";
 import { databaseWriteEffect } from "./database-writer";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { normalizeProfileHandle, profileFromDbRow } from "./profile-row";
 import type { ProfileRecord, XurlMentionUser } from "./types";
 import { getExternalUserId, upsertProfileFromXUser } from "./x-profile";
 import {
@@ -26,22 +27,6 @@ function trySync<T>(try_: () => T) {
 		try: try_,
 		catch: toError,
 	});
-}
-
-export function toProfile(row: Record<string, unknown>): ProfileRecord {
-	const followingCount = Number(row.following_count ?? 0);
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count),
-		...(Number.isFinite(followingCount) ? { followingCount } : {}),
-		avatarHue: Number(row.avatar_hue),
-		avatarUrl:
-			typeof row.avatar_url === "string" ? String(row.avatar_url) : undefined,
-		createdAt: String(row.created_at),
-	};
 }
 
 export function normalizeProfileQuery(value: string) {
@@ -73,7 +58,7 @@ export function getAccountHandle(db: Database, accountId: string) {
 	const row = db
 		.prepare("select handle from accounts where id = ?")
 		.get(accountId) as { handle: string } | undefined;
-	return row?.handle.replace(/^@/, "") ?? "";
+	return normalizeProfileHandle(row?.handle);
 }
 
 export function resolveLocalProfile(
@@ -97,7 +82,7 @@ export function resolveLocalProfile(
 		return null;
 	}
 
-	const profile = toProfile(row);
+	const profile = profileFromDbRow(row);
 	return {
 		profile,
 		externalUserId: getExternalUserId(profile.id),

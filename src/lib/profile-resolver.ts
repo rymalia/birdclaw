@@ -11,6 +11,7 @@ import {
 	hydrateProfileAffiliationOrganizationsEffect,
 	type ProfileAffiliationHydrationResult,
 } from "./profile-affiliation-hydration";
+import { profileFromDbRow, profileHandleKey } from "./profile-row";
 import type { ProfileRecord, XurlMentionUser } from "./types";
 import { getExternalUserId, upsertProfileFromXUser } from "./x-profile";
 import { lookupUsersByHandles, lookupUsersByIds } from "./xurl";
@@ -64,43 +65,6 @@ export interface HandleProfileResolveResult {
 	error?: string;
 }
 
-function toProfile(row: Record<string, unknown>): ProfileRecord {
-	const followingCount = Number(row.following_count ?? 0);
-	let entities: Record<string, unknown> | undefined;
-	if (typeof row.entities_json === "string" && row.entities_json.length > 0) {
-		try {
-			const parsed = JSON.parse(row.entities_json) as unknown;
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				entities = parsed as Record<string, unknown>;
-			}
-		} catch {
-			entities = undefined;
-		}
-	}
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count),
-		...(Number.isFinite(followingCount) ? { followingCount } : {}),
-		avatarHue: Number(row.avatar_hue),
-		avatarUrl:
-			typeof row.avatar_url === "string" ? String(row.avatar_url) : undefined,
-		...(typeof row.location === "string" && row.location.length > 0
-			? { location: row.location }
-			: {}),
-		...(typeof row.url === "string" && row.url.length > 0
-			? { url: row.url }
-			: {}),
-		...(typeof row.verified_type === "string" && row.verified_type.length > 0
-			? { verifiedType: row.verified_type }
-			: {}),
-		...(entities ? { entities } : {}),
-		createdAt: String(row.created_at),
-	};
-}
-
 function getProfile(profileId: string) {
 	const row = getNativeDb()
 		.prepare(
@@ -113,7 +77,7 @@ function getProfile(profileId: string) {
 		)
 		.get(profileId) as Record<string, unknown> | undefined;
 
-	return row ? toProfile(row) : null;
+	return row ? profileFromDbRow(row) : null;
 }
 
 function isPlaceholderProfile(profile: ProfileRecord) {
@@ -162,10 +126,6 @@ function lookupViaXurlEffect(externalUserId: string) {
 		const [user] = yield* tryPromise(() => lookupUsersByIds([externalUserId]));
 		return user ?? null;
 	});
-}
-
-function normalizeHandle(value: string) {
-	return value.trim().replace(/^@/, "").toLowerCase();
 }
 
 function fetchProfileUserEffect(
@@ -471,7 +431,7 @@ export function resolveProfilesForHandlesEffect(
 		const xurlFallback = options.xurlFallback ?? true;
 		const targets = Array.from(
 			new Set(
-				handles.map(normalizeHandle).filter((handle) => handle.length > 0),
+				handles.map(profileHandleKey).filter((handle) => handle.length > 0),
 			),
 		);
 		if (targets.length === 0) {
@@ -488,7 +448,7 @@ export function resolveProfilesForHandlesEffect(
 		if (birdResult.ok) {
 			const birdResults = birdResult.items;
 			for (const item of birdResults) {
-				const handle = normalizeHandle(item.target);
+				const handle = profileHandleKey(item.target);
 				if (item.user) {
 					const resolved = yield* trySync(() => {
 						const resolved = upsertProfileFromXUser(db, item.user!);
@@ -539,7 +499,7 @@ export function resolveProfilesForHandlesEffect(
 				const users = xurlResult.users;
 				const usersByHandle = new Map(
 					users.map((user) => [
-						normalizeHandle(String(user.username ?? "")),
+						profileHandleKey(String(user.username ?? "")),
 						user,
 					]),
 				);

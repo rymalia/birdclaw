@@ -39,4 +39,30 @@ describe("database migrations", () => {
 		expect(getDatabaseSchemaVersion(db)).toBe(0);
 		db.close();
 	});
+
+	it("rolls back the schema and version when a migration fails", () => {
+		const db = new NativeSqliteDatabase(":memory:");
+
+		expect(() =>
+			runDatabaseMigrations(db, [
+				{
+					version: 1,
+					name: "broken migration",
+					up: (database) => {
+						database.exec("create table partial_change (value text)");
+						throw new Error("migration failed");
+					},
+				},
+			]),
+		).toThrow("migration failed");
+		expect(getDatabaseSchemaVersion(db)).toBe(0);
+		expect(
+			db
+				.prepare(
+					"select name from sqlite_master where type = 'table' and name = 'partial_change'",
+				)
+				.get(),
+		).toBeUndefined();
+		db.close();
+	});
 });

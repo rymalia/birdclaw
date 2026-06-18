@@ -335,7 +335,6 @@ function mergeXurlTweetsIntoLocalStore(
 	db: Database,
 	accountId: string,
 	payload: XurlTweetsResponse,
-	tweetKind: "profile" | "thread_context",
 	edgeKind: TweetAccountEdgeKind,
 	source: "xurl" | "cache",
 ) {
@@ -345,13 +344,11 @@ function mergeXurlTweetsIntoLocalStore(
 	const upsertTweet = db.prepare(
 		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 0, 0, ?, ?, ?)
+      id, author_profile_id, text, created_at, is_replied, reply_to_id,
+      like_count, media_count, entities_json, media_json, quoted_tweet_id
+    ) values (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
     on conflict(id) do update set
       author_profile_id = excluded.author_profile_id,
-      kind = tweets.kind,
       text = excluded.text,
       created_at = excluded.created_at,
       reply_to_id = coalesce(tweets.reply_to_id, excluded.reply_to_id),
@@ -362,9 +359,7 @@ function mergeXurlTweetsIntoLocalStore(
         when excluded.media_json not in ('', '[]', 'null') then excluded.media_json
         else tweets.media_json
       end,
-      quoted_tweet_id = coalesce(tweets.quoted_tweet_id, excluded.quoted_tweet_id),
-      bookmarked = tweets.bookmarked,
-      liked = tweets.liked
+      quoted_tweet_id = coalesce(tweets.quoted_tweet_id, excluded.quoted_tweet_id)
     `,
 	);
 	const existingTweet = db.prepare("select text from tweets where id = ?");
@@ -391,9 +386,7 @@ function mergeXurlTweetsIntoLocalStore(
 					: null;
 			upsertTweet.run(
 				tweet.id,
-				accountId,
 				profile.profile.id,
-				tweetKind,
 				tweet.text,
 				tweet.created_at,
 				replyToId,
@@ -863,7 +856,6 @@ export function collectProfileAnalysisContextEffect(
 				account.id,
 				profilePayload,
 				"profile",
-				"profile",
 				"xurl",
 			),
 		);
@@ -958,7 +950,6 @@ export function collectProfileAnalysisContextEffect(
 				db,
 				account.id,
 				conversationPayload,
-				"thread_context",
 				"thread_context",
 				"xurl",
 			),

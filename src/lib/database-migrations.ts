@@ -25,8 +25,10 @@ export function runDatabaseMigrations(
 				`Missing database migration between versions ${String(currentVersion)} and ${String(migration.version)}`,
 			);
 		}
-		migration.up(db);
-		db.pragma(`user_version = ${String(migration.version)}`);
+		db.transaction(() => {
+			migration.up(db);
+			db.pragma(`user_version = ${String(migration.version)}`);
+		})();
 		currentVersion = migration.version;
 	}
 
