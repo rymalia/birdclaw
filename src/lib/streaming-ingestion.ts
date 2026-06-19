@@ -1,5 +1,4 @@
 import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
 import { Effect } from "effect";
 
 export interface IngestionCheckpoint {
@@ -22,7 +21,7 @@ export async function* streamJsonLines(
 	filePath: string,
 ): AsyncGenerator<{ lineNumber: number; value: Record<string, unknown> }> {
 	const input = createReadStream(filePath, { encoding: "utf8" });
-	const lines = createInterface({ input, crlfDelay: Infinity });
+	const lines = splitPhysicalLines(input);
 	let lineNumber = 0;
 	for await (const line of lines) {
 		lineNumber += 1;
@@ -31,6 +30,24 @@ export async function* streamJsonLines(
 			lineNumber,
 			value: JSON.parse(line) as Record<string, unknown>,
 		};
+	}
+}
+
+async function* splitPhysicalLines(
+	source: AsyncIterable<string>,
+): AsyncGenerator<string> {
+	let buffered = "";
+	for await (const chunk of source) {
+		buffered += chunk;
+		let newlineIndex = buffered.indexOf("\n");
+		while (newlineIndex !== -1) {
+			yield buffered.slice(0, newlineIndex).replace(/\r$/, "");
+			buffered = buffered.slice(newlineIndex + 1);
+			newlineIndex = buffered.indexOf("\n");
+		}
+	}
+	if (buffered.length > 0) {
+		yield buffered.replace(/\r$/, "");
 	}
 }
 

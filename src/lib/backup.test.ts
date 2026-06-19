@@ -380,6 +380,21 @@ describe("text backup", () => {
 	it("exports JSONL shards and imports them without changing the portable fingerprint", async () => {
 		switchHome("birdclaw-backup-src-");
 		seedBackupFixture();
+		const collectionRawJson = JSON.stringify({
+			id: "tweet_2025",
+			text: "line\u2028separator\u2029done",
+		});
+		getNativeDb()
+			.prepare(
+				`
+        update tweet_collections
+        set raw_json = ?
+        where account_id = 'acct_primary'
+          and tweet_id = 'tweet_2025'
+          and kind = 'likes'
+        `,
+			)
+			.run(collectionRawJson);
 		const before = getBackupDatabaseFingerprint();
 		const repoPath = makeTempDir("birdclaw-store-");
 
@@ -432,6 +447,14 @@ describe("text backup", () => {
 				"utf8",
 			),
 		).toContain('"kind":"bookmarks"');
+		const likesJsonl = readFileSync(
+			path.join(repoPath, "data/collections/likes.jsonl"),
+			"utf8",
+		);
+		expect(likesJsonl).not.toContain("\u2028");
+		expect(likesJsonl).not.toContain("\u2029");
+		expect(likesJsonl).toContain("\\u2028");
+		expect(likesJsonl).toContain("\\u2029");
 		expect(
 			readFileSync(
 				path.join(repoPath, "data/timeline_edges/search.jsonl"),
@@ -518,6 +541,19 @@ describe("text backup", () => {
 			entities_json:
 				'{"hashtags":[{"text":"backup"}],"urls":[{"url":"https://t.co/shared","expandedUrl":"https://example.com/demo","displayUrl":"example.com/demo","start":22,"end":41}]}',
 		});
+		expect(
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					`
+          select raw_json
+          from tweet_collections
+          where account_id = 'acct_primary'
+            and tweet_id = 'tweet_2025'
+            and kind = 'likes'
+          `,
+				)
+				.get(),
+		).toEqual({ raw_json: collectionRawJson });
 		expect(
 			getNativeDb({ seedDemoData: false })
 				.prepare(

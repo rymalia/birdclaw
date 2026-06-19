@@ -216,8 +216,15 @@ function jsonlStringify(row: JsonRecord): string {
 		jsonlKeyOrderCache.set(signature, sortedKeys);
 	}
 	return `{${sortedKeys
-		.map((key) => `${JSON.stringify(key)}:${JSON.stringify(row[key])}`)
+		.map(
+			(key) =>
+				`${JSON.stringify(key)}:${escapeJsonLineSeparators(JSON.stringify(row[key]))}`,
+		)
 		.join(",")}}`;
+}
+
+function escapeJsonLineSeparators(value: string) {
+	return value.replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
 }
 
 function rowsForQuery(db: Database, sql: string, params: unknown[] = []) {
