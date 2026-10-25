@@ -1,0 +1,3362 @@
+// @vitest-environment node
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { Effect } from "effect";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetBirdclawPathsForTests } from "./config";
+import { getNativeDb, resetDatabaseForTests } from "./db";
+import { refreshSearchRows } from "./search-index";
+import { NativeSqliteDatabase } from "./sqlite";
+import { listInboxItems } from "./inbox";
+import {
+	getConversationThread,
+	listDmConversations,
+	decodeDmMessageCursor,
+} from "./dm-read-model";
+import {
+	applyDmRequestMutationToLocalStore,
+	createDmReply,
+	createDmReplyEffect,
+	createPost,
+	createPostEffect,
+	createTweetReply,
+	createTweetReplyEffect,
+} from "./query-actions";
+import { queryResource } from "./query-resource";
+import { getQueryEnvelope, getQueryEnvelopeEffect } from "./query-status";
+import {
+	buildTimelineItemsQuery,
+	getTweetConversation,
+	getTweetsByIds,
+	listTimelineItems,
+	TimelineCandidateLimitError,
+} from "./timeline-read-model";
+
+const mocks = vi.hoisted(() => ({
+	findArchives: vi.fn(),
+	getTransportStatus: vi.fn(),
+	postViaXurl: vi.fn(),
+	replyViaXurl: vi.fn(),
+	dmViaXurl: vi.fn(),
+	lookupAuthenticatedUser: vi.fn(),
+}));
+
+vi.mock("./archive-finder", async () => {
+	const { Effect } = await import("effect");
+	const toError = (error: unknown) =>
+		error instanceof Error ? error : new Error(String(error));
+	return {
+		findArchives: mocks.findArchives,
+		findArchivesEffect: () =>
+			Effect.tryPromise({
+				try: () => mocks.findArchives(),
+				catch: toError,
+			}),
+		findArchivesCachedEffect: () =>
+			Effect.tryPromise({
+				try: () => mocks.findArchives(),
+				catch: toError,
+			}),
+	};
+});
+
+vi.mock("./xurl", async () => {
+	const { Effect } = await import("effect");
+	const { effectFromMock } = await import("../test/effect-mocks");
+	const toError = (error: unknown) =>
+		error instanceof Error ? error : new Error(String(error));
+	return {
+		getTransportStatus: mocks.getTransportStatus,
+		getTransportStatusEffect: () =>
+			Effect.tryPromise({
+				try: () => mocks.getTransportStatus(),
+				catch: toError,
+			}),
+		postViaXurl: mocks.postViaXurl,
+		postViaXurlEffect: (text: string) =>
+			Effect.tryPromise({
+				try: () => mocks.postViaXurl(text),
+				catch: toError,
+			}),
+		replyViaXurl: mocks.replyViaXurl,
+		replyViaXurlEffect: (tweetId: string, text: string) =>
+			Effect.tryPromise({
+				try: () => mocks.replyViaXurl(tweetId, text),
+				catch: toError,
+			}),
+		dmViaXurl: mocks.dmViaXurl,
+		dmViaXurlEffect: (handle: string, text: string) =>
+			Effect.tryPromise({
+				try: () => mocks.dmViaXurl(handle, text),
+				catch: toError,
+			}),
+		lookupAuthenticatedUser: mocks.lookupAuthenticatedUser,
+		lookupAuthenticatedUserFresh: mocks.lookupAuthenticatedUser,
+		lookupAuthenticatedUserFreshEffect: effectFromMock(
+			mocks.lookupAuthenticatedUser,
+		),
+	};
+});
+
+const tempRoots: string[] = [];
+
+function setupTempHome() {
+	const tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-test-"));
+	tempRoots.push(tempRoot);
+	process.env.BIRDCLAW_HOME = tempRoot;
+	resetBirdclawPathsForTests();
+	resetDatabaseForTests();
+}
+
+type TestDatabase = ReturnType<typeof getNativeDb>;
+
+function insertTestTweet(
+	db: TestDatabase,
+	options: {
+		id: string;
+		text: string;
+		createdAt: string;
+		authorProfileId?: string;
+		replyToId?: string | null;
+		likeCount?: number;
+		mediaCount?: number;
+		entitiesJson?: string;
+		noteTweetJson?: string;
+		mediaJson?: string;
+		quotedTweetId?: string | null;
+	},
+) {
+	db.prepare(`
+		insert into tweets (
+			id, author_profile_id, text, created_at, is_replied, reply_to_id,
+			like_count, media_count, entities_json, note_tweet_json, media_json,
+			quoted_tweet_id
+		) values (?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+	`).run(
+		options.id,
+		options.authorProfileId ?? "profile_me",
+		options.text,
+		options.createdAt,
+		options.replyToId ?? null,
+		options.likeCount ?? 0,
+		options.mediaCount ?? 0,
+		options.entitiesJson ?? "{}",
+		options.noteTweetJson ?? null,
+		options.mediaJson ?? "[]",
+		options.quotedTweetId ?? null,
+	);
+}
+
+function insertTestEdge(
+	db: TestDatabase,
+	tweetId: string,
+	createdAt: string,
+	kind = "home",
+	rawJson = "{}",
+) {
+	db.prepare(`
+		insert into tweet_account_edges (
+			account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+			source, raw_json, updated_at
+		) values ('acct_primary', ?, ?, ?, ?, 1, 'test', ?, ?)
+	`).run(tweetId, kind, createdAt, createdAt, rawJson, createdAt);
+}
+
+function insertTestCollection(
+	db: TestDatabase,
+	tweetId: string,
+	kind: "bookmarks" | "likes",
+	createdAt: string,
+) {
+	db.prepare(`
+		insert into tweet_collections (
+			account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+		) values ('acct_primary', ?, ?, ?, 'test', '{}', ?)
+	`).run(tweetId, kind, createdAt, createdAt);
+}
+
+afterEach(() => {
+	resetDatabaseForTests();
+	resetBirdclawPathsForTests();
+	delete process.env.BIRDCLAW_HOME;
+	mocks.findArchives.mockReset();
+	mocks.getTransportStatus.mockReset();
+	mocks.postViaXurl.mockReset();
+	mocks.replyViaXurl.mockReset();
+	mocks.dmViaXurl.mockReset();
+	mocks.lookupAuthenticatedUser.mockReset();
+	delete process.env.BIRDCLAW_DISABLE_LIVE_WRITES;
+	delete process.env.BIRDCLAW_E2E;
+	delete process.env.BIRDCLAW_E2E_FAKE_LIVE_WRITES;
+
+	for (const tempRoot of tempRoots.splice(0)) {
+		rmSync(tempRoot, { recursive: true, force: true });
+	}
+});
+
+describe("query models", () => {
+	beforeEach(() => {
+		mocks.findArchives.mockResolvedValue([
+			{
+				path: "/Users/steipete/Downloads/twitter-2026.zip",
+				name: "twitter-2026.zip",
+				size: 4_200_000,
+				sizeFormatted: "4.2 MB",
+				modifiedTime: "2026-03-08T08:00:00.000Z",
+				dateFormatted: "Today",
+			},
+		]);
+		mocks.getTransportStatus.mockResolvedValue({
+			installed: true,
+			availableTransport: "xurl",
+			statusText: "xurl available",
+			rawStatus: "ok",
+		});
+		mocks.postViaXurl.mockResolvedValue({ ok: true, output: "posted" });
+		mocks.replyViaXurl.mockResolvedValue({ ok: true, output: "replied" });
+		mocks.dmViaXurl.mockResolvedValue({ ok: true, output: "sent" });
+		mocks.lookupAuthenticatedUser.mockResolvedValue({
+			id: "25401953",
+			username: "steipete",
+		});
+	});
+
+	it("filters DM conversations by follower threshold and reply state", () => {
+		setupTempHome();
+
+		const unreplied = listDmConversations({
+			replyFilter: "unreplied",
+			minFollowers: 1000,
+		});
+
+		expect(unreplied.map((item) => item.id)).toEqual(["dm_001", "dm_003"]);
+		expect(unreplied[0]?.participant.bio).toContain("AGI");
+		expect(unreplied[0]?.participant.avatarUrl).toMatch(
+			/^data:image\/svg\+xml/,
+		);
+	});
+
+	it("filters DM conversations by derived influence score", () => {
+		setupTempHome();
+
+		const highSignal = listDmConversations({
+			minInfluenceScore: 120,
+			sort: "followers",
+		});
+
+		expect(highSignal.map((item) => item.id)).toEqual([
+			"dm_001",
+			"dm_004",
+			"dm_002",
+		]);
+		expect(highSignal[0]?.influenceLabel).toBe("very high");
+	});
+
+	it("sorts DM conversations by follower count before applying the limit", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare("update dm_conversations set last_message_at = ?").run(
+			"2026-05-01T00:00:00.000Z",
+		);
+		db.prepare(
+			"update dm_conversations set last_message_at = ? where id = 'dm_003'",
+		).run("2026-05-03T00:00:00.000Z");
+
+		const sorted = listDmConversations({
+			sort: "followers",
+			limit: 1,
+		});
+
+		expect(sorted.map((item) => item.id)).toEqual(["dm_001"]);
+	});
+
+	it("applies influence score filters before follower-sort limits", () => {
+		setupTempHome();
+
+		const filtered = listDmConversations({
+			maxInfluenceScore: 100,
+			sort: "followers",
+			limit: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_003"]);
+	});
+
+	it("returns no DMs when max influence score is below the minimum follower score", () => {
+		setupTempHome();
+
+		const filtered = listDmConversations({
+			maxInfluenceScore: 10,
+			sort: "followers",
+		});
+
+		expect(filtered).toEqual([]);
+	});
+
+	it("filters DM conversations by accepted/request inbox", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			"update dm_conversations set inbox_kind = 'request' where id = ?",
+		).run("dm_003");
+
+		expect(
+			listDmConversations({ inbox: "requests" }).map((item) => item.id),
+		).toEqual(["dm_003"]);
+		expect(
+			listDmConversations({ inbox: "accepted" })
+				.map((item) => item.id)
+				.includes("dm_003"),
+		).toBe(false);
+		expect(listDmConversations({ inbox: "requests" })[0]).toMatchObject({
+			inboxKind: "request",
+			isMessageRequest: true,
+		});
+	});
+
+	it("applies live DM request mutations to the local store", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			"update dm_conversations set inbox_kind = 'request' where id = ?",
+		).run("dm_003");
+
+		await expect(
+			applyDmRequestMutationToLocalStore("dm_003", "accept"),
+		).resolves.toBeGreaterThan(0);
+		expect(listDmConversations({ inbox: "requests" })).toHaveLength(0);
+		expect(listDmConversations({ inbox: "accepted" })).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: "dm_003",
+					inboxKind: "accepted",
+					isMessageRequest: false,
+				}),
+			]),
+		);
+
+		db.prepare(
+			"update dm_conversations set inbox_kind = 'request' where id = ?",
+		).run("dm_003");
+		db.prepare(
+			"insert into sync_cache (cache_key, value_json, updated_at) values ('dms:bird:acct_primary:20:requests:max-pages:0', '{}', '2026-05-01T00:00:00.000Z')",
+		).run();
+		for (const mode of ["web", "auto", "xurl"])
+			db.prepare(
+				"insert into sync_cache(cache_key,value_json,updated_at) values(?, '{}', '2026-05-01T00:00:00Z')",
+			).run(`dms:${mode}:acct_primary:20:requests:max-pages:0`);
+
+		await expect(
+			applyDmRequestMutationToLocalStore("dm_003", "reject"),
+		).resolves.toBeGreaterThan(0);
+		expect(getConversationThread("dm_003")).toBeNull();
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from sync_cache where cache_key like 'dms:%'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+	});
+
+	it("filters DM conversations by participant, search, and upper bounds", () => {
+		setupTempHome();
+
+		const filtered = listDmConversations({
+			participant: "amelia",
+			search: "context rail",
+			maxFollowers: 10_000,
+			maxInfluenceScore: 95,
+			replyFilter: "unreplied",
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_003"]);
+		expect(filtered[0]?.lastMessagePreview).toContain("context rail");
+		expect(filtered[0]?.searchSnippet).toContain(
+			"<mark>context</mark> <mark>rail</mark>",
+		);
+	});
+
+	it("filters DM conversations by time before applying the limit", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			"update dm_conversations set last_message_at = ? where id in ('dm_001', 'dm_002', 'dm_003')",
+		).run("2026-05-03T00:00:00.000Z");
+		db.prepare(
+			"update dm_conversations set last_message_at = ? where id = 'dm_004'",
+		).run("2026-05-01T12:00:00.000Z");
+
+		const filtered = listDmConversations({
+			since: "2026-05-01T00:00:00.000Z",
+			until: "2026-05-02T00:00:00.000Z",
+			limit: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_004"]);
+	});
+
+	it("uses the latest matching DM message as the search snippet", () => {
+		setupTempHome();
+		const db = getNativeDb();
+
+		const messages = [
+			{
+				id: "msg_dm_search_older",
+				text: "older needleword snippet should not win",
+				createdAt: "2026-03-08T09:00:00.000Z",
+			},
+			{
+				id: "msg_dm_search_latest",
+				text: "latest needleword snippet should win",
+				createdAt: "2026-03-08T10:00:00.000Z",
+			},
+		];
+
+		for (const message of messages) {
+			db.prepare(
+				`
+        insert into dm_messages (
+          id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+        ) values (?, 'dm_003', 'profile_me', ?, ?, 'outbound', 1, 0)
+        `,
+			).run(message.id, message.text, message.createdAt);
+			db.prepare("insert into dm_fts (message_id, text) values (?, ?)").run(
+				message.id,
+				message.text,
+			);
+		}
+
+		db.prepare(
+			"update dm_conversations set last_message_at = ? where id = 'dm_003'",
+		).run(messages[1].createdAt);
+
+		const filtered = listDmConversations({ search: "needleword" });
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_003"]);
+		expect(filtered[0]?.searchSnippet).toContain(
+			"latest <mark>needleword</mark> snippet should win",
+		);
+	});
+
+	it("keeps the latest three DM matches when ranking a large matching thread", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const insert = db.prepare(
+			"insert into dm_messages(id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count) values (?, 'dm_001', 'profile_me', 'rankneedle', '2030-01-01', 'outbound', 0, 0)",
+		);
+		db.transaction(() => {
+			for (let i = 0; i < 1000; i++) {
+				const id = `rank_${String(i).padStart(4, "0")}`;
+				insert.run(id);
+				db.prepare(
+					"insert into dm_fts(message_id, text) values (?, 'rankneedle')",
+				).run(id);
+			}
+		})();
+		const result = listDmConversations({ search: "rankneedle", context: 1 });
+		expect(result).toHaveLength(1);
+		expect(result[0]?.matches?.map((match) => match.message.id)).toEqual([
+			"rank_0999",
+			"rank_0998",
+			"rank_0997",
+		]);
+		expect(result[0]?.matches?.[0]?.before[0]?.id).toBe("rank_0998");
+		expect(result[0]?.matches?.[0]?.after).toEqual([]);
+		expect(result[0]?.matches?.[2]?.message.sender.id).toBe("profile_me");
+	});
+
+	it("returns nearby DM context when requested for search results", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const messages = [
+			{
+				id: "msg_dm_context_before",
+				text: "before the identity hint",
+				createdAt: "2026-03-08T11:00:00.000Z",
+			},
+			{
+				id: "msg_dm_context_match",
+				text: "needlectx is the blacksmith cofounder",
+				createdAt: "2026-03-08T11:01:00.000Z",
+			},
+			{
+				id: "msg_dm_context_after",
+				text: "after the identity hint",
+				createdAt: "2026-03-08T11:02:00.000Z",
+			},
+		];
+
+		for (const message of messages) {
+			db.prepare(
+				`
+        insert into dm_messages (
+          id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+        ) values (?, 'dm_003', 'profile_me', ?, ?, 'outbound', 1, 0)
+        `,
+			).run(message.id, message.text, message.createdAt);
+			db.prepare("insert into dm_fts (message_id, text) values (?, ?)").run(
+				message.id,
+				message.text,
+			);
+		}
+
+		const filtered = listDmConversations({
+			search: "needlectx",
+			context: 1,
+		});
+
+		expect(filtered[0]?.matches?.[0]).toMatchObject({
+			message: expect.objectContaining({
+				id: "msg_dm_context_match",
+				text: "needlectx is the blacksmith cofounder",
+			}),
+			before: [expect.objectContaining({ id: "msg_dm_context_before" })],
+			after: [expect.objectContaining({ id: "msg_dm_context_after" })],
+		});
+	});
+
+	it("sanitizes handle-shaped DM search queries for FTS", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+        insert into dm_messages (
+          id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+        ) values (?, 'dm_003', 'profile_me', ?, ?, 'outbound', 1, 0)
+        `,
+		).run(
+			"msg_dm_handle_query",
+			"ask @github about the identity clue",
+			"2026-03-08T11:03:00.000Z",
+		);
+		db.prepare("insert into dm_fts (message_id, text) values (?, ?)").run(
+			"msg_dm_handle_query",
+			"ask @github about the identity clue",
+		);
+
+		const filtered = listDmConversations({
+			search: "@github",
+			context: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual(["dm_003"]);
+		expect(filtered[0]?.searchSnippet).toContain("<mark>github</mark>");
+		expect(filtered[0]?.matches?.[0]?.message.id).toBe("msg_dm_handle_query");
+	});
+
+	it("treats punctuation-only DM search as an unfiltered query", () => {
+		setupTempHome();
+
+		const filtered = listDmConversations({
+			search: "@",
+			context: 1,
+		});
+
+		expect(filtered.map((item) => item.id)).toEqual([
+			"dm_001",
+			"dm_003",
+			"dm_002",
+			"dm_004",
+		]);
+		expect(
+			filtered.every(
+				(item) =>
+					item.searchSnippet === null || item.searchSnippet === undefined,
+			),
+		).toBe(true);
+		expect(filtered.every((item) => item.matches === undefined)).toBe(true);
+	});
+
+	it("omits DM search snippets when no query is provided", () => {
+		setupTempHome();
+
+		const items = listDmConversations({ limit: 1 });
+
+		expect(items[0]).not.toHaveProperty("searchSnippet");
+	});
+
+	it("hydrates a selected conversation thread with sender context", () => {
+		setupTempHome();
+
+		const thread = getConversationThread("dm_003");
+
+		expect(thread?.conversation.participant.handle).toBe("amelia");
+		expect(thread?.messages.at(-1)?.sender.handle).toBe("amelia");
+	});
+
+	it("returns unreplied mention filters correctly", () => {
+		setupTempHome();
+
+		const mentions = listTimelineItems({
+			resource: "mentions",
+			replyFilter: "unreplied",
+		});
+
+		expect(mentions).toHaveLength(1);
+		expect(mentions[0]?.author.handle).toBe("amelia");
+	});
+
+	it("filters timeline items by account, search, and replied state", () => {
+		setupTempHome();
+
+		const items = listTimelineItems({
+			resource: "home",
+			account: "acct_studio",
+			search: "Agents",
+			replyFilter: "unreplied",
+		});
+
+		expect(items.map((item) => item.id)).toEqual(["tweet_006"]);
+		expect(items[0]?.accountId).toBe("acct_studio");
+		expect(items[0]?.searchSnippet).toContain("<mark>Agents</mark>");
+	});
+
+	it("filters tweets by author with the from operator", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const createdAt = "2030-01-01T00:00:00.000Z";
+		insertTestTweet(db, {
+			id: "tweet_from_sam_decoy",
+			authorProfileId: "profile_des",
+			text: "A dispatch from sam",
+			createdAt,
+		});
+		insertTestEdge(db, "tweet_from_sam_decoy", createdAt);
+		refreshSearchRows(db, "tweet", ["tweet_from_sam_decoy"]);
+
+		const items = listTimelineItems({
+			resource: "home",
+			search: "from:sam",
+		});
+
+		expect(items.map((item) => item.id)).toEqual(["tweet_001", "tweet_006"]);
+	});
+
+	it("combines the from operator with tweet text", () => {
+		setupTempHome();
+
+		const items = listTimelineItems({
+			resource: "home",
+			search: "local-first from:sam",
+		});
+
+		expect(items.map((item) => item.id)).toEqual(["tweet_001"]);
+	});
+
+	it.each([
+		{ search: "from:@SAM" },
+		{ author: "@SAM" },
+		{ search: "from:des", author: "@SAM" },
+		{ search: "from:@SAM", likedOnly: true },
+		{ author: "@SAM", bookmarkedOnly: true },
+	])("matches author handles across local searches: %j", (filters) => {
+		setupTempHome();
+		const items = listTimelineItems({ resource: "home", ...filters });
+		expect(items.map((item) => item.id)).toEqual(["tweet_001", "tweet_006"]);
+	});
+
+	// Perf regression guard: with bound parameters SQLite used to pick a plan
+	// that re-ran the whole tweets_fts MATCH scan for every timeline edge row,
+	// turning limited searches into minutes on large archives. Every tweets_fts
+	// access must stay inside the materialized fts_matches CTE so the match
+	// scan runs exactly once.
+	it("keeps timeline search FTS scans inside the materialized match CTE", () => {
+		setupTempHome();
+		const db = getNativeDb();
+
+		// Both drive strategies: selective terms iterate the match set, dense
+		// terms walk the created_at index (hint above the crossover threshold).
+		for (const ftsMatchCountHint of [0, 1_000_000]) {
+			const plan = buildTimelineItemsQuery(
+				{ resource: "home", search: "Agents", limit: 5 },
+				ftsMatchCountHint,
+			);
+			const planRows = db
+				.prepare(`explain query plan ${plan.sql}`)
+				.all(...plan.params) as Array<{
+				id: number;
+				parent: number;
+				detail: string;
+			}>;
+			const parentById = new Map(planRows.map((row) => [row.id, row.parent]));
+			const hasAncestor = (
+				row: (typeof planRows)[number],
+				ids: Set<number>,
+			) => {
+				let ancestor: number | undefined = row.parent;
+				while (ancestor !== undefined && ancestor !== 0) {
+					if (ids.has(ancestor)) return true;
+					ancestor = parentById.get(ancestor);
+				}
+				return false;
+			};
+			const materializeIds = new Set(
+				planRows
+					.filter((row) => row.detail.startsWith("MATERIALIZE fts_matches"))
+					.map((row) => row.id),
+			);
+			expect(materializeIds.size).toBe(1);
+
+			const ftsAccesses = planRows.filter(
+				(row) =>
+					row.detail.includes("tweets_fts") &&
+					!row.detail.startsWith("MATERIALIZE"),
+			);
+			expect(ftsAccesses.length).toBeGreaterThan(0);
+			for (const access of ftsAccesses) {
+				expect(hasAncestor(access, materializeIds)).toBe(true);
+			}
+			expect(
+				planRows.some((row) =>
+					row.detail.includes("idx_tweet_account_edges_kind_tweet"),
+				),
+			).toBe(true);
+		}
+	});
+
+	it("limits timeline membership before hydrating embedded metadata", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		for (const filters of [
+			{ account: "acct_primary" },
+			{},
+			{ replyFilter: "unreplied" as const },
+		]) {
+			const plan = buildTimelineItemsQuery({
+				resource: "home",
+				limit: 2,
+				...filters,
+			});
+			const rows = db
+				.prepare(`explain query plan ${plan.sql}`)
+				.all(...plan.params) as Array<{
+				id: number;
+				parent: number;
+				detail: string;
+			}>;
+			const selection = rows.find(
+				(row) => row.detail === "MATERIALIZE timeline_selection",
+			);
+			expect(selection).toBeDefined();
+			const parents = new Map(rows.map((row) => [row.id, row.parent]));
+			for (const row of rows.filter((row) =>
+				/SEARCH (rt|qt|rp|qp|collection) USING/.test(row.detail),
+			)) {
+				let parent = row.parent;
+				while (parent) {
+					expect(parent).not.toBe(selection?.id);
+					parent = parents.get(parent) ?? 0;
+				}
+			}
+		}
+	});
+
+	it("fills a limited timeline page past missing authors and accounts", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec("pragma foreign_keys = off");
+		try {
+			for (const [id, authorProfileId, createdAt] of [
+				["late_valid", "profile_me", "2030-01-01T00:00:00Z"],
+				["late_orphan_author", "missing_author", "2030-01-02T00:00:00Z"],
+				["late_orphan_account", "profile_me", "2030-01-03T00:00:00Z"],
+			] as const) {
+				insertTestTweet(db, {
+					id,
+					authorProfileId,
+					createdAt,
+					text: "Synthetic late hydration",
+				});
+				insertTestEdge(db, id, createdAt);
+			}
+			db.exec(
+				"update tweet_account_edges set account_id = 'missing_account' where tweet_id = 'late_orphan_account'",
+			);
+			for (const account of [undefined, "acct_primary"]) {
+				expect(
+					listTimelineItems({ resource: "home", account, limit: 1 }, db).map(
+						(item) => item.id,
+					),
+				).toEqual(["late_valid"]);
+			}
+		} finally {
+			db.exec("pragma foreign_keys = on");
+		}
+	});
+
+	it("pins dense timeline searches to the created-time index and bounded hydration", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const plan = buildTimelineItemsQuery(
+			{ resource: "home", search: "Agents", limit: 5 },
+			1_000_000,
+		);
+		const planRows = db
+			.prepare(`explain query plan ${plan.sql}`)
+			.all(...plan.params) as Array<{
+			id: number;
+			parent: number;
+			detail: string;
+		}>;
+		const parentById = new Map(planRows.map((row) => [row.id, row.parent]));
+		const searchSelectionIds = new Set(
+			planRows
+				.filter((row) => row.detail.startsWith("MATERIALIZE search_selection"))
+				.map((row) => row.id),
+		);
+		const hasSearchSelectionAncestor = (row: (typeof planRows)[number]) => {
+			let ancestor: number | undefined = row.parent;
+			while (ancestor !== undefined && ancestor !== 0) {
+				if (searchSelectionIds.has(ancestor)) return true;
+				ancestor = parentById.get(ancestor);
+			}
+			return false;
+		};
+		const selectionRows = planRows.filter(hasSearchSelectionAncestor);
+		const outerRows = planRows.filter(
+			(row) =>
+				!searchSelectionIds.has(row.id) && !hasSearchSelectionAncestor(row),
+		);
+
+		expect(searchSelectionIds.size).toBe(1);
+		expect(
+			selectionRows.some((row) =>
+				row.detail.includes("SCAN t USING INDEX idx_tweets_created"),
+			),
+		).toBe(true);
+		expect(
+			selectionRows.some(
+				(row) =>
+					row.detail.includes("idx_tweets_deleted") ||
+					row.detail.includes("idx_tweets_superseded"),
+			),
+		).toBe(false);
+		expect(outerRows.some((row) => row.detail === "SCAN e")).toBe(true);
+		expect(
+			outerRows.some(
+				(row) =>
+					row.detail.startsWith("SEARCH t USING") &&
+					row.detail.includes("(id=?)"),
+			),
+		).toBe(true);
+		expect(outerRows.some((row) => row.detail.startsWith("SCAN t"))).toBe(
+			false,
+		);
+	});
+
+	it("returns identical timeline search results for both FTS drive strategies", () => {
+		setupTempHome();
+		const db = getNativeDb();
+
+		const results = [0, 1_000_000].map((ftsMatchCountHint) => {
+			const plan = buildTimelineItemsQuery(
+				{ resource: "home", search: "Agents", limit: 5 },
+				ftsMatchCountHint,
+			);
+			return (
+				db.prepare(plan.sql).all(...plan.params) as Array<{ id: string }>
+			).map((row) => row.id);
+		});
+
+		expect(results[0]?.length).toBeGreaterThan(0);
+		expect(results[0]).toEqual(results[1]);
+	});
+
+	it("bounds FTS match counting at the dense-strategy threshold", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		let countSql = "";
+		let countParams: Array<string | number> = [];
+		const boundedDb = {
+			prepare(sql: string) {
+				const statement = db.prepare(sql);
+				const normalizedSql = sql.replace(/\s+/gu, " ").trim().toLowerCase();
+				if (!normalizedSql.includes(" as match_count")) return statement;
+				countSql = normalizedSql;
+				return {
+					get(...params: Array<string | number>) {
+						countParams = params;
+						return statement.get(...params);
+					},
+				} as ReturnType<TestDatabase["prepare"]>;
+			},
+		} as unknown as TestDatabase;
+
+		listTimelineItems(
+			{ resource: "home", search: "Agents", limit: 5 },
+			boundedDb,
+		);
+
+		expect(countSql).toContain("select distinct tweet_id from tweets_fts");
+		expect(countSql).toContain("limit ?");
+		expect(countParams.at(-1)).toBe(10_001);
+	});
+
+	it("uses a supplied FTS match-count hint without a count query", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const preparedSql: string[] = [];
+		const hintedDb = {
+			prepare(sql: string) {
+				preparedSql.push(sql.replace(/\s+/gu, " ").trim().toLowerCase());
+				return db.prepare(sql);
+			},
+		} as unknown as TestDatabase;
+
+		const items = listTimelineItems(
+			{ resource: "home", search: "local-first", limit: 5 },
+			hintedDb,
+			{ ftsMatchCountHint: 1 },
+		);
+
+		expect(items.map((item) => item.id)).toContain("tweet_001");
+		expect(preparedSql.some((sql) => sql.includes(" as match_count"))).toBe(
+			false,
+		);
+	});
+
+	it("batches URL hits and misses across a timeline page and refreshes on the next read", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const stamp = "2026-01-01T00:00:00Z";
+		for (let i = 0; i < 50; i++) {
+			const id = `url_batch_${i}`;
+			const url = `https://t.co/batch${i}`;
+			insertTestTweet(db, { id, text: `bulkurl ${url}.`, createdAt: stamp });
+			db.prepare("insert into tweets_fts(tweet_id, text) values (?, ?)").run(
+				id,
+				`bulkurl ${url}.`,
+			);
+			insertTestEdge(db, id, stamp);
+			if (i % 2 === 0)
+				db.prepare(
+					"insert into url_expansions(short_url, expanded_url, final_url, status, title, source, updated_at) values (?, ?, ?, 'hit', ?, 'test', ?)",
+				).run(
+					url,
+					`https://example.com/${i}`,
+					`https://example.com/${i}`,
+					`Title ${i}`,
+					stamp,
+				);
+		}
+		const prepare = vi.spyOn(NativeSqliteDatabase.prototype, "prepare");
+		try {
+			const items = listTimelineItems({
+				resource: "home",
+				search: "bulkurl",
+				limit: 50,
+			});
+			expect(items).toHaveLength(50);
+			expect(
+				items.find((item) => item.id === "url_batch_0")?.entities.urls?.[0],
+			).toMatchObject({
+				url: "https://t.co/batch0",
+				expandedUrl: "https://example.com/0",
+				title: "Title 0",
+			});
+			expect(
+				items.find((item) => item.id === "url_batch_1")?.entities.urls?.[0],
+			).toMatchObject({
+				url: "https://t.co/batch1",
+				expandedUrl: "https://t.co/batch1",
+			});
+			expect(
+				prepare.mock.calls.filter(([sql]) =>
+					sql.includes("from url_expansions"),
+				),
+			).toHaveLength(1);
+			db.prepare(
+				"update url_expansions set title = 'Updated' where short_url = 'https://t.co/batch0'",
+			).run();
+			expect(
+				listTimelineItems({
+					resource: "home",
+					search: "bulkurl",
+					limit: 50,
+				}).find((item) => item.id === "url_batch_0")?.entities.urls?.[0]?.title,
+			).toBe("Updated");
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("batches case-insensitive mention hits and misses and refreshes between reads", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const stamp = "2026-01-01T00:00:00Z";
+		for (let i = 0; i < 40; i++) {
+			const id = `mention_batch_${i}`;
+			const text = `bulkmention @Missing${i} @sam`;
+			insertTestTweet(db, { id, text, createdAt: stamp });
+			db.prepare("insert into tweets_fts(tweet_id, text) values (?, ?)").run(
+				id,
+				text,
+			);
+			insertTestEdge(db, id, stamp);
+		}
+		const prepare = vi.spyOn(NativeSqliteDatabase.prototype, "prepare");
+		try {
+			const read = () =>
+				listTimelineItems({
+					resource: "home",
+					search: "bulkmention",
+					limit: 40,
+				});
+			const items = read();
+			expect(items).toHaveLength(40);
+			expect(items[0]?.entities.mentions?.[0]?.profile?.handle).toMatch(
+				/^missing/,
+			);
+			expect(
+				prepare.mock.calls.filter(
+					([sql]) =>
+						sql.includes("from profiles") && sql.includes("lower(handle)"),
+				),
+			).toHaveLength(1);
+			db.prepare(
+				"update profiles set display_name = 'Fresh Sam' where lower(handle) = 'sam'",
+			).run();
+			expect(read()[0]?.entities.mentions?.[1]?.profile?.displayName).toBe(
+				"Fresh Sam",
+			);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("hydrates repeated referenced retweets once per account", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const stamp = "2026-01-01T00:00:00Z";
+		insertTestTweet(db, {
+			id: "shared_retweet",
+			text: "Original @sam",
+			createdAt: stamp,
+		});
+		for (let i = 0; i < 40; i++) {
+			const id = `retweet_batch_${i}`;
+			insertTestTweet(db, { id, text: "bulkretweet", createdAt: stamp });
+			db.prepare("insert into tweets_fts(tweet_id, text) values (?, ?)").run(
+				id,
+				"bulkretweet",
+			);
+			insertTestEdge(db, id, stamp);
+			db.prepare(
+				"update tweet_account_edges set raw_json = ? where tweet_id = ?",
+			).run(JSON.stringify({ retweeted_tweet_id: "shared_retweet" }), id);
+		}
+		const prepare = vi.spyOn(NativeSqliteDatabase.prototype, "prepare");
+		try {
+			const items = listTimelineItems({
+				resource: "home",
+				search: "bulkretweet",
+				limit: 40,
+			});
+			expect(items).toHaveLength(40);
+			expect(
+				items.every((item) => item.retweetedTweet?.text === "Original @sam"),
+			).toBe(true);
+			expect(
+				prepare.mock.calls.filter(
+					([sql]) =>
+						sql.includes(
+							"from tweets t indexed by sqlite_autoindex_tweets_1",
+						) && sql.includes("json_each"),
+				),
+			).toHaveLength(1);
+			db.prepare(
+				"update tweets set deleted_at = ? where id = 'shared_retweet'",
+			).run(stamp);
+			expect(
+				listTimelineItems({
+					resource: "home",
+					search: "bulkretweet",
+					limit: 40,
+				}).every((item) => item.retweetedTweet === null),
+			).toBe(true);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("batches descendant URL and mention enrichment without changing thread limits", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const stamp = "2030-01-01T00:00:00Z";
+		insertTestTweet(db, { id: "batch_root", text: "Root", createdAt: stamp });
+		for (let i = 0; i < 79; i++) {
+			insertTestTweet(db, {
+				id: `batch_child_${i}`,
+				text: `Reply @missing${i} https://t.co/child${i}`,
+				createdAt: stamp,
+				replyToId: "batch_root",
+			});
+		}
+		const prepare = vi.spyOn(NativeSqliteDatabase.prototype, "prepare");
+		try {
+			const thread = getTweetConversation("batch_root", 80, db)!;
+			expect(thread.items).toHaveLength(80);
+			expect(thread.truncated).toBe(false);
+			const children = thread.items.filter((item) => item.id !== "batch_root");
+			expect(
+				children.every(
+					(item) =>
+						item.entities.mentions?.length === 1 &&
+						item.entities.urls?.length === 1,
+				),
+			).toBe(true);
+			expect(
+				prepare.mock.calls.filter(([sql]) =>
+					sql.includes("from url_expansions"),
+				),
+			).toHaveLength(1);
+			expect(
+				prepare.mock.calls.filter(
+					([sql]) =>
+						sql.includes("from profiles") && sql.includes("lower(handle)"),
+				),
+			).toHaveLength(1);
+			expect(getTweetConversation("batch_root", 10, db)).toMatchObject({
+				truncated: true,
+				items: expect.any(Array),
+			});
+			expect(getTweetConversation("batch_root", 10, db)?.items).toHaveLength(
+				10,
+			);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("batches cited tweets without changing order, visibility, or collection state", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const stamp = "2026-01-01T00:00:00Z";
+		for (const id of ["90001", "90002", "90003", "90004", "90005"]) {
+			insertTestTweet(db, { id, text: `Post ${id}`, createdAt: stamp });
+			if (id !== "90002" && id !== "90005") insertTestEdge(db, id, stamp);
+		}
+		insertTestCollection(db, "90001", "bookmarks", stamp);
+		insertTestCollection(db, "90002", "likes", stamp);
+		db.prepare("update tweets set deleted_at = ? where id = '90003'").run(
+			stamp,
+		);
+		db.prepare("update tweets set superseded_at = ? where id = '90004'").run(
+			stamp,
+		);
+		const ids = [
+			"90002",
+			" tweet_90001 ",
+			"90003",
+			"90004",
+			"90005",
+			"90001",
+			"missing",
+			"",
+		];
+		const scoped = getTweetsByIds(ids, "acct_primary");
+		expect(scoped.map((tweet) => tweet.id)).toEqual(["90002", "90001"]);
+		expect(scoped[0]).toMatchObject({ liked: true, bookmarked: false });
+		expect(scoped[1]).toMatchObject({ liked: false, bookmarked: true });
+		expect(getTweetsByIds(ids, "acct_studio")).toEqual([]);
+		expect(getTweetsByIds(ids, "all").map((tweet) => tweet.id)).toEqual([
+			"90002",
+			"90001",
+			"90005",
+		]);
+	});
+
+	it("bounds bulk tweet SQL queries across batches", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const ids = Array.from({ length: 501 }, (_, index) =>
+			String(91000 + index),
+		);
+		db.transaction(() => {
+			for (const id of ids)
+				insertTestTweet(db, {
+					id,
+					text: "Bulk post",
+					createdAt: "2026-01-01T00:00:00Z",
+				});
+		})();
+		const prepare = vi.spyOn(NativeSqliteDatabase.prototype, "prepare");
+		try {
+			expect(getTweetsByIds(ids).map((tweet) => tweet.id)).toEqual(ids);
+			const selects = prepare.mock.calls.filter(([sql]) =>
+				sql.includes("from tweets t"),
+			);
+			expect(selects).toHaveLength(2);
+			const plan = db
+				.prepare(`explain query plan ${selects[0]?.[0]}`)
+				.all(...ids.slice(0, 500)) as { detail: string }[];
+			expect(
+				plan.some((row) =>
+					row.detail.includes("USING INDEX sqlite_autoindex_tweets_1"),
+				),
+			).toBe(true);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("keeps timeline membership account-scoped for the same canonical tweet", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values (
+        'acct_studio', 'tweet_001', 'home', '2026-03-08T12:00:00.000Z',
+        '2026-03-08T12:00:00.000Z', 1, 'test', '{}',
+        '2026-03-08T12:00:00.000Z'
+      )
+      `,
+		).run();
+
+		const allItems = listTimelineItems({
+			resource: "home",
+			since: "2000-01-01T00:00:00.000Z",
+			limit: 20,
+		});
+		const sharedItems = allItems.filter((item) => item.id === "tweet_001");
+		const allAccountItems = listTimelineItems({
+			resource: "home",
+			account: "all",
+			since: "2000-01-01T00:00:00.000Z",
+			limit: 20,
+		});
+		const studioItems = listTimelineItems({
+			resource: "home",
+			account: "acct_studio",
+			since: "2000-01-01T00:00:00.000Z",
+			limit: 20,
+		});
+		const reservedLiteralItems = listTimelineItems(
+			{
+				resource: "home",
+				since: "2000-01-01T00:00:00.000Z",
+				limit: 20,
+			},
+			db,
+			{ literalAccountId: "all" },
+		);
+		const emptyLiteralItems = listTimelineItems(
+			{
+				resource: "home",
+				since: "2000-01-01T00:00:00.000Z",
+				limit: 20,
+			},
+			db,
+			{ literalAccountId: "" },
+		);
+
+		expect(sharedItems).toHaveLength(1);
+		expect(sharedItems[0]?.accountId).toBe("acct_primary");
+		expect(
+			allAccountItems.filter((item) => item.id === "tweet_001"),
+		).toHaveLength(1);
+		expect(studioItems.find((item) => item.id === "tweet_001")).toMatchObject({
+			accountId: "acct_studio",
+			accountHandle: "@birdclaw_lab",
+			bookmarked: false,
+			liked: false,
+		});
+		expect(reservedLiteralItems).toEqual([]);
+		expect(emptyLiteralItems).toEqual([]);
+	});
+
+	it("deduplicates unscoped timelines before applying the requested limit", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const accounts = Array.from({ length: 6 }, (_, index) => ({
+			id: `acct_overlap_${index}`,
+			handle: `@overlap_${index}`,
+		}));
+		const now = "2026-03-08T12:00:00.000Z";
+
+		const insertAccount = db.prepare(`
+      insert into accounts (
+        id, name, handle, external_user_id, transport, is_default, created_at
+      ) values (?, ?, ?, null, 'xurl', 0, ?)
+    `);
+		const insertEdge = db.prepare(`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values (?, ?, 'home', ?, ?, 1, 'test', '{}', ?)
+    `);
+		for (const account of accounts) {
+			insertAccount.run(account.id, account.id, account.handle, now);
+			for (const tweetId of ["tweet_001", "tweet_003"]) {
+				insertEdge.run(account.id, tweetId, now, now, now);
+			}
+		}
+
+		const items = listTimelineItems({
+			resource: "home",
+			since: "2000-01-01T00:00:00.000Z",
+			limit: 3,
+		});
+
+		expect(items.map((item) => item.id)).toEqual([
+			"tweet_001",
+			"tweet_003",
+			"tweet_002",
+		]);
+		expect(items.map((item) => item.accountId)).toEqual([
+			"acct_primary",
+			"acct_primary",
+			"acct_primary",
+		]);
+	});
+
+	it("bounds literal account listings and uses scoped membership indexes", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const recentPlan = buildTimelineItemsQuery(
+			{ resource: "home", limit: 20 },
+			0,
+			"acct_primary",
+		);
+		expect(recentPlan.usedRecentEdgeWindow).toBe(false);
+		expect(recentPlan.sql).toContain(
+			"indexed by idx_tweet_account_edges_kind_account",
+		);
+
+		const likedPlan = buildTimelineItemsQuery(
+			{ resource: "home", likedOnly: true, limit: 20 },
+			0,
+			"acct_primary",
+		);
+		expect(likedPlan.sql).toContain(
+			"indexed by idx_tweet_collections_kind_account",
+		);
+		expect(likedPlan.sql).not.toContain(
+			"from tweet_collections indexed by idx_tweet_collections_tweet",
+		);
+
+		const boundedOptions = {
+			literalAccountId: "acct_primary",
+			literalAccountCandidateLimit: 1,
+		};
+		for (const query of [
+			{ resource: "home" as const, limit: 1 },
+			{ resource: "home" as const, search: "from:sam", limit: 1 },
+			{ resource: "home" as const, author: "sam", limit: 1 },
+			{
+				resource: "home" as const,
+				until: "2027-01-01T00:00:00.000Z",
+				limit: 1,
+			},
+		]) {
+			expect(() => listTimelineItems(query, db, boundedOptions)).toThrow(
+				TimelineCandidateLimitError,
+			);
+		}
+	});
+
+	it("caps likes and bookmarks independently before a sparse intersection", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const createdAt = "2026-07-04T12:00:00.000Z";
+		db.prepare(
+			`insert into accounts
+			 (id, name, handle, transport, is_default, created_at)
+			 values ('acct_sparse_collections', 'Sparse collections',
+			 '@sparse_collections', 'test', 0, ?)`,
+		).run(createdAt);
+		const insertCollection = db.prepare(
+			`insert into tweet_collections
+			 (account_id, tweet_id, kind, collected_at, source, raw_json, updated_at)
+			 values ('acct_sparse_collections', ?, ?, ?, 'test', '{}', ?)`,
+		);
+		insertCollection.run("tweet_001", "likes", createdAt, createdAt);
+		insertCollection.run("tweet_002", "likes", createdAt, createdAt);
+		insertCollection.run("tweet_002", "bookmarks", createdAt, createdAt);
+
+		expect(() =>
+			listTimelineItems(
+				{
+					resource: "home",
+					likedOnly: true,
+					bookmarkedOnly: true,
+					limit: 1,
+				},
+				db,
+				{
+					literalAccountId: "acct_sparse_collections",
+					literalAccountCandidateLimit: 1,
+				},
+			),
+		).toThrow(TimelineCandidateLimitError);
+	});
+
+	it("uses match-driven membership indexes for literal FTS queries", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const cases = [
+			{
+				query: { resource: "home" as const, search: "Agents", limit: 5 },
+				index: "idx_tweet_account_edges_kind_tweet",
+			},
+			{
+				query: {
+					resource: "home" as const,
+					search: "Agents",
+					likedOnly: true,
+					limit: 5,
+				},
+				index: "idx_tweet_collections_tweet",
+			},
+			{
+				query: {
+					resource: "home" as const,
+					search: "Agents",
+					likedOnly: true,
+					bookmarkedOnly: true,
+					limit: 5,
+				},
+				index: "idx_tweet_collections_tweet",
+			},
+		];
+
+		for (const { query, index } of cases) {
+			const plan = buildTimelineItemsQuery(query, 1, "acct_primary");
+			const details = (
+				db
+					.prepare(`explain query plan ${plan.sql}`)
+					.all(...plan.params) as Array<{
+					detail: string;
+				}>
+			).map((row) => row.detail);
+			expect(plan.sql).toContain(`indexed by ${index}`);
+			expect(details.some((detail) => detail.includes(index))).toBe(true);
+			expect(
+				details.filter((detail) =>
+					/^SCAN (?:tweet_account_edges|tweet_collections|likes|bookmarks)(?: |$)/u.test(
+						detail,
+					),
+				),
+			).toEqual([]);
+		}
+	});
+
+	it("preserves literal-account cursor order across more than 5,000 tied tweets", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const createdAt = "2026-07-05T12:00:00.000Z";
+		db.prepare(
+			`insert into accounts
+			 (id, name, handle, transport, is_default, created_at)
+			 values ('acct_tie_scope', 'Tie scope', '@tie_scope', 'test', 0, ?)`,
+		).run(createdAt);
+		const insertTweet = db.prepare(
+			`insert into tweets
+			 (id, author_profile_id, text, created_at, entities_json, media_json)
+			 values (?, 'profile_me', 'Tied timestamp', ?, '{}', '[]')`,
+		);
+		db.transaction(() => {
+			for (let index = 0; index < 6_001; index += 1) {
+				insertTweet.run(`tie_${String(index).padStart(4, "0")}`, createdAt);
+			}
+		})();
+		const insertEdge = db.prepare(
+			`insert into tweet_account_edges
+			 (account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+			  source, raw_json, updated_at)
+			 values ('acct_tie_scope', ?, 'home', ?, ?, 1, 'test', '{}', ?)`,
+		);
+		for (const id of ["tie_0100", "tie_5999"]) {
+			insertEdge.run(id, createdAt, createdAt, createdAt);
+		}
+		const options = {
+			literalAccountId: "acct_tie_scope",
+			literalAccountCandidateLimit: 10_000,
+		};
+
+		const first = listTimelineItems(
+			{ resource: "home", limit: 1 },
+			db,
+			options,
+		);
+		expect(first.map((item) => item.id)).toEqual(["tie_5999"]);
+		const second = listTimelineItems(
+			{
+				resource: "home",
+				until: createdAt,
+				untilId: "tie_5999",
+				limit: 1,
+			},
+			db,
+			options,
+		);
+		expect(second.map((item) => item.id)).toEqual(["tie_0100"]);
+	});
+
+	it("omits timeline search snippets when no query is provided", () => {
+		setupTempHome();
+
+		const items = listTimelineItems({ resource: "home", limit: 1 });
+
+		expect(items[0]).not.toHaveProperty("searchSnippet");
+	});
+
+	it("falls back when recent non-timeline tweets fill the fast window", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec(`
+      delete from tweet_account_edges;
+      delete from tweet_collections;
+      delete from tweets_fts;
+      delete from tweets;
+    `);
+		insertTestTweet(db, {
+			id: "tweet_old_home",
+			text: "old but valid home item",
+			createdAt: "2026-01-01T00:00:00.000Z",
+		});
+		insertTestEdge(db, "tweet_old_home", "2026-01-01T00:00:00.000Z");
+		db.transaction(() => {
+			for (let index = 0; index < 5000; index += 1) {
+				insertTestTweet(db, {
+					id: `tweet_new_like_${String(index)}`,
+					text: `newer non-timeline tweet ${String(index)}`,
+					createdAt: `2026-02-${String(Math.floor(index / 200) + 1).padStart(2, "0")}T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+				});
+			}
+		})();
+
+		const items = listTimelineItems({ resource: "home", limit: 18 });
+
+		expect(items.map((item) => item.id)).toEqual(["tweet_old_home"]);
+	});
+
+	it("filters timeline items by liked and bookmarked state across collections", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "tweet_saved_live",
+			text: "saved live item",
+			createdAt: "2026-03-09T00:00:00.000Z",
+		});
+		insertTestCollection(
+			db,
+			"tweet_saved_live",
+			"bookmarks",
+			"2026-03-09T00:00:00.000Z",
+		);
+		insertTestCollection(
+			db,
+			"tweet_saved_live",
+			"likes",
+			"2026-03-09T00:00:00.000Z",
+		);
+
+		const liked = listTimelineItems({ resource: "home", likedOnly: true });
+		const bookmarked = listTimelineItems({
+			resource: "home",
+			bookmarkedOnly: true,
+		});
+		const likedAndBookmarked = listTimelineItems({
+			resource: "home",
+			likedOnly: true,
+			bookmarkedOnly: true,
+		});
+
+		expect(liked.every((item) => item.liked)).toBe(true);
+		expect(bookmarked.map((item) => item.id)).toContain("tweet_saved_live");
+		expect(bookmarked.every((item) => item.bookmarked)).toBe(true);
+		expect(likedAndBookmarked).toContainEqual(
+			expect.objectContaining({
+				id: "tweet_saved_live",
+				liked: true,
+				bookmarked: true,
+			}),
+		);
+	});
+
+	it("keeps date-scoped saved timelines fast with a large collection", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec(`
+      with recursive sequence(value) as (
+        select 1
+        union all
+        select value + 1 from sequence where value < 10000
+      )
+      insert into tweets (
+        id, author_profile_id, text, created_at, is_replied, reply_to_id,
+        like_count, media_count, entities_json, media_json, quoted_tweet_id
+      )
+      select
+        'tweet_saved_perf_' || value,
+        (select id from profiles order by id limit 1),
+        'saved performance fixture ' || value,
+        '2026-01-01T00:00:00.000Z',
+        0, null, 0, 0, '{}', '[]', null
+      from sequence;
+
+      insert into tweet_collections (
+        account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+      )
+      select
+        (select id from accounts order by is_default desc, id limit 1),
+        id,
+        'likes',
+        created_at,
+        'test',
+        '{}',
+        created_at
+      from tweets
+      where id like 'tweet_saved_perf_%';
+    `);
+
+		const startedAt = performance.now();
+		const items = listTimelineItems({
+			resource: "home",
+			likedOnly: true,
+			since: "2027-01-01T00:00:00.000Z",
+			until: "2027-01-02T00:00:00.000Z",
+			limit: 1667,
+		});
+		const durationMs = performance.now() - startedAt;
+
+		expect(items).toEqual([]);
+		// The indexed plan is normally single-digit milliseconds; leave ample CI room.
+		expect(durationMs).toBeLessThan(500);
+	});
+
+	it("paginates past a shared created_at boundary using the id cursor", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec(`
+      delete from tweet_account_edges;
+      delete from tweet_collections;
+      delete from tweets_fts;
+      delete from tweets;
+    `);
+		const boundary = "2026-03-09T00:00:00.000Z";
+		// Two bookmarks with an identical created_at; tweet_b sorts after tweet_a by id.
+		insertTestTweet(db, {
+			id: "tweet_a",
+			text: "shared-timestamp a",
+			createdAt: boundary,
+		});
+		insertTestTweet(db, {
+			id: "tweet_b",
+			text: "shared-timestamp b",
+			createdAt: boundary,
+		});
+		insertTestCollection(db, "tweet_a", "bookmarks", boundary);
+		insertTestCollection(db, "tweet_b", "bookmarks", boundary);
+
+		const firstPage = listTimelineItems({
+			resource: "home",
+			bookmarkedOnly: true,
+			limit: 1,
+		});
+		expect(firstPage.map((item) => item.id)).toEqual(["tweet_b"]);
+
+		const last = firstPage[0];
+		if (!last) throw new Error("expected a first page item");
+
+		// Keyset cursor (created_at + id) must return the tie row, not skip it.
+		const secondPage = listTimelineItems({
+			resource: "home",
+			bookmarkedOnly: true,
+			limit: 1,
+			until: last.createdAt,
+			untilId: last.id,
+		});
+		expect(secondPage.map((item) => item.id)).toEqual(["tweet_a"]);
+
+		// A created_at-only cursor (no untilId) silently drops the tie row — the
+		// regression this fix prevents.
+		const createdAtOnly = listTimelineItems({
+			resource: "home",
+			bookmarkedOnly: true,
+			limit: 1,
+			until: last.createdAt,
+		});
+		expect(createdAtOnly).toEqual([]);
+	});
+
+	it("hides low-quality timeline noise for summary queries", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const qualityTweets = [
+			["tweet_low_reply", "@sam yes", "2026-03-08T13:00:00.000Z", 0, 0],
+			[
+				"tweet_low_link",
+				"Wow https://t.co/noise",
+				"2026-03-08T13:01:00.000Z",
+				1,
+				0,
+			],
+			[
+				"tweet_low_rt",
+				"RT @someone: borrowed context",
+				"2026-03-08T13:02:00.000Z",
+				120,
+				0,
+			],
+			["tweet_good_short", "OMG PC GUY", "2026-03-08T13:03:00.000Z", 100, 0],
+			[
+				"tweet_good_media",
+				"https://t.co/screenshot",
+				"2026-03-08T13:04:00.000Z",
+				0,
+				1,
+			],
+		] as const;
+		for (const [id, text, createdAt, likeCount, mediaCount] of qualityTweets) {
+			insertTestTweet(db, { id, text, createdAt, likeCount, mediaCount });
+			insertTestEdge(db, id, createdAt);
+		}
+
+		const items = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			since: "2026-03-08T13:00:00.000Z",
+			until: "2026-03-08T14:00:00.000Z",
+			includeReplies: false,
+			qualityFilter: "summary",
+			limit: 20,
+		});
+
+		expect(items.map((item) => item.id)).toEqual([
+			"tweet_good_media",
+			"tweet_good_short",
+		]);
+
+		const strictItems = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			since: "2026-03-08T13:00:00.000Z",
+			until: "2026-03-08T14:00:00.000Z",
+			includeReplies: false,
+			qualityFilter: "summary",
+			lowQualityThreshold: 5,
+			limit: 20,
+		});
+		const noLikeGateItems = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			since: "2026-03-08T13:00:00.000Z",
+			until: "2026-03-08T14:00:00.000Z",
+			includeReplies: false,
+			qualityFilter: "summary",
+			lowQualityThreshold: 0,
+			limit: 20,
+		});
+
+		expect(strictItems.map((item) => item.id)).toEqual([
+			"tweet_good_media",
+			"tweet_good_short",
+		]);
+		expect(noLikeGateItems.map((item) => item.id)).toEqual([
+			"tweet_good_media",
+			"tweet_good_short",
+			"tweet_low_link",
+		]);
+	});
+
+	it("includes quality reasons only when requested", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const reasonTweets = [
+			[
+				"tweet_reason_rt",
+				"RT @someone: borrowed context",
+				"2026-03-08T15:00:00.000Z",
+				120,
+				0,
+			],
+			[
+				"tweet_reason_media",
+				"https://t.co/screenshot",
+				"2026-03-08T15:01:00.000Z",
+				0,
+				1,
+			],
+			[
+				"tweet_reason_liked",
+				"short but liked",
+				"2026-03-08T15:02:00.000Z",
+				100,
+				0,
+			],
+		] as const;
+		for (const [id, text, createdAt, likeCount, mediaCount] of reasonTweets) {
+			insertTestTweet(db, { id, text, createdAt, likeCount, mediaCount });
+			insertTestEdge(db, id, createdAt);
+		}
+
+		const plainItems = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			since: "2026-03-08T15:00:00.000Z",
+			until: "2026-03-08T16:00:00.000Z",
+			qualityFilter: "all",
+			limit: 20,
+		});
+		const items = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			since: "2026-03-08T15:00:00.000Z",
+			until: "2026-03-08T16:00:00.000Z",
+			qualityFilter: "all",
+			includeQualityReason: true,
+			limit: 20,
+		});
+
+		expect(plainItems[0]).not.toHaveProperty("qualityReason");
+		expect(items.map((item) => [item.id, item.qualityReason])).toEqual([
+			["tweet_reason_liked", "keep:high-likes"],
+			["tweet_reason_media", "keep:has-media"],
+			["tweet_reason_rt", "drop:rt"],
+		]);
+	});
+
+	it("preserves timestamp ties across global and account timeline reads", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const createdAt = "2035-01-01T00:00:00Z";
+		db.transaction(() => {
+			for (let index = 0; index < 5100; index++) {
+				const id = `window_tie_${String(index).padStart(5, "0")}`;
+				insertTestTweet(db, {
+					id,
+					createdAt,
+					text: "Synthetic tied timestamp",
+				});
+				insertTestEdge(db, id, createdAt);
+			}
+		})();
+		for (const account of [undefined, "acct_primary", "all"]) {
+			const query = { resource: "home" as const, account, limit: 2 };
+			const plan = buildTimelineItemsQuery(query);
+			expect(plan.usedRecentEdgeWindow).toBe(true);
+			const selected = listTimelineItems(query, db).map((item) => item.id);
+			const fallback = db
+				.prepare(plan.fallbackSql)
+				.all(...plan.fallbackParams) as Array<{ id: string }>;
+			expect(selected).toEqual(["window_tie_05099", "window_tie_05098"]);
+			expect(selected).toEqual(fallback.map((item) => item.id));
+		}
+		// Sparse account membership outside the candidate window must still be found.
+		db.prepare(
+			"delete from tweet_account_edges where tweet_id like 'window_tie_%' and tweet_id != 'window_tie_00000'",
+		).run();
+		expect(
+			listTimelineItems(
+				{ resource: "home", account: "acct_primary", limit: 2 },
+				db,
+			)[0]?.id,
+		).toBe("window_tie_00000");
+	});
+
+	it("matches exhaustive selection for filtered saved pages and sparse old memberships", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.transaction(() => {
+			for (let i = 0; i < 5100; i++) {
+				const id = `sparse_saved_${String(i).padStart(5, "0")}`;
+				insertTestTweet(db, {
+					id,
+					createdAt: "2035-01-01T00:00:00Z",
+					text: "Synthetic saved post",
+				});
+				insertTestEdge(db, id, "2035-01-01T00:00:00Z");
+			}
+			for (const id of [
+				"sparse_saved_00000",
+				"sparse_saved_00001",
+				"sparse_saved_05098",
+			]) {
+				for (const kind of ["likes", "bookmarks"])
+					db.prepare(
+						"insert into tweet_collections(account_id,tweet_id,kind,source,updated_at) values ('acct_primary',?,?, 'test','2035-01-01')",
+					).run(id, kind);
+			}
+		})();
+		for (const filters of [
+			{ likedOnly: true },
+			{ bookmarkedOnly: true },
+			{ likedOnly: true, bookmarkedOnly: true },
+			{ until: "2035-01-01T00:00:00Z", untilId: "sparse_saved_00100" },
+			{ since: "2035-01-01", replyFilter: "unreplied" as const },
+		]) {
+			const query = {
+				resource: "home" as const,
+				account: "acct_primary",
+				limit: 3,
+				...filters,
+			};
+			const plan = buildTimelineItemsQuery(query);
+			const expected = db
+				.prepare(plan.fallbackSql)
+				.all(...plan.fallbackParams) as Array<{ id: string }>;
+			expect(listTimelineItems(query, db).map((item) => item.id)).toEqual(
+				expected.map((item) => item.id),
+			);
+		}
+	});
+
+	it("uses chronological index order for the recent candidate window", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const query = buildTimelineItemsQuery({ resource: "home", limit: 18 });
+		const plan = db
+			.prepare(`explain query plan ${query.sql}`)
+			.all(...query.params) as Array<{
+			id: number;
+			parent: number;
+			detail: string;
+		}>;
+		const lists = new Set(
+			plan
+				.filter((row) => row.detail === "MATERIALIZE recent_tweets")
+				.map((row) => row.id),
+		);
+		const candidates = plan.filter((row) => lists.has(row.parent));
+		expect(
+			candidates.some((row) => row.detail.includes("idx_tweets_created")),
+		).toBe(true);
+		expect(
+			candidates.some((row) => row.detail.includes("TEMP B-TREE FOR ORDER BY")),
+		).toBe(false);
+	});
+
+	it("hydrates rich tweet entities, media, reply context, and quote context", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+      insert into profiles (
+        id, handle, display_name, bio, followers_count, avatar_hue, created_at
+      ) values (
+        'profile_dimillian', 'Dimillian', 'Dominik Hauser', 'Mac and iOS apps',
+        42000, 210, '2026-03-01T00:00:00.000Z'
+      )
+      `,
+		).run();
+		insertTestTweet(db, {
+			id: "tweet_raw_url",
+			text: "Check it: https://t.co/peek",
+			createdAt: "2026-03-09T12:00:00.000Z",
+		});
+		insertTestEdge(db, "tweet_raw_url", "2026-03-09T12:00:00.000Z");
+		insertTestTweet(db, {
+			id: "tweet_raw_mention",
+			text: "@Dimillian Any ideas for Mac apps?",
+			createdAt: "2026-03-09T12:01:00.000Z",
+		});
+		insertTestEdge(db, "tweet_raw_mention", "2026-03-09T12:01:00.000Z");
+		insertTestTweet(db, {
+			id: "tweet_retweeted_original",
+			authorProfileId: "profile_dimillian",
+			text: "Actual original tweet content",
+			createdAt: "2026-03-09T11:59:00.000Z",
+			likeCount: 19,
+			mediaCount: 1,
+			entitiesJson: JSON.stringify({
+				hashtags: [{ tag: "LocalFirst", start: 30, end: 41 }],
+			}),
+			mediaJson: JSON.stringify([
+				{
+					url: "https://pbs.twimg.com/media/retweet.jpg",
+					type: "image",
+					altText: "Referenced retweet media",
+					width: 1200,
+					height: 800,
+				},
+			]),
+		});
+		db.prepare(
+			`insert into tweet_collections (
+				account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+			) values
+				('acct_studio', 'tweet_retweeted_original', 'likes', ?, 'test', '{}', ?),
+				('acct_studio', 'tweet_retweeted_original', 'bookmarks', ?, 'test', '{}', ?)`,
+		).run(
+			"2026-03-09T12:02:00.000Z",
+			"2026-03-09T12:02:00.000Z",
+			"2026-03-09T12:02:00.000Z",
+			"2026-03-09T12:02:00.000Z",
+		);
+		insertTestTweet(db, {
+			id: "tweet_retweet_ref",
+			text: "RT @Dimillian: Actual original tweet content",
+			createdAt: "2026-03-09T12:02:00.000Z",
+		});
+		db.prepare(
+			`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values (
+        'acct_primary', 'tweet_retweet_ref', 'home', '2026-03-09T12:02:00.000Z',
+        '2026-03-09T12:02:00.000Z', 1, 'test',
+        '{"referenced_tweets":[{"type":"retweeted","id":"tweet_retweeted_original"}]}',
+        '2026-03-09T12:02:00.000Z'
+      )
+      `,
+		).run();
+		insertTestTweet(db, {
+			id: "tweet_retweet_missing_ref",
+			text: "RT @Dimillian: Missing original tweet content",
+			createdAt: "2026-03-09T12:03:00.000Z",
+		});
+		db.prepare(
+			`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values (
+        'acct_primary', 'tweet_retweet_missing_ref', 'home', '2026-03-09T12:03:00.000Z',
+        '2026-03-09T12:03:00.000Z', 1, 'test',
+        '{"referenced_tweets":[{"type":"retweeted","id":"tweet_missing_original"}]}',
+        '2026-03-09T12:03:00.000Z'
+      )
+      `,
+		).run();
+		db.prepare(
+			`
+      insert into url_expansions (
+        short_url, expanded_url, final_url, status, title, description, source, updated_at
+      ) values (
+        'https://t.co/peek', 'https://peekaboo.boo/?ref=x',
+        'https://peekaboo.boo/', 'hit', 'Peekaboo', 'Mac automation',
+        'test', '2026-03-09T12:00:00.000Z'
+      )
+      `,
+		).run();
+
+		const items = listTimelineItems({
+			resource: "home",
+			limit: 20,
+		});
+		const rawUrlItem = items.find((item) => item.id === "tweet_raw_url");
+		const rawMentionItem = items.find(
+			(item) => item.id === "tweet_raw_mention",
+		);
+		const retweetItem = items.find((item) => item.id === "tweet_retweet_ref");
+		const missingRetweetItem = items.find(
+			(item) => item.id === "tweet_retweet_missing_ref",
+		);
+		const replyItem = items.find((item) => item.id === "tweet_002");
+		const mediaItem = items.find((item) => item.id === "tweet_003");
+		const quotedItem = items.find((item) => item.id === "tweet_006");
+		const referencedMembership = db
+			.prepare(
+				`select count(*) as count
+				 from (
+					select tweet_id from tweet_account_edges where account_id = ? and tweet_id = ?
+					union all
+					select tweet_id from tweet_collections where account_id = ? and tweet_id = ?
+				 )`,
+			)
+			.get(
+				"acct_primary",
+				"tweet_retweeted_original",
+				"acct_primary",
+				"tweet_retweeted_original",
+			) as { count: number };
+
+		expect(rawUrlItem?.entities.urls?.[0]).toMatchObject({
+			url: "https://t.co/peek",
+			expandedUrl: "https://peekaboo.boo/",
+			displayUrl: "peekaboo.boo",
+			title: "Peekaboo",
+			description: "Mac automation",
+		});
+		expect(rawMentionItem?.entities.mentions?.[0]).toMatchObject({
+			username: "Dimillian",
+			start: 0,
+			end: 10,
+			profile: {
+				handle: "Dimillian",
+				displayName: "Dominik Hauser",
+			},
+		});
+		expect(referencedMembership.count).toBe(0);
+		expect(retweetItem?.retweetedTweet).toMatchObject({
+			id: "tweet_retweeted_original",
+			text: "Actual original tweet content",
+			likeCount: 19,
+			mediaCount: 1,
+			bookmarked: false,
+			liked: false,
+			author: {
+				handle: "Dimillian",
+				followersCount: 42000,
+			},
+			entities: {
+				hashtags: [{ tag: "LocalFirst", start: 30, end: 41 }],
+			},
+			media: [
+				{
+					type: "image",
+					altText: "Referenced retweet media",
+					width: 1200,
+					height: 800,
+				},
+			],
+		});
+		expect(missingRetweetItem?.retweetedTweet).toMatchObject({
+			id: "tweet_retweet_missing_ref:retweeted",
+			text: "Missing original tweet content",
+			likeCount: 0,
+			mediaCount: 0,
+			bookmarked: false,
+			liked: false,
+			author: {
+				handle: "Dimillian",
+			},
+		});
+		insertTestCollection(
+			db,
+			"tweet_retweeted_original",
+			"likes",
+			"2026-03-09T12:04:00.000Z",
+		);
+		insertTestCollection(
+			db,
+			"tweet_retweeted_original",
+			"bookmarks",
+			"2026-03-09T12:04:00.000Z",
+		);
+		const retweetWithPrimaryState = listTimelineItems({
+			resource: "home",
+			account: "acct_primary",
+			limit: 20,
+		}).find((item) => item.id === "tweet_retweet_ref");
+		expect(retweetWithPrimaryState?.retweetedTweet).toMatchObject({
+			id: "tweet_retweeted_original",
+			liked: true,
+			bookmarked: true,
+		});
+		expect(replyItem?.replyToTweet?.id).toBe("tweet_001");
+		expect(mediaItem?.media[0]?.altText).toBe("Pricing survey chart");
+		expect(mediaItem?.entities.urls?.[0]?.title).toBe(
+			"Developer platform pricing survey",
+		);
+		expect(quotedItem?.quotedTweet?.id).toBe("tweet_001");
+		expect(quotedItem?.quotedTweet?.text).toContain("local-first");
+		expect(quotedItem?.author.avatarUrl).toMatch(/^data:image\/svg\+xml/);
+	});
+
+	it("hydrates Note Tweets across timeline and conversation contexts", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const noteTweet = (text: string) => JSON.stringify({ text, entities: {} });
+
+		insertTestTweet(db, {
+			id: "note_parent",
+			text: "Full parent Note Tweet",
+			createdAt: "2026-03-10T09:00:00.000Z",
+			noteTweetJson: noteTweet("Full parent Note Tweet"),
+		});
+		insertTestTweet(db, {
+			id: "note_quote",
+			text: "Full quoted Note Tweet",
+			createdAt: "2026-03-10T09:01:00.000Z",
+			noteTweetJson: noteTweet("Full quoted Note Tweet"),
+		});
+		insertTestTweet(db, {
+			id: "note_primary",
+			text: "Full primary Note Tweet",
+			createdAt: "2026-03-10T09:02:00.000Z",
+			replyToId: "note_parent",
+			quotedTweetId: "note_quote",
+			noteTweetJson: noteTweet("Full primary Note Tweet"),
+		});
+		insertTestEdge(db, "note_primary", "2026-03-10T09:02:00.000Z");
+		insertTestTweet(db, {
+			id: "note_retweet",
+			text: "RT @steipete: Full quoted Note Tweet",
+			createdAt: "2026-03-10T09:03:00.000Z",
+		});
+		insertTestEdge(
+			db,
+			"note_retweet",
+			"2026-03-10T09:03:00.000Z",
+			"home",
+			'{"referenced_tweets":[{"type":"retweeted","id":"note_quote"}]}',
+		);
+
+		const items = listTimelineItems({ resource: "home", limit: 20 });
+		const primary = items.find((item) => item.id === "note_primary");
+		const retweet = items.find((item) => item.id === "note_retweet");
+		const conversation = getTweetConversation("note_primary");
+
+		expect(primary?.noteTweet).toEqual({
+			text: "Full primary Note Tweet",
+			entities: { urls: [] },
+		});
+		expect(primary?.replyToTweet?.noteTweet?.text).toBe(
+			"Full parent Note Tweet",
+		);
+		expect(primary?.quotedTweet?.noteTweet?.text).toBe(
+			"Full quoted Note Tweet",
+		);
+		expect(retweet?.retweetedTweet?.noteTweet?.text).toBe(
+			"Full quoted Note Tweet",
+		);
+		expect(
+			conversation?.items.find((item) => item.id === "note_primary")?.noteTweet
+				?.text,
+		).toBe("Full primary Note Tweet");
+	});
+
+	it("returns an archived tweet conversation from the root", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const insertTweet = db.prepare(`
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, reply_to_id,
+				like_count, media_count, entities_json, media_json, quoted_tweet_id
+			) values (?, 'profile_me', ?, ?, 0, ?, 0, 0, '{}', '[]', null)
+		`);
+
+		insertTweet.run(
+			"conv_root",
+			"Root of the conversation",
+			"2026-03-10T10:00:00.000Z",
+			null,
+		);
+		insertTweet.run(
+			"conv_anchor",
+			"Clicked middle tweet",
+			"2026-03-10T10:01:00.000Z",
+			"conv_root",
+		);
+		insertTweet.run(
+			"conv_child",
+			"Reply after the clicked tweet",
+			"2026-03-10T10:02:00.000Z",
+			"conv_anchor",
+		);
+
+		const conversation = getTweetConversation("conv_anchor");
+
+		expect(conversation?.anchorId).toBe("conv_anchor");
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"conv_root",
+			"conv_anchor",
+			"conv_child",
+		]);
+		expect(conversation?.items[1]?.replyToId).toBe("conv_root");
+		expect(conversation?.truncated).toBe(false);
+	});
+
+	it("traverses hidden replies to retain active descendants", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "hidden_thread_root",
+			text: "Visible root",
+			createdAt: "2026-03-10T10:00:00.000Z",
+		});
+		insertTestTweet(db, {
+			id: "hidden_thread_middle",
+			text: "Deleted middle reply",
+			createdAt: "2026-03-10T10:01:00.000Z",
+			replyToId: "hidden_thread_root",
+		});
+		insertTestTweet(db, {
+			id: "hidden_thread_leaf",
+			text: "Visible reply below the deletion",
+			createdAt: "2026-03-10T10:02:00.000Z",
+			replyToId: "hidden_thread_middle",
+		});
+		db.prepare(
+			"update tweets set deleted_at = '2026-03-11T00:00:00.000Z' where id = 'hidden_thread_middle'",
+		).run();
+
+		const conversation = getTweetConversation("hidden_thread_root", 10, db);
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"hidden_thread_root",
+			"hidden_thread_leaf",
+		]);
+		expect(conversation?.truncated).toBe(false);
+		expect(getTweetConversation("hidden_thread_root", 1, db)?.truncated).toBe(
+			true,
+		);
+	});
+
+	it("does not spend the visible result budget on broad hidden branches", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "broad_hidden_root",
+			text: "Visible root",
+			createdAt: "2026-03-10T10:00:00.000Z",
+		});
+		for (let index = 0; index < 160; index += 1) {
+			const id = `broad_hidden_${String(index).padStart(3, "0")}`;
+			insertTestTweet(db, {
+				id,
+				text: "Deleted reply",
+				createdAt: new Date(
+					Date.parse("2026-03-10T10:01:00.000Z") + index * 1_000,
+				).toISOString(),
+				replyToId: "broad_hidden_root",
+			});
+			db.prepare(
+				"update tweets set deleted_at = '2026-03-11T00:00:00.000Z' where id = ?",
+			).run(id);
+		}
+		insertTestTweet(db, {
+			id: "broad_hidden_visible_leaf",
+			text: "Visible leaf after the broad hidden level",
+			createdAt: "2026-03-10T11:00:00.000Z",
+			replyToId: "broad_hidden_159",
+		});
+
+		const conversation = getTweetConversation("broad_hidden_root", 5, db);
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"broad_hidden_root",
+			"broad_hidden_visible_leaf",
+		]);
+		expect(conversation?.truncated).toBe(false);
+	});
+
+	it("ignores hidden-only descendants beyond the thread depth limit", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "hidden_depth_root",
+			text: "Visible root",
+			createdAt: "2026-03-10T10:00:00.000Z",
+		});
+		let parentId = "hidden_depth_root";
+		for (let depth = 1; depth <= 10; depth += 1) {
+			const id = `hidden_depth_${String(depth)}`;
+			insertTestTweet(db, {
+				id,
+				text: "Deleted depth node",
+				createdAt: `2026-03-10T10:${String(depth).padStart(2, "0")}:00.000Z`,
+				replyToId: parentId,
+			});
+			db.prepare(
+				"update tweets set deleted_at = '2026-03-11T00:00:00.000Z' where id = ?",
+			).run(id);
+			parentId = id;
+		}
+
+		const conversation = getTweetConversation("hidden_depth_root", 10, db);
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"hidden_depth_root",
+		]);
+		expect(conversation?.truncated).toBe(false);
+	});
+
+	it("retains truncation state when the first active descendant is too deep", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "hidden_cutoff_root",
+			text: "Visible root",
+			createdAt: "2026-03-10T10:00:00.000Z",
+		});
+		let parentId = "hidden_cutoff_root";
+		for (let depth = 1; depth <= 8; depth += 1) {
+			const id = `hidden_cutoff_${String(depth)}`;
+			insertTestTweet(db, {
+				id,
+				text: "Deleted depth node",
+				createdAt: `2026-03-10T10:${String(depth).padStart(2, "0")}:00.000Z`,
+				replyToId: parentId,
+			});
+			db.prepare(
+				"update tweets set deleted_at = '2026-03-11T00:00:00.000Z' where id = ?",
+			).run(id);
+			parentId = id;
+		}
+		insertTestTweet(db, {
+			id: "hidden_cutoff_active_leaf",
+			text: "Active reply beyond the depth cutoff",
+			createdAt: "2026-03-10T10:09:00.000Z",
+			replyToId: parentId,
+		});
+
+		const conversation = getTweetConversation("hidden_cutoff_root", 10, db);
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"hidden_cutoff_root",
+		]);
+		expect(conversation?.truncated).toBe(true);
+	});
+
+	it("excludes ancestors and descendants cached only for another account", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "scoped_thread_secret_parent",
+			text: "Studio-only secret parent",
+			createdAt: "2026-03-10T11:59:00.000Z",
+		});
+		insertTestTweet(db, {
+			id: "scoped_thread_anchor",
+			text: "Scoped thread anchor",
+			createdAt: "2026-03-10T12:00:00.000Z",
+			replyToId: "scoped_thread_secret_parent",
+		});
+		insertTestTweet(db, {
+			id: "scoped_thread_secret_child",
+			text: "Studio-only secret child",
+			createdAt: "2026-03-10T12:01:00.000Z",
+			replyToId: "scoped_thread_anchor",
+		});
+		insertTestEdge(db, "scoped_thread_anchor", "2026-03-10T12:00:00.000Z");
+		insertTestCollection(
+			db,
+			"scoped_thread_anchor",
+			"likes",
+			"2026-03-10T12:00:00.000Z",
+		);
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values ('acct_studio', ?, 'thread_context', ?, ?, 1, 'test', '{}', ?)
+		`).run(
+			"scoped_thread_secret_parent",
+			"2026-03-10T11:59:00.000Z",
+			"2026-03-10T11:59:00.000Z",
+			"2026-03-10T11:59:00.000Z",
+		);
+		db.prepare(`
+			insert into tweet_collections (
+				account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+			) values ('acct_studio', ?, 'bookmarks', ?, 'test', '{}', ?)
+		`).run(
+			"scoped_thread_anchor",
+			"2026-03-10T12:00:00.000Z",
+			"2026-03-10T12:00:00.000Z",
+		);
+		db.prepare(`
+			insert into tweet_collections (
+				account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+			) values ('acct_studio', ?, 'likes', ?, 'test', '{}', ?)
+		`).run(
+			"scoped_thread_secret_child",
+			"2026-03-10T12:01:00.000Z",
+			"2026-03-10T12:01:00.000Z",
+		);
+
+		const primary = getTweetConversation(
+			"scoped_thread_anchor",
+			10,
+			db,
+			"acct_primary",
+		);
+		const studio = getTweetConversation(
+			"scoped_thread_anchor",
+			10,
+			db,
+			"acct_studio",
+		);
+
+		expect(primary?.items).toEqual([
+			expect.objectContaining({
+				id: "scoped_thread_anchor",
+				replyToId: null,
+				liked: true,
+				bookmarked: false,
+			}),
+		]);
+		expect(primary?.items.map((tweet) => tweet.text)).not.toContain(
+			"Studio-only secret child",
+		);
+		expect(primary?.truncated).toBe(false);
+		expect(studio?.items).toEqual([
+			expect.objectContaining({
+				id: "scoped_thread_secret_parent",
+				liked: false,
+				bookmarked: false,
+			}),
+			expect.objectContaining({
+				id: "scoped_thread_anchor",
+				replyToId: "scoped_thread_secret_parent",
+				liked: false,
+				bookmarked: true,
+			}),
+			expect.objectContaining({
+				id: "scoped_thread_secret_child",
+				liked: true,
+				bookmarked: false,
+			}),
+		]);
+		expect(studio?.truncated).toBe(false);
+		expect(
+			getTweetConversation("scoped_thread_anchor", 10, db, "missing_account"),
+		).toBeNull();
+		expect(
+			getTweetConversation("scoped_thread_anchor", 10, db, "all"),
+		).toBeNull();
+		expect(getTweetConversation("scoped_thread_anchor", 10, db, "")).toBeNull();
+	});
+
+	it("returns deterministic bounded descendant context and signals truncation", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "wide_thread_root",
+			text: "Wide thread root",
+			createdAt: "2026-03-10T13:00:00.000Z",
+		});
+		for (let index = 199; index >= 0; index -= 1) {
+			insertTestTweet(db, {
+				id: `wide_thread_child_${String(index).padStart(3, "0")}`,
+				text: `Wide child ${String(index)}`,
+				createdAt: new Date(
+					Date.parse("2026-03-10T13:01:00.000Z") + index * 1_000,
+				).toISOString(),
+				replyToId: "wide_thread_root",
+			});
+		}
+
+		const conversation = getTweetConversation("wide_thread_root", 5, db);
+
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"wide_thread_root",
+			"wide_thread_child_000",
+			"wide_thread_child_001",
+			"wide_thread_child_002",
+			"wide_thread_child_003",
+		]);
+		expect(conversation?.truncated).toBe(true);
+	});
+
+	it("drives conversation hydration from the bounded branch", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		let planDetails: string[] = [];
+		const tracedDb = {
+			prepare(sql: string) {
+				const statement = db.prepare(sql);
+				if (!sql.includes("with recursive branch")) return statement;
+				return {
+					all(...params: Array<string | number>) {
+						planDetails = (
+							db.prepare(`explain query plan ${sql}`).all(...params) as Array<{
+								detail: string;
+							}>
+						).map((row) => row.detail);
+						return statement.all(...params);
+					},
+				};
+			},
+		} as unknown as TestDatabase;
+
+		const conversation = getTweetConversation(
+			"tweet_001",
+			10,
+			tracedDb,
+			"acct_primary",
+		);
+
+		expect(conversation?.anchorId).toBe("tweet_001");
+		expect(planDetails.some((detail) => /^SCAN t(?: |$)/u.test(detail))).toBe(
+			false,
+		);
+		expect(
+			planDetails.some((detail) =>
+				/^SEARCH t USING INDEX .*\(id=\?\)/u.test(detail),
+			),
+		).toBe(true);
+	});
+
+	it("terminates cyclic cached reply graphs without duplicate tweets", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		insertTestTweet(db, {
+			id: "cycle_a",
+			text: "Cycle A",
+			createdAt: "2026-03-10T14:00:00.000Z",
+			replyToId: "cycle_b",
+		});
+		insertTestTweet(db, {
+			id: "cycle_b",
+			text: "Cycle B",
+			createdAt: "2026-03-10T14:01:00.000Z",
+			replyToId: "cycle_a",
+		});
+
+		const conversation = getTweetConversation("cycle_a", 10, db);
+
+		expect(conversation?.items.map((tweet) => tweet.id)).toEqual([
+			"cycle_a",
+			"cycle_b",
+		]);
+		expect(conversation?.truncated).toBe(true);
+	});
+
+	it("preserves the selected reply chain before broad thread context", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const insertTweet = db.prepare(`
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, reply_to_id,
+				like_count, media_count, entities_json, media_json, quoted_tweet_id
+			) values (?, 'profile_me', ?, ?, 0, ?, 0, 0, '{}', '[]', null)
+		`);
+
+		insertTweet.run("deep_root", "Root", "2026-03-10T10:00:00.000Z", null);
+		for (let index = 0; index < 20; index += 1) {
+			insertTweet.run(
+				`deep_sibling_${String(index).padStart(2, "0")}`,
+				`Popular sibling ${String(index)}`,
+				`2026-03-10T10:${String(index + 1).padStart(2, "0")}:00.000Z`,
+				"deep_root",
+			);
+		}
+
+		let parentId = "deep_root";
+		for (let depth = 1; depth <= 10; depth += 1) {
+			const tweetId = depth === 10 ? "deep_anchor" : `deep_parent_${depth}`;
+			insertTweet.run(
+				tweetId,
+				`Deep branch ${String(depth)}`,
+				`2026-03-10T11:${String(depth).padStart(2, "0")}:00.000Z`,
+				parentId,
+			);
+			parentId = tweetId;
+		}
+		insertTweet.run(
+			"deep_child",
+			"Focused child",
+			"2026-03-10T11:11:00.000Z",
+			"deep_anchor",
+		);
+
+		const conversation = getTweetConversation("deep_anchor", 12);
+		const ids = conversation?.items.map((tweet) => tweet.id) ?? [];
+
+		expect(ids).toContain("deep_root");
+		expect(ids).toContain("deep_parent_1");
+		expect(ids).toContain("deep_parent_9");
+		expect(ids).toContain("deep_anchor");
+		expect(ids).toContain("deep_child");
+		expect(ids.indexOf("deep_parent_9")).toBeLessThan(
+			ids.indexOf("deep_anchor"),
+		);
+		expect(ids.at(-1)).toBe("deep_child");
+		expect(conversation?.truncated).toBe(true);
+	});
+
+	it("keeps complete DM histories and independently mutable sender objects", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const baseline = getConversationThread("dm_001")!;
+		const insert = db.prepare(
+			"insert into dm_messages(id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count) values (?, 'dm_001', 'profile_me', 'Long thread', '2030-01-01', 'outbound', 0, 0)",
+		);
+		db.transaction(() => {
+			for (let i = 0; i < 1200; i++) insert.run(`long_dm_${i}`);
+		})();
+		const thread = getConversationThread("dm_001")!;
+		expect(thread.messages).toHaveLength(baseline.messages.length + 1200);
+		expect(thread.messages.slice(0, baseline.messages.length)).toEqual(
+			baseline.messages,
+		);
+		const first = thread.messages[baseline.messages.length]!;
+		const second = thread.messages[baseline.messages.length + 1]!;
+		expect(first.sender).toEqual(second.sender);
+		expect(first.sender).not.toBe(second.sender);
+		first.sender.displayName = "Changed locally";
+		expect(second.sender.displayName).not.toBe("Changed locally");
+		db.prepare(
+			"update profiles set display_name = 'Fresh sender' where id = 'profile_me'",
+		).run();
+		expect(
+			getConversationThread("dm_001")?.messages.at(-1)?.sender.displayName,
+		).toBe("Fresh sender");
+	});
+
+	it("reads stored Inbox scores only for current candidates", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const original = listInboxItems();
+		const candidate = original.items[0]!;
+		const insert = db.prepare(
+			"insert or replace into ai_scores values (?, ?, 'test', 99, 'Stored score', 'Reason', '2026-01-01')",
+		);
+		db.transaction(() => {
+			for (let i = 0; i < 1000; i++) insert.run("mention", `unrelated_${i}`);
+			insert.run(candidate.entityKind, candidate.entityId);
+		})();
+		const nativePrepare = NativeSqliteDatabase.prototype.prepare;
+		let scoreRows = 0;
+		const prepare = vi
+			.spyOn(NativeSqliteDatabase.prototype, "prepare")
+			.mockImplementation(function (this: NativeSqliteDatabase, sql: string) {
+				const statement = nativePrepare.call(this, sql);
+				if (sql.includes("from ai_scores")) {
+					const all = statement.all.bind(statement);
+					statement.all = (...params: unknown[]) => {
+						const rows = all(...params);
+						scoreRows += rows.length;
+						return rows;
+					};
+				}
+				return statement;
+			});
+		try {
+			const inbox = listInboxItems();
+			expect(inbox.items[0]).toMatchObject({
+				entityId: candidate.entityId,
+				source: "openai",
+				score: 99,
+				summary: "Stored score",
+			});
+			expect(scoreRows).toBeLessThanOrEqual(original.items.length);
+			expect(inbox.items.map((item) => item.entityId).sort()).toEqual(
+				original.items.map((item) => item.entityId).sort(),
+			);
+		} finally {
+			prepare.mockRestore();
+		}
+	});
+
+	it("builds a mixed inbox with ranked mentions and dms", () => {
+		setupTempHome();
+
+		const inbox = listInboxItems({
+			kind: "mixed",
+			hideLowSignal: true,
+			minScore: 40,
+		});
+
+		expect(inbox.items[0]?.entityKind).toBe("dm");
+		expect(inbox.items.some((item) => item.entityKind === "mention")).toBe(
+			true,
+		);
+		expect(inbox.stats.total).toBeGreaterThan(0);
+	});
+
+	it("returns envelope stats, archives, accounts, and transport", async () => {
+		setupTempHome();
+
+		const envelope = await getQueryEnvelope();
+
+		expect(envelope.stats).toEqual({
+			home: 4,
+			mentions: 2,
+			dms: 4,
+			needsReply: 2,
+			inbox: 4,
+		});
+		expect(envelope.accounts.map((account) => account.id)).toEqual([
+			"acct_primary",
+			"acct_studio",
+		]);
+		expect(envelope.archives).toHaveLength(1);
+		expect(envelope.transport.availableTransport).toBe("xurl");
+	});
+
+	it("exposes the status envelope as a lazy Effect program", async () => {
+		setupTempHome();
+
+		const effect = getQueryEnvelopeEffect();
+
+		expect(mocks.findArchives).not.toHaveBeenCalled();
+		expect(mocks.getTransportStatus).not.toHaveBeenCalled();
+		await expect(Effect.runPromise(effect)).resolves.toMatchObject({
+			stats: { home: 4, mentions: 2 },
+			transport: { availableTransport: "xurl" },
+		});
+		expect(mocks.findArchives).toHaveBeenCalledTimes(1);
+		expect(mocks.getTransportStatus).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips archive discovery for the web status envelope", async () => {
+		setupTempHome();
+
+		await expect(
+			Effect.runPromise(getQueryEnvelopeEffect({ includeArchives: false })),
+		).resolves.toMatchObject({ archives: [] });
+
+		expect(mocks.findArchives).not.toHaveBeenCalled();
+		expect(mocks.getTransportStatus).toHaveBeenCalledTimes(1);
+	});
+
+	it("counts envelope timeline stats from account edges", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values
+        (
+          'acct_studio', 'tweet_001', 'home', '2026-03-08T12:00:00.000Z',
+          '2026-03-08T12:00:00.000Z', 1, 'test', '{}',
+          '2026-03-08T12:00:00.000Z'
+        ),
+        (
+          'acct_studio', 'tweet_001', 'mention', '2026-03-08T12:01:00.000Z',
+          '2026-03-08T12:01:00.000Z', 1, 'test', '{}',
+          '2026-03-08T12:01:00.000Z'
+        )
+      `,
+		).run();
+
+		const envelope = await getQueryEnvelope();
+
+		expect(envelope.stats.home).toBe(
+			listTimelineItems({ resource: "home", limit: 20 }).length,
+		);
+		expect(envelope.stats.mentions).toBe(
+			listTimelineItems({ resource: "mentions", limit: 20 }).length,
+		);
+		expect(envelope.stats).toMatchObject({
+			home: 4,
+			mentions: 3,
+			inbox: 5,
+		});
+	});
+
+	it("ignores stale timeline edges when counting envelope stats", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`
+      insert into tweet_account_edges (
+        account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+        source, raw_json, updated_at
+      ) values (
+        'acct_primary', 'tweet_missing', 'home', '2026-03-08T12:00:00.000Z',
+        '2026-03-08T12:00:00.000Z', 1, 'test', '{}',
+        '2026-03-08T12:00:00.000Z'
+      )
+      `,
+		).run();
+
+		const envelope = await getQueryEnvelope();
+
+		expect(envelope.stats.home).toBe(
+			listTimelineItems({ resource: "home", limit: 20 }).length,
+		);
+	});
+
+	it("hydrates selected dms inside queryResource", () => {
+		setupTempHome();
+
+		const result = queryResource("dms", {
+			replyFilter: "unreplied",
+			conversationId: "dm_003",
+			search: "context rail",
+		});
+
+		expect(result.resource).toBe("dms");
+		expect(result.selectedConversation?.conversation.id).toBe("dm_003");
+		expect(result.selectedConversation?.messages).toHaveLength(2);
+	});
+
+	it("pages complete DM history across timestamp ties without changing full-thread reads", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const insert = db.prepare(
+			"insert into dm_messages(id,conversation_id,sender_profile_id,text,created_at,direction,is_replied,media_count) values (?,'dm_001','profile_me',?,'2030-01-01','outbound',0,0)",
+		);
+		db.transaction(() => {
+			for (let i = 0; i < 305; i++)
+				insert.run(`paged_${String(i).padStart(4, "0")}`, `Message ${i}`);
+		})();
+		const full = getConversationThread("dm_001", { account: "acct_primary" })!;
+		expect(full).not.toHaveProperty("nextCursor");
+		const messages: typeof full.messages = [];
+		let cursor: string | null | undefined;
+		let pages = 0;
+		do {
+			const page = getConversationThread("dm_001", {
+				account: "acct_primary",
+				messageLimit: 100,
+				...(cursor ? { before: decodeDmMessageCursor(cursor, "dm_001") } : {}),
+			})!;
+			expect(page.messages.length).toBeLessThanOrEqual(100);
+			messages.unshift(...page.messages);
+			cursor = page.nextCursor;
+			pages++;
+			if (pages > 5) throw new Error("Pagination failed to terminate");
+		} while (cursor);
+		expect(pages).toBe(4);
+		expect(messages).toEqual(full.messages);
+		expect(
+			getConversationThread("dm_001", {
+				account: "acct_studio",
+				messageLimit: 100,
+			}),
+		).toBeNull();
+		expect(() =>
+			getConversationThread("dm_001", { messageLimit: 201 }),
+		).toThrow("messageLimit must be between 1 and 200");
+		const page = getConversationThread("dm_001", { messageLimit: 100 })!;
+		expect(() => decodeDmMessageCursor(page.nextCursor!, "dm_other")).toThrow(
+			"Invalid message cursor",
+		);
+	});
+
+	it("separates DM lists and threads while retaining the combined contract and account scope", () => {
+		setupTempHome();
+		const combined = queryResource("dms", { account: "acct_primary" });
+		const list = queryResource("dms", {
+			account: "acct_primary",
+			view: "list",
+		});
+		expect(list).toEqual({ resource: "dms", items: combined.items });
+		expect(list).not.toHaveProperty("selectedConversation");
+		const id = combined.items[0]!.id;
+		const thread = queryResource("dms", {
+			account: "acct_primary",
+			view: "conversation",
+			conversationId: id,
+		});
+		expect(thread).toEqual({
+			resource: "dms",
+			items: [],
+			selectedConversation: combined.selectedConversation,
+		});
+		expect(
+			queryResource("dms", {
+				account: "acct_studio",
+				view: "conversation",
+				conversationId: id,
+			}),
+		).toEqual({ resource: "dms", items: [], selectedConversation: null });
+		expect(queryResource("dms", { view: "conversation" })).toEqual({
+			resource: "dms",
+			items: [],
+			selectedConversation: null,
+		});
+	});
+
+	it("hydrates selected dms with the active account filter", () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const insertConversation = db.prepare(`
+      insert into dm_conversations (
+        id, account_id, participant_profile_id, title, last_message_at, unread_count, needs_reply
+      ) values (?, 'acct_primary', 'profile_sam', ?, ?, 0, 0)
+    `);
+		const insertMessage = db.prepare(`
+      insert into dm_messages (
+        id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+      ) values (?, ?, 'profile_sam', ?, ?, 'inbound', 1, 0)
+    `);
+
+		for (let index = 0; index < 120; index += 1) {
+			const id = `dm_bulk_${String(index).padStart(3, "0")}`;
+			const createdAt = `2026-05-16T12:${String(index % 60).padStart(2, "0")}:00.000Z`;
+			insertConversation.run(id, `Bulk ${String(index)}`, createdAt);
+			insertMessage.run(
+				`msg_${id}`,
+				id,
+				`Bulk conversation ${String(index)}`,
+				createdAt,
+			);
+		}
+
+		const result = queryResource("dms", {
+			account: "acct_studio",
+			conversationId: "dm_004",
+		});
+
+		expect(result.items.map((item) => item.id)).toEqual(["dm_004"]);
+		expect(result.selectedConversation?.conversation.id).toBe("dm_004");
+		expect(result.selectedConversation?.messages).toHaveLength(2);
+	});
+
+	it("returns a null selected conversation when dm filters empty the result set", () => {
+		setupTempHome();
+
+		const result = queryResource("dms", {
+			participant: "nobody",
+		});
+
+		expect(result.items).toEqual([]);
+		expect(result.selectedConversation).toBeNull();
+		expect(getConversationThread("missing")).toBeNull();
+	});
+
+	it("creates posts locally and records outbound actions", async () => {
+		setupTempHome();
+
+		const result = await createPost("acct_primary", "Fresh local-first post");
+		const db = getNativeDb();
+		const action = db
+			.prepare("select kind, body from tweet_actions where tweet_id = ?")
+			.get(result.tweetId) as { kind: string; body: string } | undefined;
+		const post = db
+			.prepare(`
+				select t.text, e.kind
+				from tweets t
+				join tweet_account_edges e on e.tweet_id = t.id
+				where t.id = ? and e.account_id = 'acct_primary'
+			`)
+			.get(result.tweetId) as { text: string; kind: string } | undefined;
+
+		expect(result.ok).toBe(true);
+		expect(result.transport).toEqual({ ok: true, output: "posted" });
+		expect(post).toEqual({
+			text: "Fresh local-first post",
+			kind: "home",
+		});
+		expect(action).toEqual({
+			kind: "post",
+			body: "Fresh local-first post",
+		});
+		expect(mocks.postViaXurl).toHaveBeenCalledWith("Fresh local-first post");
+	});
+
+	it("exposes local compose writes as lazy Effect programs", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+
+		const postEffect = createPostEffect("acct_primary", "Effect post");
+		const replyEffect = createTweetReplyEffect(
+			"acct_primary",
+			"tweet_004",
+			"Effect reply",
+		);
+		const dmEffect = createDmReplyEffect("dm_003", "Effect DM");
+
+		expect(mocks.postViaXurl).not.toHaveBeenCalled();
+		expect(mocks.replyViaXurl).not.toHaveBeenCalled();
+		expect(mocks.dmViaXurl).not.toHaveBeenCalled();
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweet_actions where body like ?",
+				)
+				.get("Effect%") as { count: number },
+		).toEqual({ count: 0 });
+
+		await expect(Effect.runPromise(postEffect)).resolves.toMatchObject({
+			ok: true,
+		});
+		await expect(Effect.runPromise(replyEffect)).resolves.toMatchObject({
+			ok: true,
+		});
+		await expect(Effect.runPromise(dmEffect)).resolves.toMatchObject({
+			ok: true,
+		});
+		expect(mocks.postViaXurl).toHaveBeenCalledWith("Effect post");
+		expect(mocks.replyViaXurl).toHaveBeenCalledWith(
+			"tweet_004",
+			"Effect reply",
+		);
+		expect(mocks.dmViaXurl).toHaveBeenCalledWith("amelia", "Effect DM");
+	});
+
+	it("rejects tweet writes when the local author profile is unavailable", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.prepare("delete from profiles where id = ?").run("profile_me");
+
+		await expect(createPost("acct_primary", "hello")).rejects.toThrow(
+			"No local author profile for account",
+		);
+		await expect(
+			createTweetReply("acct_primary", "tweet_004", "hello"),
+		).rejects.toThrow("No local author profile for account");
+	});
+
+	it("does not persist tweet writes when transport fails", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		mocks.postViaXurl.mockRejectedValueOnce(new Error("post failed"));
+		mocks.replyViaXurl.mockRejectedValueOnce(new Error("reply failed"));
+
+		await expect(createPost("acct_primary", "do not keep")).rejects.toThrow(
+			"post failed",
+		);
+		await expect(
+			createTweetReply("acct_primary", "tweet_004", "do not reply"),
+		).rejects.toThrow("reply failed");
+		mocks.postViaXurl.mockResolvedValueOnce({
+			ok: false,
+			output: "post denied",
+		});
+		mocks.replyViaXurl.mockResolvedValueOnce({
+			ok: false,
+			output: "reply denied",
+		});
+
+		await expect(
+			createPost("acct_primary", "do not keep false"),
+		).rejects.toThrow("post denied");
+		await expect(
+			createTweetReply("acct_primary", "tweet_004", "do not reply false"),
+		).rejects.toThrow("reply denied");
+
+		expect(
+			db
+				.prepare("select count(*) as count from tweets where text like ?")
+				.get("do not%") as { count: number },
+		).toEqual({ count: 0 });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweet_actions where body like ?",
+				)
+				.get("do not%") as { count: number },
+		).toEqual({ count: 0 });
+		expect(
+			db.prepare("select is_replied from tweets where id = ?").get("tweet_004"),
+		).toEqual({ is_replied: 0 });
+	});
+
+	it("does not call xurl whoami when live writes are disabled", async () => {
+		setupTempHome();
+		process.env.BIRDCLAW_DISABLE_LIVE_WRITES = "1";
+		mocks.postViaXurl.mockResolvedValueOnce({
+			ok: false,
+			output: "live writes disabled",
+		});
+
+		await expect(createPost("acct_primary", "do not verify")).rejects.toThrow(
+			"live writes disabled",
+		);
+
+		expect(mocks.lookupAuthenticatedUser).not.toHaveBeenCalled();
+		expect(
+			getNativeDb()
+				.prepare("select count(*) as count from tweets where text = ?")
+				.get("do not verify"),
+		).toEqual({ count: 0 });
+	});
+
+	it("does not publish tweet writes when local persistence cannot be staged", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec("drop table tweet_actions");
+
+		await expect(
+			createPost("acct_primary", "do not publish post"),
+		).rejects.toThrow("tweet_actions");
+		await expect(
+			createTweetReply("acct_primary", "tweet_004", "do not publish reply"),
+		).rejects.toThrow("tweet_actions");
+
+		expect(mocks.postViaXurl).not.toHaveBeenCalled();
+		expect(mocks.replyViaXurl).not.toHaveBeenCalled();
+		expect(
+			db
+				.prepare("select count(*) as count from tweets where text like ?")
+				.get("do not publish%") as { count: number },
+		).toEqual({ count: 0 });
+		expect(
+			db.prepare("select is_replied from tweets where id = ?").get("tweet_004"),
+		).toEqual({ is_replied: 0 });
+	});
+
+	it("creates tweet replies and flips the original item to replied", async () => {
+		setupTempHome();
+
+		const result = await createTweetReply(
+			"acct_primary",
+			"tweet_004",
+			"Sync deserves an engine when replay matters.",
+		);
+		const db = getNativeDb();
+		const original = db
+			.prepare("select is_replied from tweets where id = ?")
+			.get("tweet_004") as { is_replied: number } | undefined;
+		const reply = db
+			.prepare("select reply_to_id, is_replied from tweets where id = ?")
+			.get(result.replyId) as
+			| { reply_to_id: string; is_replied: number }
+			| undefined;
+
+		expect(original?.is_replied).toBe(1);
+		expect(reply).toEqual({
+			reply_to_id: "tweet_004",
+			is_replied: 1,
+		});
+		expect(mocks.replyViaXurl).toHaveBeenCalledWith(
+			"tweet_004",
+			"Sync deserves an engine when replay matters.",
+		);
+	});
+
+	it("creates dm replies and clears reply pressure on the thread", async () => {
+		setupTempHome();
+
+		const result = await createDmReply("dm_003", "Send it over.");
+		const db = getNativeDb();
+		const conversation = db
+			.prepare(
+				"select needs_reply, unread_count from dm_conversations where id = ?",
+			)
+			.get("dm_003") as
+			| { needs_reply: number; unread_count: number }
+			| undefined;
+		const message = db
+			.prepare(
+				"select direction, sender_profile_id, text from dm_messages where id = ?",
+			)
+			.get(result.messageId) as
+			| { direction: string; sender_profile_id: string; text: string }
+			| undefined;
+
+		expect(message).toEqual({
+			direction: "outbound",
+			sender_profile_id: "profile_me",
+			text: "Send it over.",
+		});
+		expect(conversation).toEqual({
+			needs_reply: 0,
+			unread_count: 0,
+		});
+		expect(mocks.dmViaXurl).toHaveBeenCalledWith("amelia", "Send it over.");
+	});
+
+	it("clears dm reply pressure when the existing timestamp is future-dated", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const futureAt = "2099-01-01T00:00:00.000Z";
+		db.prepare(
+			"update dm_conversations set last_message_at = ?, unread_count = 2, needs_reply = 1 where id = 'dm_003'",
+		).run(futureAt);
+
+		await createDmReply("dm_003", "Reply to future state.");
+
+		expect(
+			db
+				.prepare(
+					"select last_message_at, needs_reply, unread_count from dm_conversations where id = ?",
+				)
+				.get("dm_003"),
+		).toEqual({
+			last_message_at: futureAt,
+			needs_reply: 0,
+			unread_count: 0,
+		});
+	});
+
+	it("preserves newer dm sync state when it lands during live send", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		const newerInboundAt = "2099-01-01T00:00:00.000Z";
+		mocks.dmViaXurl.mockImplementationOnce(async () => {
+			db.prepare(
+				`
+        insert into dm_messages (
+          id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
+        ) values ('msg_newer_sync', 'dm_003', 'profile_amelia', 'newer inbound', ?, 'inbound', 0, 0)
+        `,
+			).run(newerInboundAt);
+			refreshSearchRows(db, "dm", ["msg_newer_sync"]);
+			db.prepare(
+				"update dm_conversations set last_message_at = ?, unread_count = 1, needs_reply = 1 where id = 'dm_003'",
+			).run(newerInboundAt);
+			return { ok: true, output: "sent" };
+		});
+
+		const result = await createDmReply("dm_003", "Reply after sync.");
+		const conversation = db
+			.prepare(
+				"select last_message_at, needs_reply, unread_count from dm_conversations where id = ?",
+			)
+			.get("dm_003");
+		const outbound = db
+			.prepare("select direction, text from dm_messages where id = ?")
+			.get(result.messageId);
+
+		expect(outbound).toEqual({
+			direction: "outbound",
+			text: "Reply after sync.",
+		});
+		expect(conversation).toEqual({
+			last_message_at: newerInboundAt,
+			needs_reply: 1,
+			unread_count: 1,
+		});
+	});
+
+	it("does not persist dm replies when transport fails", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		mocks.dmViaXurl.mockRejectedValueOnce(new Error("dm failed"));
+
+		await expect(createDmReply("dm_003", "do not dm")).rejects.toThrow(
+			"dm failed",
+		);
+		mocks.dmViaXurl.mockResolvedValueOnce({
+			ok: false,
+			output: "dm denied",
+		});
+
+		await expect(createDmReply("dm_003", "do not dm false")).rejects.toThrow(
+			"dm denied",
+		);
+
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from dm_messages where text like ? and direction = 'outbound'",
+				)
+				.get("do not dm%") as { count: number },
+		).toEqual({ count: 0 });
+		expect(
+			db
+				.prepare(
+					"select needs_reply, unread_count from dm_conversations where id = ?",
+				)
+				.get("dm_003"),
+		).toEqual({ needs_reply: 1, unread_count: 2 });
+	});
+
+	it("does not publish dm replies when local persistence cannot be staged", async () => {
+		setupTempHome();
+		const db = getNativeDb();
+		db.exec("drop table dm_fts");
+
+		await expect(createDmReply("dm_003", "do not publish dm")).rejects.toThrow(
+			"dm_fts",
+		);
+
+		expect(mocks.dmViaXurl).not.toHaveBeenCalled();
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from dm_messages where text = ? and direction = 'outbound'",
+				)
+				.get("do not publish dm") as { count: number },
+		).toEqual({ count: 0 });
+		expect(
+			db
+				.prepare(
+					"select needs_reply, unread_count from dm_conversations where id = ?",
+				)
+				.get("dm_003"),
+		).toEqual({ needs_reply: 1, unread_count: 2 });
+	});
+
+	it("rejects dm replies for missing conversations", async () => {
+		setupTempHome();
+
+		await expect(createDmReply("missing", "hello")).rejects.toThrow(
+			"Conversation not found",
+		);
+	});
+
+	it("rejects dm replies selected for a different account", async () => {
+		setupTempHome();
+
+		await expect(
+			createDmReply("dm_003", "wrong account", "acct_other"),
+		).rejects.toThrow("Conversation belongs to acct_primary, not acct_other");
+		expect(mocks.dmViaXurl).not.toHaveBeenCalled();
+	});
+});

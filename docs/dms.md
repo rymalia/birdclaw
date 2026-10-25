@@ -20,7 +20,7 @@ birdclaw dms list --unreplied --min-followers 500 --min-influence-score 90 --sor
 Flags:
 
 - `--refresh` — refresh live DMs before listing
-- `--mode bird|xurl|auto` — choose the live transport for refreshes
+- `--mode web|bird|xurl|auto` — choose the live transport for refreshes
 - `--cache-ttl <seconds>` — tune freshness
 - `--participant <handle-or-id>`
 - `--min-followers <n>` / `--max-followers <n>`
@@ -42,14 +42,37 @@ birdclaw dms sync --mode auto --limit 50 --refresh --json
 Flags:
 
 - `--account <account-id>`
-- `--mode bird|xurl|auto`
+- `--mode web|bird|xurl|auto`
 - `--limit <n>`
 - `--refresh` — force a live fetch
 - `--cache-ttl <seconds>`
 
 Sync is idempotent — re-running merges new events without disturbing already-imported message bodies.
 
-`--mode bird` remains the default because it can read accepted DMs and message requests with accept/reject state. `--mode xurl` imports recent OAuth2 `/2/dm_events` as accepted conversations only; use `--mode auto` to try xurl for accepted DMs and fall back to bird. Message-request inbox syncs always require `bird`.
+`--mode auto` is the default. It uses native `web` for request inboxes when session cookies are configured, and for the default account's full inbox so request state is retained. Other reads try xurl, with native-cookie and legacy bird fallback when available. `--mode xurl` imports recent OAuth2 `/2/dm_events` as accepted conversations; that API does not expose accept/reject state. Explicit non-default account reads prefer account-scoped xurl; `--mode web` requires cookies matching the selected account.
+
+## Message requests without bird
+
+Set `AUTH_TOKEN` and `CT0` in a protected environment, then use the native web transport:
+
+```bash
+birdclaw dms sync --mode web --inbox requests --limit 20 --max-pages 3 --refresh --json
+birdclaw dms accept <conversation-id> --json
+birdclaw dms reject <conversation-id> --json
+birdclaw dms block <conversation-id> --json
+```
+
+Actions default to native `web`; pass `--mode bird` for an existing legacy installation.
+Auto read failures can fall back to xurl for accepted/all inboxes or independently
+verified bird for request inboxes. Select `--mode web` to require native behavior;
+request actions never switch transports or replay a failed mutation.
+Blocking requires a single other participant in a one-to-one conversation. Account
+verification runs before remote operations, and local request state changes only
+after success. All DM transport caches are invalidated after an action so an older
+cached request cannot reappear. Native requests never launch a browser or read its
+cookie database. Native pagination uses `--max-pages`, or a maximum of 250 extra
+pages per inbox with `--all-pages`, with a 15-second timeout per HTTP request,
+32 MiB per response, and 128 MiB per operation. See [Sign in](auth.md#run-without-bird).
 
 ## Search
 
@@ -85,6 +108,8 @@ links and separates ecosystem mentions from likely staff/company matches.
 
 ## Influence score
 
+The CLI rejects non-finite `--min-followers` and `--max-followers` values before refreshing or reading DMs. Existing finite thresholds, including fractions and numeric spellings such as `1e3`, retain their filtering behavior in both `dms list` and `search dms`.
+
 Influence is a derived ranking signal that starts with follower count and folds in:
 
 - verified status
@@ -119,7 +144,7 @@ Replies use the active live transport (`auto` by default). Without a working tra
 
 Twitter archives include full DM history but the JSON is awkward. `import archive` imports message bodies into SQLite and makes them FTS5-searchable.
 
-Use `--select directMessages` when a newer archive has fresher DMs and you do not want to touch tweets, likes, bookmarks, profiles, or follow data. The selected re-import clears only archive DM rows for `acct_primary`, preserves other accounts, then rebuilds DM FTS. `dms` is accepted as a shorter alias.
+Use `--select directMessages` when a newer archive has fresher DMs and you do not want to touch tweets, likes, bookmarks, profiles, or follow data. The selected re-import merges archive DM rows for `acct_primary` and preserves other accounts. Add `--restore` to clear and exactly replay that account's archive DMs before rebuilding DM FTS. `dms` is accepted as a shorter alias.
 
 ```bash
 birdclaw import archive ~/Downloads/twitter-archive.zip --select directMessages --json

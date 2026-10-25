@@ -88,9 +88,9 @@ birdclaw unban @amelia --account acct_primary --transport bird --json
 
 `ban` / `unban` are aliases for `blocks add` / `blocks remove` with one extra knob: `--transport`.
 
-- `--transport auto` — try `bird` first, then `xurl`; xweb is not used automatically
+- `--transport auto` — try `bird` first, then verified `xurl`
 - `--transport bird` — force `bird`
-- `--transport xurl` — force `xurl`; verifies through `bird status` before mutating SQLite
+- `--transport xurl` — force `xurl`; requires X's response to confirm the expected `blocking`/`muting` state before mutating SQLite, without calling bird
 
 ## Mutes
 
@@ -110,8 +110,8 @@ Same model as blocks, with one resolution detail: `mute` and `unmute` prefer `bi
 OAuth2 block writes are the most common failure case. Twitter intermittently rejects them with no recoverable error code. For that reason:
 
 - `auto` is the default everywhere
-- xweb helpers remain low-level and are not part of `auto`
-- forced `xurl` writes still verify through `bird status` before sqlite changes
+- `auto` stops after the verified `xurl` fallback
+- forced `xurl` writes require X's boolean confirmation before SQLite changes; a successful subprocess exit alone is insufficient
 - failed live writes never leave the local DB in an inconsistent state — either the local row reflects the live state or it is rolled back
 
 If your account chronically rejects OAuth2 blocks, just set:

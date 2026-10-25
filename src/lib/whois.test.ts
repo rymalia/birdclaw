@@ -20,6 +20,8 @@ describe("whois", () => {
       delete from tweet_actions;
       delete from dm_fts;
       delete from tweets_fts;
+			delete from tweet_account_edges;
+			delete from tweet_collections;
       delete from dm_messages;
       delete from dm_conversations;
       delete from tweets;
@@ -114,12 +116,18 @@ describe("whois", () => {
 		db.prepare(
 			`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
+        id, author_profile_id, text, created_at,
+        is_replied, reply_to_id, like_count, media_count,
         entities_json, media_json, quoted_tweet_id
-      ) values ('tweet_blacksmith', 'acct_primary', 'profile_user_42', 'home', 'Blacksmith public tweet', '2026-05-01T00:02:00.000Z', 0, null, 0, 0, 0, 0, '{}', '[]', null)
+			) values ('tweet_blacksmith', 'profile_user_42', 'Blacksmith public tweet', '2026-05-01T00:02:00.000Z', 0, null, 0, 0, '{}', '[]', null)
       `,
 		).run();
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values ('acct_primary', 'tweet_blacksmith', 'home', '2026-05-01T00:02:00.000Z', '2026-05-01T00:02:00.000Z', 1, 'test', '{}', '2026-05-01T00:02:00.000Z')
+		`).run();
 		db.prepare("insert into tweets_fts (tweet_id, text) values (?, ?)").run(
 			"tweet_blacksmith",
 			"Blacksmith public tweet",
@@ -675,12 +683,18 @@ describe("whois", () => {
 		db.prepare(
 			`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
+        id, author_profile_id, text, created_at,
+        is_replied, reply_to_id, like_count, media_count,
         entities_json, media_json, quoted_tweet_id
-      ) values ('tweet_lazyprobe', 'acct_primary', 'profile_user_42', 'home', 'lazyprobe public tweet', '2026-05-01T00:03:00.000Z', 0, null, 0, 0, 0, 0, '{}', '[]', null)
+			) values ('tweet_lazyprobe', 'profile_user_42', 'lazyprobe public tweet', '2026-05-01T00:03:00.000Z', 0, null, 0, 0, '{}', '[]', null)
       `,
 		).run();
+		db.prepare(`
+			insert into tweet_account_edges (
+				account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+				source, raw_json, updated_at
+			) values ('acct_primary', 'tweet_lazyprobe', 'home', '2026-05-01T00:03:00.000Z', '2026-05-01T00:03:00.000Z', 1, 'test', '{}', '2026-05-01T00:03:00.000Z')
+		`).run();
 		db.prepare("insert into tweets_fts (tweet_id, text) values (?, ?)").run(
 			"tweet_lazyprobe",
 			"lazyprobe public tweet",

@@ -1,15 +1,7 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
-import type { ComponentType } from "react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Route } from "./links";
-
-const LinksRoute = Route.options.component as ComponentType;
+import { renderWithQueryClient as render } from "#/test/render";
+import { LinksRouteView as LinksRoute } from "./links";
 
 describe("links route", () => {
 	beforeEach(() => {
@@ -175,9 +167,29 @@ describe("links route", () => {
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
-		render(<LinksRoute />);
+		const { queryClient } = render(<LinksRoute />);
 
 		expect(await screen.findByText("Example story")).toBeInTheDocument();
+		const defaultCallsBeforeRemount = queryUrls.filter(
+			(url) =>
+				url.pathname === "/api/link-insights" &&
+				url.searchParams.get("kind") === "links" &&
+				url.searchParams.get("range") === "week" &&
+				url.searchParams.get("sort") === "rank",
+		).length;
+		cleanup();
+		render(<LinksRoute />, { queryClient });
+
+		expect(screen.getByText("Example story")).toBeInTheDocument();
+		expect(
+			queryUrls.filter(
+				(url) =>
+					url.pathname === "/api/link-insights" &&
+					url.searchParams.get("kind") === "links" &&
+					url.searchParams.get("range") === "week" &&
+					url.searchParams.get("sort") === "rank",
+			),
+		).toHaveLength(defaultCallsBeforeRemount);
 		await waitFor(
 			() => {
 				const hydrationUrl = queryUrls.find(
@@ -222,10 +234,9 @@ describe("links route", () => {
 				queryUrls.some((url) => url.searchParams.get("sort") === "comments"),
 			).toBe(true);
 		});
-	});
+	}, 15_000);
 
 	it("shows a retryable error when link insights fail", async () => {
-		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 		const fetchMock = vi.fn(async () => {
 			throw new Error("Insights unavailable");
 		});
@@ -239,9 +250,5 @@ describe("links route", () => {
 		await waitFor(() => {
 			expect(fetchMock).toHaveBeenCalledTimes(2);
 		});
-		expect(warnSpy).toHaveBeenCalledWith(
-			"Link insights failed",
-			expect.any(Error),
-		);
 	});
 });

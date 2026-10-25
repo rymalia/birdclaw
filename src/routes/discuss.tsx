@@ -1,5 +1,7 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
 import {
+	ChevronDown,
 	CheckCircle2,
 	Loader2,
 	RefreshCw,
@@ -15,13 +17,23 @@ import {
 	useState,
 } from "react";
 import { MarkdownViewer } from "#/components/MarkdownViewer";
+import { useNdjsonRun } from "#/components/useNdjsonRun";
 import type {
 	SearchDiscussionContext,
 	SearchDiscussionRunResult,
 	SearchDiscussionSource,
 	SearchDiscussionStreamEvent,
 } from "#/lib/search-discussion";
+import {
+	isTerminalStreamEvent,
+	searchDiscussionStreamEventSchema,
+} from "#/lib/client-stream-contracts";
 import type { TweetSearchMode } from "#/lib/tweet-search-live";
+import {
+	type DiscussRouteSearch,
+	type RouteSearchChange,
+	validateDiscussSearch,
+} from "#/lib/route-search";
 import {
 	cx,
 	errorCopyClass,
@@ -41,6 +53,7 @@ import {
 
 export const Route = createFileRoute("/discuss")({
 	component: DiscussRoute,
+	validateSearch: validateDiscussSearch,
 });
 
 const sources: Array<{ value: SearchDiscussionSource; label: string }> = [
@@ -53,18 +66,31 @@ const sources: Array<{ value: SearchDiscussionSource; label: string }> = [
 	{ value: "bookmarks", label: "Bookmarks" },
 ];
 
-const modes: Array<{ value: TweetSearchMode; label: string }> = [
+const modes: Array<{ value: TweetSearchMode | ""; label: string }> = [
+	{ value: "", label: "Default" },
 	{ value: "auto", label: "Auto" },
 	{ value: "bird", label: "Bird" },
 	{ value: "xurl", label: "xurl" },
 	{ value: "local", label: "Local" },
 ];
+const DISCUSS_SEARCH_LIMIT = 20_000;
+const DISCUSS_MAX_PAGES = 200;
+
+function discussionPrematureEofError() {
+	return new Error(
+		"Discussion connection closed before completion. Retry to continue.",
+	);
+}
+
+function discussionStreamError(cause: unknown) {
+	return cause instanceof Error ? cause.message : "Discussion failed";
+}
 
 function discussionUrl(
 	query: string,
 	options: {
 		source: SearchDiscussionSource;
-		mode: TweetSearchMode;
+		mode: TweetSearchMode | undefined;
 		includeDms: boolean;
 		question: string;
 		refresh: boolean;
@@ -73,10 +99,10 @@ function discussionUrl(
 	const url = new URL("/api/search-discussion", window.location.origin);
 	url.searchParams.set("query", query);
 	url.searchParams.set("source", options.source);
-	url.searchParams.set("mode", options.mode);
+	if (options.mode) url.searchParams.set("mode", options.mode);
 	url.searchParams.set("includeDms", String(options.includeDms));
-	url.searchParams.set("limit", "5000");
-	url.searchParams.set("maxPages", "50");
+	url.searchParams.set("limit", String(DISCUSS_SEARCH_LIMIT));
+	url.searchParams.set("maxPages", String(DISCUSS_MAX_PAGES));
 	if (options.question.trim()) {
 		url.searchParams.set("question", options.question.trim());
 	}
@@ -86,28 +112,43 @@ function discussionUrl(
 	return url;
 }
 
-async function discussionRequestError(response: Response) {
-	const status = `${String(response.status)}${response.statusText ? ` ${response.statusText}` : ""}`;
-	let detail = "";
-	try {
-		const contentType = response.headers.get("content-type") ?? "";
-		if (contentType.includes("application/json")) {
-			const payload = (await response.json()) as {
-				error?: unknown;
-				message?: unknown;
-			};
-			if (typeof payload.message === "string") detail = payload.message;
-			else if (typeof payload.error === "string") detail = payload.error;
-		} else {
-			detail = (await response.text()).trim();
-		}
-	} catch {
-		detail = "";
-	}
-	return new Error(
-		detail
-			? `Discussion request failed (${status}): ${detail}`
-			: `Discussion request failed (${status})`,
+function DropdownField<T extends string>({
+	label,
+	value,
+	options,
+	onChange,
+}: {
+	label: string;
+	value: T;
+	options: Array<{ value: T; label: string }>;
+	onChange: (value: T) => void;
+}) {
+	return (
+		<label className="relative min-w-0">
+			<span className="pointer-events-none absolute left-3 top-1.5 z-10 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--ink-soft)]">
+				{label}
+			</span>
+			<select
+				aria-label={label}
+				className={cx(
+					selectFieldClass,
+					"h-[54px] rounded-2xl bg-[var(--bg)] pb-1 pl-3 pr-9 pt-5 font-semibold text-[var(--ink)]",
+				)}
+				value={value}
+				onChange={(event) => onChange(event.currentTarget.value as T)}
+			>
+				{options.map((item) => (
+					<option key={item.value} value={item.value}>
+						{item.label}
+					</option>
+				))}
+			</select>
+			<ChevronDown
+				aria-hidden="true"
+				className="pointer-events-none absolute right-3 top-1/2 size-4 -translate-y-1/2 text-[var(--ink-soft)]"
+				strokeWidth={2}
+			/>
+		</label>
 	);
 }
 
@@ -133,38 +174,23 @@ function formatCounts(context: SearchDiscussionContext | null) {
 function useDiscussionStream(
 	query: string,
 	source: SearchDiscussionSource,
-	mode: TweetSearchMode,
+	mode: TweetSearchMode | undefined,
 	includeDms: boolean,
 	question: string,
 ) {
 	const [markdown, setMarkdown] = useState("");
 	const [context, setContext] = useState<SearchDiscussionContext | null>(null);
 	const [result, setResult] = useState<SearchDiscussionRunResult | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [loading, setLoading] = useState(false);
-	const abortRef = useRef<AbortController | null>(null);
-	const requestIdRef = useRef(0);
 
-	const run = useCallback(
-		(refresh = false) => {
+	const onStart = useCallback(() => {
+		setMarkdown("");
+		setContext(null);
+		setResult(null);
+	}, []);
+	const request = useCallback(
+		(signal: AbortSignal, refresh: boolean) => {
 			const trimmed = query.trim();
-			if (!trimmed) return;
-			abortRef.current?.abort();
-			const controller = new AbortController();
-			const requestId = requestIdRef.current + 1;
-			requestIdRef.current = requestId;
-			abortRef.current = controller;
-			const isActiveRequest = () =>
-				abortRef.current === controller &&
-				requestIdRef.current === requestId &&
-				!controller.signal.aborted;
-			setMarkdown("");
-			setContext(null);
-			setResult(null);
-			setError(null);
-			setLoading(true);
-
-			fetch(
+			return fetch(
 				discussionUrl(trimmed, {
 					source,
 					mode,
@@ -172,75 +198,73 @@ function useDiscussionStream(
 					question,
 					refresh,
 				}),
-				{ signal: controller.signal },
-			)
-				.then(async (response) => {
-					if (!response.ok) {
-						throw await discussionRequestError(response);
-					}
-					if (!response.body) {
-						throw new Error("Discussion request failed: empty response body");
-					}
-					const reader = response.body.getReader();
-					const decoder = new TextDecoder();
-					let buffer = "";
-					const pump = (): Promise<void> =>
-						reader.read().then(({ done, value }) => {
-							if (!isActiveRequest()) return;
-							if (done) return;
-							buffer += decoder.decode(value, { stream: true });
-							let newline = buffer.indexOf("\n");
-							while (newline >= 0) {
-								const line = buffer.slice(0, newline).trim();
-								buffer = buffer.slice(newline + 1);
-								if (line) {
-									const event = JSON.parse(line) as SearchDiscussionStreamEvent;
-									if (!isActiveRequest()) return;
-									if (event.type === "start") {
-										setContext(event.context);
-									} else if (event.type === "delta") {
-										setMarkdown((current) => current + event.delta);
-									} else if (event.type === "done") {
-										setResult(event.result);
-										setContext(event.result.context);
-										setMarkdown(event.result.markdown);
-									} else if (event.type === "error") {
-										setError(event.error);
-									}
-								}
-								newline = buffer.indexOf("\n");
-							}
-							return pump();
-						});
-					return pump();
-				})
-				.catch((cause: unknown) => {
-					if (!isActiveRequest()) return;
-					setError(
-						cause instanceof Error ? cause.message : "Discussion failed",
-					);
-				})
-				.finally(() => {
-					if (isActiveRequest()) {
-						setLoading(false);
-					}
-				});
+				{ signal },
+			);
 		},
 		[includeDms, mode, query, question, source],
 	);
-
-	useEffect(() => () => abortRef.current?.abort(), []);
+	const onEvent = useCallback((event: SearchDiscussionStreamEvent) => {
+		if (event.type === "start") setContext(event.context);
+		else if (event.type === "delta") {
+			setMarkdown((current) => current + event.delta);
+		} else if (event.type === "done") {
+			setResult(event.result);
+			setContext(event.result.context);
+			setMarkdown(event.result.markdown);
+		} else if (event.type === "error") throw new Error(event.error);
+	}, []);
+	const {
+		error,
+		loading,
+		run: runStream,
+	} = useNdjsonRun({
+		schema: searchDiscussionStreamEventSchema,
+		request,
+		onStart,
+		onEvent,
+		isTerminal: isTerminalStreamEvent,
+		errorLabel: "Discussion request failed",
+		emptyBodyMessage: "Discussion request failed: empty response body",
+		prematureEofError: discussionPrematureEofError,
+		formatError: discussionStreamError,
+	});
+	const run = useCallback(
+		(refresh = false) => {
+			if (query.trim()) runStream(refresh);
+		},
+		[query, runStream],
+	);
 
 	return { context, error, loading, markdown, result, run };
 }
 
 function DiscussRoute() {
-	const [query, setQuery] = useState("");
+	const search = Route.useSearch();
+	const navigate = Route.useNavigate();
+	return (
+		<DiscussRouteView
+			searchState={search}
+			onSearchChange={(next, options) =>
+				void navigate({ search: next, replace: options?.replace })
+			}
+		/>
+	);
+}
+
+export function DiscussRouteView({
+	searchState: controlledSearch,
+	onSearchChange,
+}: {
+	searchState?: DiscussRouteSearch;
+	onSearchChange?: RouteSearchChange<DiscussRouteSearch>;
+} = {}) {
+	const { searchState, updateSearch, textInput } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateDiscussSearch,
+	);
+	const { q: query, question, source, mode, includeDms } = searchState;
 	const [submittedQuery, setSubmittedQuery] = useState("");
-	const [question, setQuestion] = useState("");
-	const [source, setSource] = useState<SearchDiscussionSource>("search");
-	const [mode, setMode] = useState<TweetSearchMode>("auto");
-	const [includeDms, setIncludeDms] = useState(false);
 	const pendingSubmitRef = useRef(false);
 	const { context, error, loading, markdown, result, run } =
 		useDiscussionStream(submittedQuery, source, mode, includeDms, question);
@@ -299,15 +323,15 @@ function DiscussRoute() {
 						<input
 							className={searchFieldInputClass}
 							placeholder="Keywords"
-							value={query}
-							onChange={(event) => setQuery(event.currentTarget.value)}
+
+							{...textInput("q")}
 						/>
 					</label>
 					<input
 						className={textFieldClass}
-						placeholder="Question"
-						value={question}
-						onChange={(event) => setQuestion(event.currentTarget.value)}
+						placeholder="Optional question"
+
+						{...textInput("question")}
 					/>
 					<button
 						type="submit"
@@ -317,38 +341,33 @@ function DiscussRoute() {
 						<Sparkles className="size-4" aria-hidden="true" />
 						Discuss
 					</button>
-					<div className="flex flex-wrap gap-2 md:col-span-3">
-						<select
-							className={selectFieldClass}
+					<div className="grid gap-2 md:col-span-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+						<DropdownField
+							label="Source"
+							options={sources}
 							value={source}
-							onChange={(event) =>
-								setSource(event.currentTarget.value as SearchDiscussionSource)
+							onChange={(value) =>
+								updateSearch({ ...searchState, source: value })
 							}
-						>
-							{sources.map((item) => (
-								<option key={item.value} value={item.value}>
-									{item.label}
-								</option>
-							))}
-						</select>
-						<select
-							className={selectFieldClass}
-							value={mode}
-							onChange={(event) =>
-								setMode(event.currentTarget.value as TweetSearchMode)
+						/>
+						<DropdownField
+							label="Mode"
+							options={modes}
+							value={mode ?? ""}
+							onChange={(value) =>
+								updateSearch({ ...searchState, mode: value || undefined })
 							}
-						>
-							{modes.map((item) => (
-								<option key={item.value} value={item.value}>
-									{item.label}
-								</option>
-							))}
-						</select>
-						<label className="inline-flex items-center gap-2 rounded-full border border-[var(--line)] px-3 py-1 text-[13px] font-medium text-[var(--ink-soft)]">
+						/>
+						<label className="inline-flex h-[54px] items-center gap-2 rounded-2xl border border-[var(--line)] bg-[var(--bg)] px-3 text-[13px] font-medium text-[var(--ink-soft)]">
 							<input
 								type="checkbox"
 								checked={includeDms}
-								onChange={(event) => setIncludeDms(event.currentTarget.checked)}
+								onChange={(event) =>
+									updateSearch({
+										...searchState,
+										includeDms: event.currentTarget.checked,
+									})
+								}
 							/>
 							DMs
 						</label>
@@ -377,7 +396,7 @@ function DiscussRoute() {
 
 			{markdown ? (
 				<MarkdownViewer
-					context={(result?.context ?? context) as never}
+					context={result?.context ?? context}
 					markdown={markdown}
 				/>
 			) : (

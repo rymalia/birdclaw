@@ -1,13 +1,13 @@
 import { Effect } from "effect";
 import { getNativeDb } from "./db";
-import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { runEffectPromise, tryPromise, trySync } from "./effect-runtime";
 import {
 	resolvePublicAddresses,
 	safePreviewFetchEffect,
 } from "./link-preview-metadata";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
 import type { UrlExpansionItem } from "./types";
-import { assertSafePreviewUrl } from "./url-safety";
+import { assertSafePreviewUrl, isTcoUrl } from "./url-safety";
 import {
 	normalizeUrlExpansionForIndex,
 	upsertUrlExpansion,
@@ -46,18 +46,8 @@ function isFresh(updatedAt: string, maxAgeMs: number) {
 }
 
 function trimTrailingPunctuation(url: string) {
-	return url.replace(/[.,;:!?]+$/g, "");
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
+	const cleanUrl = isTcoUrl(url) ? url.split("(")[0]! : url;
+	return cleanUrl.replace(/[.,;:!?]+$/g, "");
 }
 
 function cancelBodyEffect(response: Response) {
@@ -125,7 +115,11 @@ function fetchExpansionEffect(
 			});
 			yield* cancelBodyEffect(headResponse);
 			const headFinalUrl = headResponse.url || url;
-			if (headFinalUrl !== url && headResponse.status < 400) {
+			if (
+				headFinalUrl !== url &&
+				headResponse.status < 400 &&
+				!isTcoUrl(headFinalUrl)
+			) {
 				yield* Effect.try({
 					try: () => assertSafePreviewUrl(headFinalUrl),
 					catch: (error) => error,
@@ -154,7 +148,10 @@ function fetchExpansionEffect(
 			return {
 				expandedUrl: finalUrl,
 				finalUrl,
-				status: response.ok || finalUrl !== url ? "hit" : "miss",
+				status:
+					!isTcoUrl(finalUrl) && (response.ok || finalUrl !== url)
+						? "hit"
+						: "miss",
 				...(response.ok ? {} : { error: `HTTP ${response.status}` }),
 			} satisfies CachedUrlExpansion;
 		}
@@ -239,7 +236,8 @@ function fetchExpansionEffect(
 			expandedUrl: finalUrl,
 			finalUrl,
 			status:
-				response.ok || (finalUrl !== url && response.status < 300)
+				!isTcoUrl(finalUrl) &&
+				(response.ok || (finalUrl !== url && response.status < 300))
 					? "hit"
 					: "miss",
 			...(response.ok ? {} : { error: `HTTP ${response.status}` }),
@@ -276,7 +274,11 @@ export function expandUrlsEffect(
 			const cached = yield* trySync(() =>
 				readSyncCache<CachedUrlExpansion>(cacheKeyForUrl(url)),
 			);
-			if (cached && !options.refresh) {
+			if (
+				cached &&
+				!options.refresh &&
+				!(cached.value.status === "hit" && isTcoUrl(cached.value.finalUrl))
+			) {
 				const maxAge =
 					cached.value.status === "hit"
 						? (options.successMaxAgeMs ?? SUCCESS_CACHE_TTL_MS)

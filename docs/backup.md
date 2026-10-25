@@ -10,6 +10,7 @@ birdclaw can write the canonical SQLite store as deterministic JSONL shards that
 ## Layout
 
 ```text
+.gitattributes
 manifest.json
 data/accounts.jsonl
 data/profiles.jsonl
@@ -18,6 +19,8 @@ data/profile_snapshots.jsonl
 data/profile_bio_entities.jsonl
 data/tweets/YYYY.jsonl
 data/tweets/unknown.jsonl
+data/tweet_revisions.jsonl
+data/tweet_subordinate_tombstones.jsonl
 data/collections/likes.jsonl
 data/collections/bookmarks.jsonl
 data/dms/conversations.jsonl
@@ -28,6 +31,9 @@ data/follow_snapshots.jsonl
 data/follow_snapshot_members.jsonl
 data/follow_edges.jsonl
 data/follow_events.jsonl
+data/lists/lists.jsonl
+data/lists/members.jsonl
+data/<logical-shard>.part-NNNN.jsonl
 ```
 
 Design rules:
@@ -35,13 +41,17 @@ Design rules:
 - **tweets** are sharded by year for human browsing, partial loads, and yearly analysis
 - **DMs** are sharded by year with `conversation_id` in each row, so Git stays fast while preserving conversation membership
 - **collection-only tweets** with unknown timestamps go to `data/tweets/unknown.jsonl` instead of pretending they belong to 1970
+- **tweet tombstones and revisions** preserve explicit deletions, subordinate media/quote deletion state, and observable edit chains without re-exposing deleted or superseded rows through search
 - **likes** and **bookmarks** are stored as collection edges and mirrored into the timeline rows so existing queries keep working
 - **profiles** include bio, follower/following counts, profile URL, location, verification type, structured URL entities, and raw profile JSON so the snapshot is meaningful on its own
 - **profile affiliations** preserve X badge/highlighted-label organization edges separately from profile rows
 - **profile snapshots** preserve deduplicated profile-history states for identity evidence over time
 - **profile bio entities** preserve extracted `@handle`, domain, and company-phrase identity hints, including inactive historical values
 - **follow graph** shards preserve followers/following snapshots, snapshot members, current edges, and append-only churn events
+- **X Lists** preserve owned-List freshness/completeness metadata and current/ended member edges
 - **no SQLite WAL/SHM, FTS shadow tables, or transient live cache rows** ever land in the backup
+- **line endings** for hashed JSONL and manifest files stay LF on every platform via the generated `.gitattributes`
+- **large logical shards** split deterministically into numbered parts capped at 48 MiB, keeping every Git blob below common hosted-repository limits without Git LFS
 
 The manifest pins per-shard byte counts, row counts, and SHA hashes. Validation walks every shard and verifies they line up.
 
@@ -62,6 +72,7 @@ Flags:
 - `--no-validate` — skip post-export validation (not recommended)
 
 The `data/` directory is fully rewritten on every export. Anything outside `data/` (your README, license, hooks) is left alone.
+Logical shards at or below 48 MiB keep their existing filename. Larger shards become files such as `data/profile_snapshots.part-0001.jsonl`; import and validation accept both layouts.
 
 ## `backup sync`
 
@@ -82,7 +93,19 @@ What `sync` does:
 4. exports the local union back into deterministic text shards
 5. commits and pushes the backup repo
 
+Git operations are rooted at the configured `repoPath`. If that directory sits inside another worktree, Birdclaw initializes or uses a separate repository there instead of staging backup files into the enclosing project.
+
 This is what makes birdclaw safe across multiple machines: each machine can sync independently, and the merge step preserves rows that only one side has.
+
+Validation ignores regular files named exactly `.DS_Store` anywhere under `data/`, and Git staging excludes them from backup commits. Other unexpected files, directories, and symlinks (including symlinks named `.DS_Store`) still fail validation.
+
+### Note Tweet compatibility
+
+Note Tweets keep their complete text and matching entities in the existing schema-8 tweet fields. New exports add an optional `note_tweet_json` field so current readers can preserve the full body when a later live payload contains only a preview. The backup schema stays at 8: existing readers can still validate and import these backups.
+
+Older writers omit that optional marker when re-exporting. They retain the full text and entities, but do not provide the new protection against preview-only live updates or the expandable Note Tweet presentation. Use current Birdclaw versions on machines that refresh Note Tweets.
+
+The local SQLite database migrates to version 14 on writable startup. Prepare read-only archive deployments with a writable initialization before serving the updated application. Stop older writer processes before upgrading; all writers must use the current incremental search-index implementation. Map revision counters are derived locally and do not change the portable backup schema, which remains at 8.
 
 ## `backup import`
 
@@ -92,9 +115,15 @@ birdclaw backup import ~/Projects/birdclaw-store --json
 
 Validates the backup first (unless `--no-validate`), then merge-imports rows into local SQLite. Local-only rows are preserved by default.
 
-`--replace` restores exactly from backup and **deletes local portable rows first**. Use it when you want a known-clean state from the backup, e.g. on a new machine.
+Merge-import folds legacy profile rows with proven numeric X identities into their canonical profiles after importing all references. Current canonical handles and mutable state are preserved unless matching imported profile snapshots establish a newer state; unproven legacy rows remain separate and receive reserved handles when necessary to avoid collisions.
+
+`--restore` restores exactly from backup and **deletes local portable rows first**. Use it when you want a known-clean state from the backup, e.g. on a new machine. The older `--replace` spelling remains as a deprecated alias.
 
 The FTS5 shadow tables for tweets and DMs are rebuilt from the JSONL text after import, so search is immediately available.
+
+The portable database fingerprint is computed after the write transaction commits and streams rows in canonical order inside a read snapshot. Large first imports therefore keep bounded memory, do not hold the SQLite write lock while producing the verification hash, and remain atomically usable even while the fingerprint is being calculated.
+
+Revision topology reconciliation visits only multi-revision or explicitly edge-connected components. Canonical singleton revisions are imported directly instead of each triggering an identical recursive component query and rewrite.
 
 ## `backup validate`
 
@@ -117,20 +146,23 @@ Exits non-zero on validation failure. Run it in CI before publishing a backup, o
 
 ```json
 {
-  "backup": {
-    "repoPath": "/Users/steipete/Projects/backup-birdclaw",
-    "remote": "https://github.com/steipete/backup-birdclaw.git",
-    "autoSync": true,
-    "staleAfterSeconds": 900
-  }
+	"backup": {
+		"repoPath": "/Users/steipete/Projects/backup-birdclaw",
+		"remote": "https://github.com/steipete/backup-birdclaw.git",
+		"autoSync": true,
+		"staleAfterSeconds": 900
+	}
 }
 ```
 
 When `autoSync` is enabled:
 
-- read paths (CLI search, inbox, API status/query, web startup) pull + merge from Git **only** when the last backup check is older than `staleAfterSeconds`
+- CLI read paths pull + merge from Git before returning when the last backup check is older than `staleAfterSeconds`
+- web startup and API reads serve the current local SQLite snapshot immediately and request the stale backup check in the background
+- stale checks compare the manifest `backupHash` and skip validation/import when the already-applied backup is unchanged
+- after a changed backup import, Birdclaw reopens its read pool and requests a passive WAL checkpoint
 - data-changing commands (compose, sync, blocks, mutes, etc.) run a full backup sync afterward
-- the freshness window is per-process; nothing pings Git on every command
+- a changed import still uses synchronous SQLite work in the server process, so concurrent requests may briefly pause while that import commits; use a separate scheduled updater when strict isolation is required
 
 Set `BIRDCLAW_BACKUP_AUTO_SYNC=0` to disable auto-sync for one process — useful for local debugging.
 

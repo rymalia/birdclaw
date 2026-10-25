@@ -1,3 +1,4 @@
+import { getPreferredTransport } from "./config";
 import { Effect } from "effect";
 
 import { getNativeDb } from "./db";
@@ -5,15 +6,16 @@ import {
 	lookupProfileViaBirdEffect,
 	lookupProfilesViaBirdEffect,
 } from "./bird";
-import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
 import {
 	hydrateProfileAffiliationOrganizationsEffect,
 	type ProfileAffiliationHydrationResult,
 } from "./profile-affiliation-hydration";
+import { profileFromDbRow, profileHandleKey } from "./profile-row";
 import type { ProfileRecord, XurlMentionUser } from "./types";
 import { getExternalUserId, upsertProfileFromXUser } from "./x-profile";
-import { lookupUsersByHandles, lookupUsersByIds } from "./xurl";
+import { lookupUsersByHandlesEffect, lookupUsersByIdsEffect } from "./xurl";
 
 const PROFILE_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PROFILE_NEGATIVE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
@@ -26,17 +28,6 @@ interface CachedProfileLookup {
 	source: Exclude<ProfileLookupSource, "local" | "cache">;
 	user?: XurlMentionUser;
 	error?: string;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
 }
 
 export interface ResolveProfilesOptions {
@@ -64,43 +55,6 @@ export interface HandleProfileResolveResult {
 	error?: string;
 }
 
-function toProfile(row: Record<string, unknown>): ProfileRecord {
-	const followingCount = Number(row.following_count ?? 0);
-	let entities: Record<string, unknown> | undefined;
-	if (typeof row.entities_json === "string" && row.entities_json.length > 0) {
-		try {
-			const parsed = JSON.parse(row.entities_json) as unknown;
-			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-				entities = parsed as Record<string, unknown>;
-			}
-		} catch {
-			entities = undefined;
-		}
-	}
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count),
-		...(Number.isFinite(followingCount) ? { followingCount } : {}),
-		avatarHue: Number(row.avatar_hue),
-		avatarUrl:
-			typeof row.avatar_url === "string" ? String(row.avatar_url) : undefined,
-		...(typeof row.location === "string" && row.location.length > 0
-			? { location: row.location }
-			: {}),
-		...(typeof row.url === "string" && row.url.length > 0
-			? { url: row.url }
-			: {}),
-		...(typeof row.verified_type === "string" && row.verified_type.length > 0
-			? { verifiedType: row.verified_type }
-			: {}),
-		...(entities ? { entities } : {}),
-		createdAt: String(row.created_at),
-	};
-}
-
 function getProfile(profileId: string) {
 	const row = getNativeDb()
 		.prepare(
@@ -113,7 +67,7 @@ function getProfile(profileId: string) {
 		)
 		.get(profileId) as Record<string, unknown> | undefined;
 
-	return row ? toProfile(row) : null;
+	return row ? profileFromDbRow(row) : null;
 }
 
 function isPlaceholderProfile(profile: ProfileRecord) {
@@ -124,6 +78,7 @@ function isPlaceholderProfile(profile: ProfileRecord) {
 	return (
 		profile.handle === `id${externalUserId}` ||
 		profile.handle === `user_${externalUserId}` ||
+		profile.handle.startsWith("birdclaw_stub_") ||
 		profile.displayName === `id${externalUserId}` ||
 		profile.displayName === `user_${externalUserId}` ||
 		profile.bio === `Imported from archive user ${externalUserId}` ||
@@ -158,14 +113,9 @@ function updateConversationTitles(profile: ProfileRecord, db = getNativeDb()) {
 }
 
 function lookupViaXurlEffect(externalUserId: string) {
-	return Effect.gen(function* () {
-		const [user] = yield* tryPromise(() => lookupUsersByIds([externalUserId]));
-		return user ?? null;
-	});
-}
-
-function normalizeHandle(value: string) {
-	return value.trim().replace(/^@/, "").toLowerCase();
+	return lookupUsersByIdsEffect([externalUserId]).pipe(
+		Effect.map(([user]) => user ?? null),
+	);
 }
 
 function fetchProfileUserEffect(
@@ -173,6 +123,14 @@ function fetchProfileUserEffect(
 	xurlFallback: boolean,
 ): Effect.Effect<CachedProfileLookup, never> {
 	return Effect.gen(function* () {
+		if (xurlFallback && getPreferredTransport() === "xurl") {
+			const user = yield* lookupViaXurlEffect(externalUserId).pipe(
+				Effect.catchAll(() => Effect.succeed(null)),
+			);
+			if (user) return { status: "hit", source: "xurl", user };
+			return yield* fetchProfileUserEffect(externalUserId, false);
+		}
+
 		const birdResult = yield* lookupProfileViaBirdEffect(externalUserId).pipe(
 			Effect.map((user) => ({ ok: true as const, user })),
 			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
@@ -221,11 +179,25 @@ function fetchProfileUserEffect(
 function fetchProfileUsersEffect(
 	externalUserIds: string[],
 	xurlFallback: boolean,
-) {
+): Effect.Effect<Map<string, CachedProfileLookup>, never> {
 	return Effect.gen(function* () {
 		const uniqueIds = Array.from(new Set(externalUserIds));
 		const results = new Map<string, CachedProfileLookup>();
 		let unresolved = uniqueIds;
+
+		if (xurlFallback && getPreferredTransport() === "xurl") {
+			const users = yield* lookupUsersByIdsEffect(uniqueIds).pipe(
+				Effect.catchAll(() => Effect.succeed([])),
+			);
+			for (const user of users)
+				results.set(user.id, { status: "hit", source: "xurl", user });
+			const missing = uniqueIds.filter((id) => !results.has(id));
+			if (missing.length) {
+				const fallback = yield* fetchProfileUsersEffect(missing, false);
+				for (const [id, result] of fallback) results.set(id, result);
+			}
+			return results;
+		}
 
 		const birdResult = yield* lookupProfilesViaBirdEffect(uniqueIds).pipe(
 			Effect.map((items) => ({ ok: true as const, items })),
@@ -274,9 +246,7 @@ function fetchProfileUsersEffect(
 			return results;
 		}
 
-		const xurlResult = yield* tryPromise(() =>
-			lookupUsersByIds(unresolved),
-		).pipe(
+		const xurlResult = yield* lookupUsersByIdsEffect(unresolved).pipe(
 			Effect.map((users) => ({ ok: true as const, users })),
 			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
 		);
@@ -430,6 +400,7 @@ export function resolveProfilesForIdsEffect(
 					yield* hydrateProfileAffiliationOrganizationsEffect(
 						db,
 						resolved.profile.id,
+						{ xurlFallback },
 					);
 				yield* trySync(() => updateConversationTitles(resolved.profile, db));
 				results.push({
@@ -471,7 +442,7 @@ export function resolveProfilesForHandlesEffect(
 		const xurlFallback = options.xurlFallback ?? true;
 		const targets = Array.from(
 			new Set(
-				handles.map(normalizeHandle).filter((handle) => handle.length > 0),
+				handles.map(profileHandleKey).filter((handle) => handle.length > 0),
 			),
 		);
 		if (targets.length === 0) {
@@ -481,6 +452,34 @@ export function resolveProfilesForHandlesEffect(
 		const results = new Map<string, HandleProfileResolveResult>();
 		let unresolved = targets;
 
+		if (xurlFallback && getPreferredTransport() === "xurl") {
+			const users = yield* lookupUsersByHandlesEffect(targets).pipe(
+				Effect.catchAll(() => Effect.succeed([])),
+			);
+			for (const user of users) {
+				const handle = profileHandleKey(user.username);
+				const resolved = yield* trySync(() => {
+					const resolved = upsertProfileFromXUser(db, user);
+					updateConversationTitles(resolved.profile, db);
+					return resolved;
+				});
+				results.set(handle, {
+					handle,
+					status: "hit",
+					source: "xurl",
+					profile: resolved.profile,
+				});
+			}
+			const missing = targets.filter((handle) => !results.has(handle));
+			if (missing.length) {
+				const fallback = yield* resolveProfilesForHandlesEffect(missing, {
+					xurlFallback: false,
+				});
+				for (const result of fallback) results.set(result.handle, result);
+			}
+			return targets.map((handle) => results.get(handle)!);
+		}
+
 		const birdResult = yield* lookupProfilesViaBirdEffect(targets).pipe(
 			Effect.map((items) => ({ ok: true as const, items })),
 			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
@@ -488,7 +487,7 @@ export function resolveProfilesForHandlesEffect(
 		if (birdResult.ok) {
 			const birdResults = birdResult.items;
 			for (const item of birdResults) {
-				const handle = normalizeHandle(item.target);
+				const handle = profileHandleKey(item.target);
 				if (item.user) {
 					const resolved = yield* trySync(() => {
 						const resolved = upsertProfileFromXUser(db, item.user!);
@@ -527,9 +526,7 @@ export function resolveProfilesForHandlesEffect(
 		}
 
 		if (unresolved.length > 0 && xurlFallback) {
-			const xurlResult = yield* tryPromise(() =>
-				lookupUsersByHandles(unresolved),
-			).pipe(
+			const xurlResult = yield* lookupUsersByHandlesEffect(unresolved).pipe(
 				Effect.map((users) => ({ ok: true as const, users })),
 				Effect.catchAll((error) =>
 					Effect.succeed({ ok: false as const, error }),
@@ -539,7 +536,7 @@ export function resolveProfilesForHandlesEffect(
 				const users = xurlResult.users;
 				const usersByHandle = new Map(
 					users.map((user) => [
-						normalizeHandle(String(user.username ?? "")),
+						profileHandleKey(String(user.username ?? "")),
 						user,
 					]),
 				);

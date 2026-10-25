@@ -18,24 +18,40 @@ const mocks = vi.hoisted(() => ({
 	lookupUsersByIds: vi.fn(),
 	unblockUserViaBird: vi.fn(),
 	unblockUserViaXurl: vi.fn(),
+	getAuthenticatedBirdAccount: vi.fn(),
 }));
 
-vi.mock("./bird-actions", () => ({
-	blockUserViaBird: mocks.blockUserViaBird,
-	lookupProfileViaBird: mocks.lookupProfileViaBird,
-	readBirdStatusViaBird: mocks.readBirdStatusViaBird,
-	unblockUserViaBird: mocks.unblockUserViaBird,
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		getAuthenticatedBirdAccountEffect: fromMock(
+			mocks.getAuthenticatedBirdAccount,
+		),
+	};
+});
 
-vi.mock("./xurl", () => ({
-	blockUserViaXurl: mocks.blockUserViaXurl,
-	listBlockedUsers: mocks.listBlockedUsers,
-	lookupAuthenticatedUser: mocks.lookupAuthenticatedUser,
-	lookupAuthenticatedUserFresh: mocks.lookupAuthenticatedUser,
-	lookupUsersByHandles: mocks.lookupUsersByHandles,
-	lookupUsersByIds: mocks.lookupUsersByIds,
-	unblockUserViaXurl: mocks.unblockUserViaXurl,
-}));
+vi.mock("./bird-actions", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		blockUserViaBirdEffect: fromMock(mocks.blockUserViaBird),
+		lookupProfileViaBirdEffect: fromMock(mocks.lookupProfileViaBird),
+		readBirdStatusViaBirdEffect: fromMock(mocks.readBirdStatusViaBird),
+		unblockUserViaBirdEffect: fromMock(mocks.unblockUserViaBird),
+	};
+});
+
+vi.mock("./xurl", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		blockUserViaXurlEffect: fromMock(mocks.blockUserViaXurl),
+		listBlockedUsersEffect: fromMock(mocks.listBlockedUsers),
+		lookupAuthenticatedUserEffect: fromMock(mocks.lookupAuthenticatedUser),
+		lookupAuthenticatedUserFreshEffect: fromMock(mocks.lookupAuthenticatedUser),
+		lookupUsersByHandlesEffect: fromMock(mocks.lookupUsersByHandles),
+		lookupUsersByIdsEffect: fromMock(mocks.lookupUsersByIds),
+		unblockUserViaXurlEffect: fromMock(mocks.unblockUserViaXurl),
+	};
+});
 
 const tempRoots: string[] = [];
 
@@ -62,6 +78,7 @@ afterEach(() => {
 	mocks.lookupUsersByIds.mockReset();
 	mocks.unblockUserViaBird.mockReset();
 	mocks.unblockUserViaXurl.mockReset();
+	mocks.getAuthenticatedBirdAccount.mockReset();
 
 	for (const tempRoot of tempRoots.splice(0)) {
 		rmSync(tempRoot, { recursive: true, force: true });
@@ -76,6 +93,10 @@ describe("blocklist", () => {
 			id: "25401953",
 			username: "steipete",
 		});
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue({
+			id: "25401953",
+			username: "steipete",
+		});
 		mocks.listBlockedUsers.mockResolvedValue({ items: [], nextToken: null });
 		mocks.readBirdStatusViaBird.mockResolvedValue({
 			blocking: true,
@@ -87,7 +108,7 @@ describe("blocklist", () => {
 		});
 		mocks.blockUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "blocked via xurl",
+			output: "blocked via xurl\nverified blocking=true",
 		});
 		mocks.unblockUserViaBird.mockResolvedValue({
 			ok: true,
@@ -95,7 +116,7 @@ describe("blocklist", () => {
 		});
 		mocks.unblockUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "unblocked via xurl",
+			output: "unblocked via xurl\nverified blocking=false",
 		});
 		mocks.lookupUsersByHandles.mockResolvedValue([
 			{
@@ -525,7 +546,7 @@ describe("blocklist", () => {
 
 		expect(row).toEqual({
 			account_id: "acct_primary",
-			profile_id: "profile_amelia",
+			profile_id: "profile_user_7",
 			source: "manual",
 		});
 	});

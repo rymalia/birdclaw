@@ -4,11 +4,13 @@ import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { birdAccountForTest } from "../test/bird-account";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
-import { listTimelineItems } from "./queries";
+import { listTimelineItems } from "./timeline-read-model";
 
 const mocks = vi.hoisted(() => ({
+	getAuthenticatedBirdAccount: vi.fn(),
 	listBookmarkedTweetsViaBird: vi.fn(),
 	listHomeTimelineViaBird: vi.fn(),
 	listLikedTweetsViaBird: vi.fn(),
@@ -17,32 +19,32 @@ const mocks = vi.hoisted(() => ({
 	lookupUsersByHandles: vi.fn(),
 }));
 
-vi.mock("./bird", () => ({
-	listBookmarkedTweetsViaBird: mocks.listBookmarkedTweetsViaBird,
-	listBookmarkedTweetsViaBirdEffect: (options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.listBookmarkedTweetsViaBird(options),
-			catch: (error) => error,
-		}),
-	listHomeTimelineViaBird: mocks.listHomeTimelineViaBird,
-	listHomeTimelineViaBirdEffect: (options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.listHomeTimelineViaBird(options),
-			catch: (error) => error,
-		}),
-	listLikedTweetsViaBird: mocks.listLikedTweetsViaBird,
-	listLikedTweetsViaBirdEffect: (options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.listLikedTweetsViaBird(options),
-			catch: (error) => error,
-		}),
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return {
+		getAuthenticatedBirdAccountEffect: effectFromMock(
+			mocks.getAuthenticatedBirdAccount,
+		),
+		listBookmarkedTweetsViaBirdEffect: effectFromMock(
+			mocks.listBookmarkedTweetsViaBird,
+		),
+		listHomeTimelineViaBirdEffect: effectFromMock(
+			mocks.listHomeTimelineViaBird,
+		),
+		listLikedTweetsViaBirdEffect: effectFromMock(mocks.listLikedTweetsViaBird),
+	};
+});
 
-vi.mock("./xurl", () => ({
-	listBookmarkedTweetsViaXurl: mocks.listBookmarkedTweetsViaXurl,
-	listLikedTweetsViaXurl: mocks.listLikedTweetsViaXurl,
-	lookupUsersByHandles: mocks.lookupUsersByHandles,
-}));
+vi.mock("./xurl", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return {
+		listBookmarkedTweetsViaXurlEffect: effectFromMock(
+			mocks.listBookmarkedTweetsViaXurl,
+		),
+		listLikedTweetsViaXurlEffect: effectFromMock(mocks.listLikedTweetsViaXurl),
+		lookupUsersByHandlesEffect: effectFromMock(mocks.lookupUsersByHandles),
+	};
+});
 
 const tempRoots: string[] = [];
 
@@ -94,6 +96,10 @@ function setupTempHome() {
 	process.env.BIRDCLAW_HOME = tempRoot;
 	resetBirdclawPathsForTests();
 	resetDatabaseForTests();
+	mocks.getAuthenticatedBirdAccount.mockResolvedValue({
+		id: "25401953",
+		username: "steipete",
+	});
 }
 
 afterEach(() => {
@@ -109,6 +115,34 @@ afterEach(() => {
 });
 
 describe("live timeline collection sync", () => {
+	it("rejects a mismatched Bird account before collection persistence", async () => {
+		setupTempHome();
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue({
+			id: "999",
+			username: "wrong",
+		});
+		const before = getNativeDb()
+			.prepare("select count(*) as count from tweet_collections")
+			.get();
+		const { syncTimelineCollection } =
+			await import("./timeline-collections-live");
+
+		await expect(
+			syncTimelineCollection({
+				kind: "likes",
+				mode: "bird",
+				limit: 5,
+				refresh: true,
+			}),
+		).rejects.toThrow("refusing to sync");
+		expect(mocks.listLikedTweetsViaBird).not.toHaveBeenCalled();
+		expect(
+			getNativeDb()
+				.prepare("select count(*) as count from tweet_collections")
+				.get(),
+		).toEqual(before);
+	});
+
 	it("builds collection sync effects lazily", async () => {
 		setupTempHome();
 		const { syncTimelineCollectionEffect } =
@@ -267,18 +301,32 @@ describe("live timeline collection sync", () => {
 			.prepare(
 				`
         insert into tweets (
-          id, account_id, author_profile_id, kind, text, created_at,
-          is_replied, like_count, media_count, bookmarked, liked,
-          entities_json, media_json
-        ) values (?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 0, '{}', '[]')
-        `,
+		  id, author_profile_id, text, created_at,
+		  is_replied, like_count, media_count,
+		  entities_json, media_json
+		) values (?, ?, ?, ?, 0, 0, 0, '{}', '[]')
+		`,
 			)
 			.run(
 				"authored_liked_1",
-				"acct_primary",
 				"profile_user_42",
-				"authored",
 				"authored before likes sync",
+				"2026-04-26T13:43:34.000Z",
+			);
+		getNativeDb()
+			.prepare(
+				`
+				insert into tweet_account_edges (
+				  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+				  seen_count, source, raw_json, updated_at
+				) values (?, ?, 'authored', ?, ?, 1, 'test', '{}', ?)
+				`,
+			)
+			.run(
+				"acct_primary",
+				"authored_liked_1",
+				"2026-04-26T13:43:34.000Z",
+				"2026-04-26T13:43:34.000Z",
 				"2026-04-26T13:43:34.000Z",
 			);
 		mocks.listLikedTweetsViaXurl.mockResolvedValue({
@@ -296,8 +344,10 @@ describe("live timeline collection sync", () => {
 			refresh: true,
 		});
 		const row = getNativeDb()
-			.prepare("select kind from tweets where id = ?")
-			.get("authored_liked_1");
+			.prepare(
+				"select kind from tweet_account_edges where account_id = ? and tweet_id = ? and kind = ?",
+			)
+			.get("acct_primary", "authored_liked_1", "authored");
 
 		expect(row).toEqual({ kind: "authored" });
 	});
@@ -315,10 +365,10 @@ describe("live timeline collection sync", () => {
 			.prepare(
 				`
         insert into tweets (
-          id, account_id, author_profile_id, kind, text, created_at,
-          is_replied, like_count, media_count, bookmarked, liked,
-          entities_json, media_json
-        ) values (?, 'acct_primary', 'profile_user_42', 'like', ?, ?, 0, 0, 1, 0, 0, '{}', ?)
+		  id, author_profile_id, text, created_at,
+		  is_replied, like_count, media_count,
+		  entities_json, media_json
+		) values (?, 'profile_user_42', ?, ?, 0, 0, 1, '{}', ?)
         `,
 			)
 			.run(
@@ -425,7 +475,7 @@ describe("live timeline collection sync", () => {
 						expect.objectContaining({ id: "43" }),
 					]),
 				},
-				meta: { page_count: 2, oldest_id: "liked_2", newest_id: "liked_1" },
+				meta: { page_count: 2 },
 			},
 		});
 		expect(mocks.lookupUsersByHandles).toHaveBeenCalledWith(["steipete"]);
@@ -479,6 +529,33 @@ describe("live timeline collection sync", () => {
 		);
 	});
 
+	it("marks a resumed bookmark page as paginated for the max_results cap", async () => {
+		setupTempHome();
+		mocks.listBookmarkedTweetsViaXurl.mockResolvedValue({
+			data: [],
+			meta: {},
+		});
+		const { syncTimelineCollection } =
+			await import("./timeline-collections-live");
+
+		await syncTimelineCollection({
+			kind: "bookmarks",
+			mode: "xurl",
+			limit: 100,
+			paginationToken: "resume-page",
+			refresh: true,
+		});
+
+		expect(mocks.listBookmarkedTweetsViaXurl).toHaveBeenCalledOnce();
+		expect(mocks.listBookmarkedTweetsViaXurl).toHaveBeenCalledWith(
+			expect.objectContaining({
+				maxResults: 100,
+				isPaginatedWalk: true,
+				paginationToken: "resume-page",
+			}),
+		);
+	});
+
 	it("stops xurl collection paging when a page is fully existing rows", async () => {
 		setupTempHome();
 		insertCollectionRow({ tweetId: "liked_existing" });
@@ -486,8 +563,11 @@ describe("live timeline collection sync", () => {
 			.spyOn(console, "error")
 			.mockImplementation(() => {});
 		mocks.listLikedTweetsViaXurl.mockResolvedValue({
-			data: [makeTweet("liked_existing", "already local")],
-			includes: { users: [makeUser()] },
+			data: [makeTweet("liked_existing", "canonical payload refreshed")],
+			includes: {
+				users: [makeUser(), makeUser("43", "quoted")],
+				tweets: [makeTweet("quoted_context", "quoted context", "43")],
+			},
 			meta: { result_count: 1, next_token: "wasteful-next-page" },
 		});
 		const { syncTimelineCollection } =
@@ -506,9 +586,27 @@ describe("live timeline collection sync", () => {
 			source: "xurl",
 			count: 0,
 			saturated_at_page: 1,
-			payload: { meta: { page_count: 1, saturated_at_page: 1 } },
+			payload: {
+				data: [expect.objectContaining({ id: "liked_existing" })],
+				includes: {
+					tweets: [expect.objectContaining({ id: "quoted_context" })],
+				},
+				meta: { page_count: 1, saturated_at_page: 1, next_token: null },
+			},
 		});
 		expect(mocks.listLikedTweetsViaXurl).toHaveBeenCalledTimes(1);
+		expect(
+			getNativeDb()
+				.prepare("select text from tweets where id = ?")
+				.get("liked_existing"),
+		).toEqual({ text: "canonical payload refreshed" });
+		expect(
+			getNativeDb()
+				.prepare(
+					"select source, updated_at from tweet_collections where tweet_id = ? and kind = 'likes'",
+				)
+				.get("liked_existing"),
+		).toEqual({ source: "archive", updated_at: "2026-01-01T00:00:00.000Z" });
 		expect(consoleError).toHaveBeenCalledWith(
 			"likes saturated at page 1 (100% existing rows)",
 		);
@@ -768,6 +866,9 @@ describe("live timeline collection sync", () => {
 
 	it("keeps live saved-state scoped to the syncing account", async () => {
 		setupTempHome();
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue(
+			birdAccountForTest(getNativeDb(), "acct_studio"),
+		);
 		mocks.listLikedTweetsViaBird.mockResolvedValue({
 			data: [
 				{
@@ -816,12 +917,47 @@ describe("live timeline collection sync", () => {
 		});
 		expect(
 			getNativeDb()
-				.prepare("select account_id, liked from tweets where id = ?")
-				.get("tweet_003"),
-		).toEqual({
-			account_id: "acct_primary",
-			liked: 0,
+				.prepare(
+					"select account_id, kind from tweet_collections where tweet_id = ? order by account_id",
+				)
+				.all("tweet_003"),
+		).toEqual([{ account_id: "acct_studio", kind: "likes" }]);
+	});
+
+	it("ignores legacy raw collection cache rows after the envelope change", async () => {
+		setupTempHome();
+		getNativeDb()
+			.prepare(
+				"insert into sync_cache (cache_key, value_json, updated_at) values (?, ?, ?)",
+			)
+			.run(
+				"likes:xurl:acct_primary:5:single:all-pages",
+				JSON.stringify({
+					data: [makeTweet("legacy_cached_like")],
+					meta: { result_count: 1 },
+				}),
+				new Date().toISOString(),
+			);
+		mocks.listLikedTweetsViaXurl.mockResolvedValue({
+			data: [makeTweet("fresh_like")],
+			includes: { users: [makeUser()] },
+			meta: { result_count: 1 },
 		});
+		const { syncTimelineCollection } =
+			await import("./timeline-collections-live");
+
+		const result = await syncTimelineCollection({
+			kind: "likes",
+			mode: "xurl",
+			limit: 5,
+		});
+
+		expect(result).toMatchObject({
+			source: "xurl",
+			count: 1,
+			payload: { data: [expect.objectContaining({ id: "fresh_like" })] },
+		});
+		expect(mocks.listLikedTweetsViaXurl).toHaveBeenCalledTimes(1);
 	});
 
 	it("uses bird directly for liked collections and caches the payload", async () => {
@@ -838,6 +974,17 @@ describe("live timeline collection sync", () => {
 					},
 				},
 			],
+			includes: {
+				users: [
+					{
+						id: "99",
+						username: "birdsam",
+						name: "Bird Sam",
+						profile_image_url:
+							"https://pbs.twimg.com/profile_images/99/avatar_normal.jpg",
+					},
+				],
+			},
 			meta: { result_count: 1 },
 		});
 		const { syncTimelineCollection } =
@@ -874,6 +1021,59 @@ describe("live timeline collection sync", () => {
 			media_count: 1,
 			author_profile_id: "profile_user_99",
 		});
+		expect(
+			getNativeDb()
+				.prepare("select avatar_url from profiles where handle = ?")
+				.get("birdsam"),
+		).toEqual({
+			avatar_url: "https://pbs.twimg.com/profile_images/99/avatar.jpg",
+		});
+	});
+
+	it("keeps the head cache separate from a supplied head pagination token", async () => {
+		setupTempHome();
+		mocks.listLikedTweetsViaXurl
+			.mockResolvedValueOnce({
+				data: [makeTweet("liked_from_head")],
+				includes: { users: [makeUser()] },
+				meta: { result_count: 1 },
+			})
+			.mockResolvedValueOnce({
+				data: [makeTweet("liked_from_head_token")],
+				includes: { users: [makeUser()] },
+				meta: { result_count: 1 },
+			});
+		const { syncTimelineCollection } =
+			await import("./timeline-collections-live");
+
+		const head = await syncTimelineCollection({
+			kind: "likes",
+			mode: "xurl",
+			limit: 5,
+			refresh: true,
+			cacheTtlMs: 15_000,
+		});
+		const resumed = await syncTimelineCollection({
+			kind: "likes",
+			mode: "xurl",
+			limit: 5,
+			paginationToken: "head",
+			cacheTtlMs: 15_000,
+		});
+
+		expect(head).toMatchObject({ source: "xurl", count: 1 });
+		expect(resumed).toMatchObject({
+			source: "xurl",
+			count: 1,
+			payload: {
+				data: [expect.objectContaining({ id: "liked_from_head_token" })],
+			},
+		});
+		expect(mocks.listLikedTweetsViaXurl).toHaveBeenCalledTimes(2);
+		expect(mocks.listLikedTweetsViaXurl).toHaveBeenNthCalledWith(
+			2,
+			expect.objectContaining({ paginationToken: "head" }),
+		);
 	});
 
 	it("validates collection sync options before fetching", async () => {
@@ -886,7 +1086,7 @@ describe("live timeline collection sync", () => {
 		).rejects.toThrow("--limit must be at least 1");
 		await expect(
 			syncTimelineCollection({ kind: "likes", mode: "xurl", limit: 4 }),
-		).rejects.toThrow("xurl mode requires --limit between 5 and 100");
+		).rejects.toThrow("--limit must be between 5 and 100");
 		await expect(
 			syncTimelineCollection({
 				kind: "likes",
@@ -895,6 +1095,9 @@ describe("live timeline collection sync", () => {
 				maxPages: 0,
 			}),
 		).rejects.toThrow("--max-pages must be at least 1");
+		await expect(
+			syncTimelineCollection({ kind: "likes", mode: "invalid" as never }),
+		).rejects.toThrow("--mode");
 	});
 
 	it("does not fall back when xurl mode fails", async () => {
@@ -934,6 +1137,7 @@ describe("live timeline collection sync", () => {
 		const { syncHomeTimeline } = await import("./timeline-live");
 
 		const result = await syncHomeTimeline({
+			mode: "bird",
 			limit: 25,
 			refresh: true,
 		});
@@ -1011,6 +1215,12 @@ describe("live timeline collection sync", () => {
 		await expect(syncHomeTimeline({ limit: 0 })).rejects.toThrow(
 			"--limit must be at least 1",
 		);
+		await expect(syncHomeTimeline({ maxPages: 0 })).rejects.toThrow(
+			"--max-pages",
+		);
+		await expect(
+			syncHomeTimeline({ mode: "invalid" as never }),
+		).rejects.toThrow("--mode");
 		await expect(syncHomeTimeline({ account: "missing" })).rejects.toThrow(
 			"Unknown account: missing",
 		);

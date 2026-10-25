@@ -1,25 +1,31 @@
-import { TanStackDevtools } from "@tanstack/react-devtools";
 import {
 	createRootRoute,
 	HeadContent,
 	Scripts,
 	useRouterState,
 } from "@tanstack/react-router";
-import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools";
 import type { ReactNode } from "react";
 import { AppNav } from "#/components/AppNav";
+import { isReadOnlyArchivePage } from "#/lib/api-enums";
+import {
+	DeploymentModeProvider,
+	useDeploymentMode,
+} from "#/lib/deployment-mode";
+import { BirdclawQueryProvider } from "#/lib/query-client";
+import { loadStatusBootstrap } from "#/lib/status-bootstrap";
 import { ThemeProvider, themeScript } from "#/lib/theme";
 import {
 	bodyClass,
 	mainColumnClass,
 	mainColumnDmClass,
 	siteShellClass,
-	siteShellDmClass,
 } from "#/lib/ui";
 
 import appCss from "../styles.css?url";
+import brandMarkUrl from "virtual:birdclaw-brand?url";
 
 export const Route = createRootRoute({
+	loader: loadStatusBootstrap,
 	head: () => ({
 		meta: [
 			{
@@ -34,6 +40,7 @@ export const Route = createRootRoute({
 			},
 		],
 		links: [
+			{ rel: "icon", type: "image/png", href: brandMarkUrl },
 			{
 				rel: "stylesheet",
 				href: appCss,
@@ -53,10 +60,12 @@ function NotFoundView() {
 }
 
 function RootDocument({ children }: { children: ReactNode }) {
+	const initialStatus = Route.useLoaderData();
 	const pathname = useRouterState({
 		select: (state) => state.location.pathname,
 	});
-	const messagesMode = pathname.startsWith("/dms");
+	const wideMode =
+		pathname.startsWith("/dms") || pathname.startsWith("/network-map");
 
 	return (
 		<html lang="en" suppressHydrationWarning>
@@ -65,29 +74,41 @@ function RootDocument({ children }: { children: ReactNode }) {
 				<script suppressHydrationWarning>{themeScript}</script>
 			</head>
 			<body className={bodyClass}>
-				<ThemeProvider>
-					<div className={messagesMode ? siteShellDmClass : siteShellClass}>
-						<AppNav compact={messagesMode} />
-						<main
-							className={messagesMode ? mainColumnDmClass : mainColumnClass}
-						>
-							{children}
-						</main>
-					</div>
-				</ThemeProvider>
-				<TanStackDevtools
-					config={{
-						position: "bottom-right",
-					}}
-					plugins={[
-						{
-							name: "Tanstack Router",
-							render: <TanStackRouterDevtoolsPanel />,
-						},
-					]}
-				/>
+				<BirdclawQueryProvider initialStatus={initialStatus}>
+					<ThemeProvider>
+						<DeploymentModeProvider>
+							<div className={siteShellClass}>
+								<AppNav compact={wideMode} />
+								<main
+									className={wideMode ? mainColumnDmClass : mainColumnClass}
+								>
+									<ArchivePage pathname={pathname}>{children}</ArchivePage>
+								</main>
+							</div>
+						</DeploymentModeProvider>
+					</ThemeProvider>
+				</BirdclawQueryProvider>
 				<Scripts />
 			</body>
 		</html>
 	);
+}
+
+function ArchivePage({
+	pathname,
+	children,
+}: {
+	pathname: string;
+	children: ReactNode;
+}) {
+	const { readOnly } = useDeploymentMode();
+	if (readOnly && !isReadOnlyArchivePage(pathname)) {
+		return (
+			<p className="p-6">
+				This page is unavailable in a read-only archive deployment.{" "}
+				<a href="/">Browse the archive.</a>
+			</p>
+		);
+	}
+	return children;
 }

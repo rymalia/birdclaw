@@ -5,6 +5,9 @@ export type Database = NativeSqliteDatabase;
 type DatabaseOptions = {
 	readonly?: boolean;
 	fileMustExist?: boolean;
+	timeout?: number;
+	onStatement?: (sql: string, durationMs: number) => void;
+	onBatch?: (durationMs: number) => void;
 };
 
 type PragmaOptions = {
@@ -15,6 +18,9 @@ type RunResult = {
 	changes: number;
 	lastInsertRowid: number;
 };
+
+export const SQLITE_BUSY_TIMEOUT_MS = 30_000;
+const STATEMENT_CACHE_LIMIT = 128;
 
 function bindArgs(parameters: unknown[]) {
 	if (parameters.length === 1 && Array.isArray(parameters[0])) {
@@ -39,55 +45,87 @@ function normalizeRow(row: unknown): unknown {
 	) {
 		return normalizeValue(row);
 	}
-	return Object.fromEntries(
-		Object.entries(row as Record<string, unknown>).map(([key, value]) => [
-			key,
-			normalizeValue(value),
-		]),
-	);
+	const record = row as Record<string, unknown>;
+	for (const key of Object.keys(record)) {
+		const value = record[key];
+		if (value instanceof Uint8Array && !Buffer.isBuffer(value)) {
+			record[key] = normalizeValue(value);
+		}
+	}
+	return Object.setPrototypeOf(record, Object.prototype);
 }
 
 class NativeSqliteStatement {
-	readonly reader: boolean;
+	constructor(
+		private readonly statement: StatementSync,
+		private readonly sql: string,
+		private readonly prepareIterator: () => StatementSync,
+		private readonly onStatement?: (sql: string, durationMs: number) => void,
+	) {}
 
-	constructor(private readonly statement: StatementSync) {
-		this.reader = statement.columns().length > 0;
+	private track<T>(operation: () => T) {
+		const startedAt = performance.now();
+		try {
+			return operation();
+		} finally {
+			this.onStatement?.(this.sql, performance.now() - startedAt);
+		}
 	}
 
 	all(...parameters: unknown[]): unknown[] {
-		return this.statement.all(...bindArgs(parameters)).map(normalizeRow);
+		return this.track(() =>
+			this.statement.all(...bindArgs(parameters)).map(normalizeRow),
+		);
 	}
 
 	get(...parameters: unknown[]): unknown {
-		return normalizeRow(this.statement.get(...bindArgs(parameters)));
+		return this.track(() =>
+			normalizeRow(this.statement.get(...bindArgs(parameters))),
+		);
 	}
 
 	run(...parameters: unknown[]): RunResult {
-		const result = this.statement.run(...bindArgs(parameters));
-		return {
-			changes: Number(result.changes),
-			lastInsertRowid: Number(result.lastInsertRowid),
-		};
+		return this.track(() => {
+			const result = this.statement.run(...bindArgs(parameters));
+			return {
+				changes: Number(result.changes),
+				lastInsertRowid: Number(result.lastInsertRowid),
+			};
+		});
 	}
 
 	iterate(...parameters: unknown[]): IterableIterator<unknown> {
-		const rows = this.statement.iterate(...bindArgs(parameters));
+		// Iterators own their native cursor so nested reads cannot reset it.
+		const rows = this.prepareIterator().iterate(...bindArgs(parameters));
+		const startedAt = performance.now();
+		const onStatement = this.onStatement;
+		const sql = this.sql;
 		return (function* () {
-			for (const row of rows) {
-				yield normalizeRow(row);
+			try {
+				for (const row of rows) {
+					yield normalizeRow(row);
+				}
+			} finally {
+				onStatement?.(sql, performance.now() - startedAt);
 			}
 		})();
 	}
 }
 
 export class NativeSqliteDatabase {
+	readonly writeIdentity: string | object;
 	private transactionDepth = 0;
 	private readonly db: DatabaseSync;
+	private readonly statements = new Map<string, StatementSync>();
 
-	constructor(path: string, options: DatabaseOptions = {}) {
+	constructor(
+		path: string,
+		private readonly options: DatabaseOptions = {},
+	) {
+		this.writeIdentity = path === ":memory:" ? this : path;
 		this.db = new DatabaseSync(path, {
 			readOnly: options.readonly,
-			timeout: 5000,
+			timeout: options.timeout ?? SQLITE_BUSY_TIMEOUT_MS,
 		});
 	}
 
@@ -95,11 +133,21 @@ export class NativeSqliteDatabase {
 		if (!this.db.isOpen) {
 			return;
 		}
+		this.statements.clear();
 		this.db.close();
 	}
 
 	exec(sql: string): void {
-		this.db.exec(sql);
+		if (!this.options.onBatch) {
+			this.db.exec(sql);
+			return;
+		}
+		const startedAt = performance.now();
+		try {
+			this.db.exec(sql);
+		} finally {
+			this.options.onBatch(performance.now() - startedAt);
+		}
 	}
 
 	pragma(sql: string, options: PragmaOptions = {}): unknown {
@@ -114,16 +162,32 @@ export class NativeSqliteDatabase {
 	}
 
 	prepare(sql: string): NativeSqliteStatement {
-		return new NativeSqliteStatement(this.db.prepare(sql));
+		let statement = this.statements.get(sql);
+		if (statement) {
+			this.statements.delete(sql);
+		} else {
+			statement = this.db.prepare(sql);
+			if (this.statements.size >= STATEMENT_CACHE_LIMIT) {
+				this.statements.delete(this.statements.keys().next().value!);
+			}
+		}
+		this.statements.set(sql, statement);
+		return new NativeSqliteStatement(
+			statement,
+			sql,
+			() => this.db.prepare(sql),
+			this.options.onStatement,
+		);
 	}
 
-	transaction<TArgs extends unknown[], TResult>(
+	private wrapTransaction<TArgs extends unknown[], TResult>(
 		fn: (...args: TArgs) => TResult,
+		begin: "begin" | "begin immediate",
 	): (...args: TArgs) => TResult {
 		return (...args: TArgs) => {
 			const nested = this.db.isTransaction;
 			const savepoint = `__birdclaw_tx_${++this.transactionDepth}`;
-			this.exec(nested ? `savepoint ${savepoint}` : "begin");
+			this.exec(nested ? `savepoint ${savepoint}` : begin);
 			try {
 				const result = fn(...args);
 				this.exec(nested ? `release ${savepoint}` : "commit");
@@ -138,6 +202,18 @@ export class NativeSqliteDatabase {
 				throw error;
 			}
 		};
+	}
+
+	transaction<TArgs extends unknown[], TResult>(
+		fn: (...args: TArgs) => TResult,
+	): (...args: TArgs) => TResult {
+		return this.wrapTransaction(fn, "begin immediate");
+	}
+
+	readTransaction<TArgs extends unknown[], TResult>(
+		fn: (...args: TArgs) => TResult,
+	): (...args: TArgs) => TResult {
+		return this.wrapTransaction(fn, "begin");
 	}
 }
 

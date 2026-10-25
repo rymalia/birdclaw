@@ -1,24 +1,35 @@
 import type { Database } from "./sqlite";
 import { Effect } from "effect";
 import { listThreadViaBirdEffect } from "./bird";
+import { defaultLiveSyncMode } from "./config";
+import { databaseWriteEffect } from "./database-writer";
 import { getNativeDb } from "./db";
-import { runEffectPromise } from "./effect-runtime";
-import { buildMediaJsonFromIncludes, countTweetMedia } from "./media-includes";
+import { runEffectPromise, trySync } from "./effect-runtime";
+import {
+	parseLiveSyncMode,
+	createLiveTransportAdapter,
+	fetchWithTransportFallbackEffect,
+	parseOptionalMaxPages,
+	resolveLiveSyncAccount,
+} from "./live-sync-engine";
+import { runSyncPlanEffect } from "./sync-plan";
 import type {
 	XurlMentionData,
 	XurlMentionsResponse,
-	XurlMentionUser,
-	XurlMediaItem,
 	XurlTweetsResponse,
 } from "./types";
-import { upsertTweetAccountEdge } from "./tweet-account-edges";
-import { ensureStubProfileForXUser, upsertProfileFromXUser } from "./x-profile";
+import {
+	type TweetAccountEdgeKind,
+	upsertTweetAccountEdge,
+} from "./tweet-account-edges";
+import { ingestTweetPayload } from "./tweet-repository";
+import { mergeTweetPages } from "./tweet-page";
 import { getTweetByIdEffect, searchRecentByConversationIdEffect } from "./xurl";
 
 const DEFAULT_LIMIT = 30;
 const DEFAULT_DELAY_MS = 1500;
 const DEFAULT_TIMEOUT_MS = 15_000;
-const DEFAULT_MODE = "bird";
+const DEFAULT_MODE = "xurl";
 const DEFAULT_FALLBACK_DEPTH = 12;
 const MAX_XURL_SEARCH_RESULTS = 100;
 
@@ -58,40 +69,22 @@ interface ThreadFetchResult {
 	warnings: string[];
 }
 
-function assertPositiveInteger(value: number, name: string) {
-	if (!Number.isFinite(value) || value < 1) {
+function positiveInteger(value: number, name: string) {
+	if (!Number.isInteger(value) || value < 1) {
 		throw new Error(`${name} must be at least 1`);
 	}
-	return Math.floor(value);
+	return value;
 }
 
-function parseNonNegativeInteger(value: number | undefined, name: string) {
-	if (value === undefined) {
-		return undefined;
+function nonNegativeInteger(value: number, name: string) {
+	if (!Number.isInteger(value) || value < 0) {
+		throw new Error(`${name} must be a non-negative integer`);
 	}
-	if (!Number.isFinite(value) || value < 0) {
-		throw new Error(`${name} must be non-negative`);
-	}
-	return Math.floor(value);
+	return value;
 }
 
-function parseMode(value: string | undefined): MentionThreadsMode {
-	const mode = value ?? DEFAULT_MODE;
-	if (mode !== "bird" && mode !== "xurl") {
-		throw new Error("--mode must be bird or xurl");
-	}
-	return mode;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
+function parseMode(value: string | undefined) {
+	return parseLiveSyncMode(value, defaultLiveSyncMode(DEFAULT_MODE));
 }
 
 function getRemainingThreadTimeoutMs(
@@ -106,97 +99,9 @@ function getRemainingThreadTimeoutMs(
 	}
 	return remainingMs;
 }
-function replaceTweetFts(db: Database, tweetId: string, text: string) {
-	db.prepare("delete from tweets_fts where tweet_id = ?").run(tweetId);
-	db.prepare("insert into tweets_fts (tweet_id, text) values (?, ?)").run(
-		tweetId,
-		text,
-	);
-}
-
-function resolveAccount(db: Database, accountId?: string) {
-	const row = accountId
-		? (db
-				.prepare("select id, handle from accounts where id = ?")
-				.get(accountId) as { id: string; handle: string } | undefined)
-		: (db
-				.prepare(
-					`
-          select id, handle
-          from accounts
-          order by is_default desc, created_at asc
-          limit 1
-          `,
-				)
-				.get() as { id: string; handle: string } | undefined);
-
-	if (!row) {
-		throw new Error(`Unknown account: ${accountId ?? "default"}`);
-	}
-
-	return {
-		accountId: row.id,
-		handle: row.handle.replace(/^@/, "").toLowerCase(),
-	};
-}
-
 function getReplyToId(tweet: XurlMentionData) {
 	return tweet.referenced_tweets?.find((entry) => entry.type === "replied_to")
 		?.id;
-}
-
-function mergePayloads(pages: XurlTweetsResponse[]): XurlMentionsResponse {
-	const tweets: XurlMentionData[] = [];
-	const seenTweetIds = new Set<string>();
-	const users: XurlMentionUser[] = [];
-	const seenUserIds = new Set<string>();
-	const media: XurlMediaItem[] = [];
-	const seenMediaKeys = new Set<string>();
-
-	for (const page of pages) {
-		for (const tweet of page.data) {
-			if (seenTweetIds.has(tweet.id)) {
-				continue;
-			}
-			seenTweetIds.add(tweet.id);
-			tweets.push(tweet);
-		}
-
-		for (const user of page.includes?.users ?? []) {
-			if (seenUserIds.has(user.id)) {
-				continue;
-			}
-			seenUserIds.add(user.id);
-			users.push(user);
-		}
-
-		for (const item of page.includes?.media ?? []) {
-			if (seenMediaKeys.has(item.media_key)) {
-				continue;
-			}
-			seenMediaKeys.add(item.media_key);
-			media.push(item);
-		}
-	}
-
-	const lastMeta = pages.at(-1)?.meta;
-	return {
-		data: tweets,
-		includes:
-			users.length > 0 || media.length > 0
-				? {
-						...(users.length > 0 ? { users } : {}),
-						...(media.length > 0 ? { media } : {}),
-					}
-				: undefined,
-		meta: {
-			...lastMeta,
-			result_count: tweets.length,
-			page_count: pages.length,
-			next_token:
-				typeof lastMeta?.next_token === "string" ? lastMeta.next_token : null,
-		},
-	};
 }
 
 function parseRawTweet(value: string | null | undefined) {
@@ -232,22 +137,9 @@ function listRecentMentions(
           edge.raw_json as rawJson
         from tweet_account_edges edge
         join tweets t on t.id = edge.tweet_id
-        where edge.kind = 'mention' and edge.account_id = ?
-        union all
-        select
-          t.id,
-          t.created_at as createdAt,
-          t.reply_to_id as replyToId,
-          '{}' as rawJson
-        from tweets t
-        where t.kind = 'mention' and t.account_id = ?
-          and not exists (
-            select 1
-            from tweet_account_edges edge
-            where edge.account_id = t.account_id
-              and edge.tweet_id = t.id
-              and edge.kind = 'mention'
-          )
+		where edge.kind = 'mention' and edge.account_id = ?
+		  and t.deleted_at is null
+		  and t.superseded_at is null
       )
       select id, createdAt, replyToId, rawJson
       from local_mentions
@@ -255,7 +147,7 @@ function listRecentMentions(
       limit ?
       `,
 		)
-		.all(accountId, accountId, limit) as Array<{
+		.all(accountId, limit) as Array<{
 		id: string;
 		createdAt: string;
 		replyToId: string | null;
@@ -298,20 +190,18 @@ function listMentionsByIds(
         t.reply_to_id as replyToId,
         coalesce(edge.raw_json, '{}') as rawJson
       from tweets t
-      left join tweet_account_edges edge
+		join tweet_account_edges edge
         on edge.tweet_id = t.id
         and edge.account_id = ?
         and edge.kind = 'mention'
       where t.id in (${placeholders})
-        and (
-          edge.tweet_id is not null
-          or (t.kind = 'mention' and t.account_id = ?)
-        )
+		and t.deleted_at is null
+		and t.superseded_at is null
       order by t.created_at desc
       limit ?
       `,
 		)
-		.all(accountId, ...ids, accountId, limit) as Array<{
+		.all(accountId, ...ids, limit) as Array<{
 		id: string;
 		createdAt: string;
 		replyToId: string | null;
@@ -353,84 +243,45 @@ function mergeMentionThreadIntoLocalStore({
 	const usersById = new Map(
 		(payload.includes?.users ?? []).map((user) => [user.id, user]),
 	);
-	const upsertTweet = db.prepare(
-		`
-    insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, null)
-    on conflict(id) do update set
-      account_id = excluded.account_id,
-      author_profile_id = excluded.author_profile_id,
-      kind = case
-        when tweets.kind in ('authored', 'home', 'mention') then tweets.kind
-        when excluded.kind in ('authored', 'home', 'mention') then excluded.kind
-        else coalesce(nullif(tweets.kind, ''), excluded.kind)
-      end,
-      text = excluded.text,
-      created_at = excluded.created_at,
-      is_replied = max(tweets.is_replied, excluded.is_replied),
-      reply_to_id = coalesce(excluded.reply_to_id, tweets.reply_to_id),
-      like_count = excluded.like_count,
-      media_count = max(tweets.media_count, excluded.media_count),
-      entities_json = excluded.entities_json,
-      media_json = case
-        when excluded.media_json not in ('', '[]', 'null') then excluded.media_json
-        else tweets.media_json
-      end,
-      bookmarked = tweets.bookmarked,
-      liked = tweets.liked
-    `,
-	);
-
-	db.transaction(() => {
-		const seenAt = new Date().toISOString();
-		for (const tweet of payload.data) {
-			const author =
-				usersById.get(tweet.author_id) ??
-				({
-					id: tweet.author_id,
-					username: `user_${tweet.author_id}`,
-					name: `user_${tweet.author_id}`,
-				} as const);
-			const profile = usersById.has(tweet.author_id)
-				? upsertProfileFromXUser(db, author)
-				: ensureStubProfileForXUser(db, tweet.author_id);
-			const handle = author.username.toLowerCase();
-			const kind = mentionIds.has(tweet.id)
-				? "mention"
-				: handle === accountHandle
-					? "home"
-					: "thread";
-			const replyToId = getReplyToId(tweet);
-			upsertTweet.run(
-				tweet.id,
-				accountId,
-				profile.profile.id,
-				kind,
-				tweet.text,
-				tweet.created_at,
-				replyToId ? 1 : 0,
-				replyToId ?? null,
-				Number(tweet.public_metrics?.like_count ?? 0),
-				countTweetMedia(tweet),
-				JSON.stringify(tweet.entities ?? {}),
-				buildMediaJsonFromIncludes(tweet, payload.includes?.media),
-			);
-			if (writeThreadContextEdges) {
+	const groups = new Map<"mention" | "home" | "thread", typeof payload.data>([
+		["mention", []],
+		["home", []],
+		["thread", []],
+	]);
+	for (const tweet of payload.data) {
+		const handle = usersById.get(tweet.author_id)?.username.toLowerCase();
+		const kind = mentionIds.has(tweet.id)
+			? "mention"
+			: handle === accountHandle
+				? "home"
+				: "thread";
+		groups.get(kind)?.push(tweet);
+	}
+	for (const [kind, data] of groups) {
+		if (data.length === 0) continue;
+		const classificationEdge: TweetAccountEdgeKind =
+			kind === "thread" ? "thread_context" : kind;
+		ingestTweetPayload(db, {
+			accountId,
+			payload: { ...payload, data },
+			edgeKind: classificationEdge,
+			markRepliesAsReplied: true,
+			source,
+		});
+		if (writeThreadContextEdges && classificationEdge !== "thread_context") {
+			const observedAt = new Date().toISOString();
+			for (const tweet of data) {
 				upsertTweetAccountEdge(db, {
 					accountId,
 					tweetId: tweet.id,
 					kind: "thread_context",
 					source,
-					seenAt,
+					seenAt: observedAt,
 					rawJson: JSON.stringify(tweet),
 				});
 			}
-			replaceTweetFts(db, tweet.id, tweet.text);
 		}
-	})();
+	}
 }
 
 function fetchConversationViaRecentSearchEffect({
@@ -447,39 +298,29 @@ function fetchConversationViaRecentSearchEffect({
 	deadlineMs: number;
 }) {
 	return Effect.gen(function* () {
-		const pages: XurlTweetsResponse[] = [];
-		let nextToken: string | undefined;
-		let pageCount = 0;
-
-		do {
-			const payload = yield* searchRecentByConversationIdEffect(
-				conversationId,
-				{
-					maxResults: MAX_XURL_SEARCH_RESULTS,
-					paginationToken: nextToken,
-					timeoutMs: yield* trySync(() =>
-						getRemainingThreadTimeoutMs(deadlineMs, timeoutMs),
+		const result = yield* runSyncPlanEffect({
+			fetchPage: ({ cursor }) =>
+				trySync(() => getRemainingThreadTimeoutMs(deadlineMs, timeoutMs)).pipe(
+					Effect.flatMap((remainingTimeoutMs) =>
+						searchRecentByConversationIdEffect(conversationId, {
+							maxResults: MAX_XURL_SEARCH_RESULTS,
+							paginationToken: cursor,
+							timeoutMs: remainingTimeoutMs,
+						}),
 					),
-				},
-			);
-			pages.push(payload);
-			nextToken =
-				typeof payload.meta?.next_token === "string"
-					? payload.meta.next_token
-					: undefined;
-			pageCount += 1;
-		} while (
-			(all || maxPages !== undefined) &&
-			nextToken &&
-			(maxPages === undefined || pageCount < maxPages)
-		);
-
-		const payload = mergePayloads(pages);
+				),
+			getNextCursor: (page) =>
+				typeof page.meta?.next_token === "string"
+					? page.meta.next_token
+					: undefined,
+			maxPages: all || maxPages !== undefined ? maxPages : 1,
+		});
+		const payload = mergeTweetPages(result.pages);
 		const paginationRequested = all || maxPages !== undefined;
 		return {
 			payload,
-			pages: pageCount,
-			truncated: paginationRequested && Boolean(nextToken),
+			pages: result.pages.length,
+			truncated: paginationRequested && Boolean(result.nextCursor),
 			generalReadTweets: payload.data.length,
 		};
 	});
@@ -564,7 +405,7 @@ function fetchParentChainViaXurlEffect({
 				: undefined;
 		}
 
-		const payload = mergePayloads(pages);
+		const payload = mergeTweetPages(pages);
 		return {
 			payload,
 			fallbackDepth,
@@ -677,7 +518,7 @@ function fetchThreadContextViaXurlEffect({
 					strategy: "conversation_search+parent_walk" as const,
 					pages: search.pages,
 					truncated: search.truncated,
-					payload: mergePayloads([search.payload, fallback.payload]),
+					payload: mergeTweetPages([search.payload, fallback.payload]),
 					fallbackDepth: fallback.fallbackDepth,
 					generalReadTweets:
 						search.generalReadTweets + fallback.generalReadTweets,
@@ -718,7 +559,7 @@ function fetchThreadContextViaXurlEffect({
 
 export function syncMentionThreadsEffect({
 	account,
-	mode = DEFAULT_MODE,
+	mode,
 	limit = DEFAULT_LIMIT,
 	tweetIds,
 	delayMs = DEFAULT_DELAY_MS,
@@ -729,20 +570,20 @@ export function syncMentionThreadsEffect({
 }: SyncMentionThreadsOptions) {
 	return Effect.gen(function* () {
 		const parsedMode = yield* trySync(() => parseMode(mode));
-		const parsedLimit = yield* trySync(() =>
-			assertPositiveInteger(limit, "--limit"),
+		const parsedLimit = yield* trySync(() => positiveInteger(limit, "--limit"));
+		const parsedDelayMs = yield* trySync(() =>
+			nonNegativeInteger(delayMs, "--delay-ms"),
 		);
-		const parsedDelayMs =
-			(yield* trySync(() => parseNonNegativeInteger(delayMs, "--delay-ms"))) ??
-			0;
 		const parsedTimeoutMs = yield* trySync(() =>
-			assertPositiveInteger(timeoutMs, "--timeout-ms"),
+			positiveInteger(timeoutMs, "--timeout-ms"),
 		);
 		const parsedMaxPages = yield* trySync(() =>
-			parseNonNegativeInteger(maxPages, "--max-pages"),
+			parseOptionalMaxPages(maxPages, { allowZero: true }),
 		);
 		const db = yield* trySync(() => getNativeDb());
-		const resolvedAccount = yield* trySync(() => resolveAccount(db, account));
+		const resolvedAccount = yield* trySync(() =>
+			resolveLiveSyncAccount(db, account),
+		);
 		const mentions = yield* trySync(() =>
 			tweetIds
 				? listMentionsByIds(
@@ -771,47 +612,56 @@ export function syncMentionThreadsEffect({
 		let generalReadTweets = 0;
 		const uniqueTweetIds = new Set<string>();
 		const warnings: string[] = [];
+		const sources = new Set<MentionThreadsMode>();
 
 		for (const [index, mention] of mentions.entries()) {
 			if (index > 0 && parsedDelayMs > 0) {
 				yield* Effect.sleep(parsedDelayMs);
 			}
-			const fetchEffect: Effect.Effect<ThreadFetchResult, unknown, never> =
+			const birdFetch = listThreadViaBirdEffect({
+				tweetId: mention.id,
+				all,
+				maxPages: parsedMaxPages,
+				timeoutMs: parsedTimeoutMs,
+			}).pipe(
+				Effect.map((payload): ThreadFetchResult => ({
+					strategy: "bird",
+					payload,
+					generalReadTweets: 0,
+					truncated: Boolean(payload.meta?.next_token),
+					warnings: [],
+				})),
+			);
+			const xurlFetch = fetchThreadContextViaXurlEffect({
+				mention,
+				all,
+				maxPages: parsedMaxPages,
+				maxFallbackDepth: DEFAULT_FALLBACK_DEPTH,
+				timeoutMs: parsedTimeoutMs,
+			});
+			const adapters =
 				parsedMode === "bird"
-					? listThreadViaBirdEffect({
-							tweetId: mention.id,
-							all,
-							maxPages: parsedMaxPages,
-							timeoutMs: parsedTimeoutMs,
-						}).pipe(
-							Effect.map((payload) => ({
-								strategy: "bird" as const,
-								payload,
-								pages: undefined,
-								fallbackDepth: undefined,
-								generalReadTweets: 0,
-								truncated: undefined,
-								warnings: [] as string[],
-							})),
-						)
-					: fetchThreadContextViaXurlEffect({
-							mention,
-							all,
-							maxPages: parsedMaxPages,
-							maxFallbackDepth: DEFAULT_FALLBACK_DEPTH,
-							timeoutMs: parsedTimeoutMs,
-						});
+					? [createLiveTransportAdapter("bird", birdFetch)]
+					: parsedMode === "xurl"
+						? [createLiveTransportAdapter("xurl", xurlFetch)]
+						: [
+								createLiveTransportAdapter("xurl", xurlFetch),
+								createLiveTransportAdapter("bird", birdFetch),
+							];
+			const fetchEffect = fetchWithTransportFallbackEffect(adapters).pipe(
+				Effect.map(({ source, payload }) => ({ ...payload, source })),
+			);
 			const fetched = yield* fetchEffect.pipe(
 				Effect.flatMap((fetchResult) =>
-					trySync(() =>
+					databaseWriteEffect((writeDb) =>
 						mergeMentionThreadIntoLocalStore({
-							db,
+							db: writeDb,
 							accountId: resolvedAccount.accountId,
-							accountHandle: resolvedAccount.handle,
+							accountHandle: resolvedAccount.username.toLowerCase(),
 							mentionIds: mentionIdSet,
 							payload: fetchResult.payload,
-							source: parsedMode,
-							writeThreadContextEdges: parsedMode === "xurl",
+							source: fetchResult.source,
+							writeThreadContextEdges: fetchResult.source === "xurl",
 						}),
 					).pipe(Effect.as(fetchResult)),
 				),
@@ -835,7 +685,7 @@ export function syncMentionThreadsEffect({
 				});
 				yield* Effect.sync(() =>
 					onProgress?.({
-						source: parsedMode,
+						source: parsedMode === "bird" ? "bird" : "xurl",
 						processed: index + 1,
 						total: mentions.length,
 						fetched: uniqueTweetIds.size,
@@ -846,6 +696,7 @@ export function syncMentionThreadsEffect({
 			}
 
 			const { fetchResult } = fetched;
+			sources.add(fetchResult.source);
 			const { payload } = fetchResult;
 			for (const tweet of payload.data) {
 				uniqueTweetIds.add(tweet.id);
@@ -867,7 +718,7 @@ export function syncMentionThreadsEffect({
 			});
 			yield* Effect.sync(() =>
 				onProgress?.({
-					source: parsedMode,
+					source: fetchResult.source,
 					processed: index + 1,
 					total: mentions.length,
 					fetched: uniqueTweetIds.size,
@@ -883,7 +734,11 @@ export function syncMentionThreadsEffect({
 		const partial = results.some((item) => item.truncated === true);
 		return {
 			ok: true,
-			source: parsedMode,
+			source:
+				sources.size > 1
+					? "bird+xurl"
+					: (sources.values().next().value ??
+						(parsedMode === "bird" ? "bird" : "xurl")),
 			accountId: resolvedAccount.accountId,
 			mentions: mentionIds.length,
 			threads: results.length,
@@ -892,7 +747,7 @@ export function syncMentionThreadsEffect({
 			failed: failures.length,
 			mergedTweets,
 			uniqueTweets: uniqueTweetIds.size,
-			generalReadTweets: parsedMode === "xurl" ? generalReadTweets : 0,
+			generalReadTweets,
 			partial,
 			options: {
 				mode: parsedMode,

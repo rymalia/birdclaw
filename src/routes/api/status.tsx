@@ -1,12 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Effect } from "effect";
-import { maybeAutoUpdateBackupEffect } from "#/lib/backup";
+import { queryEnvelopeSchema } from "#/lib/api-contracts";
+import { requestBackupAutoUpdate } from "#/lib/backup";
 import {
 	jsonResponse,
 	runRouteEffect,
 	sensitiveRequestErrorResponse,
 } from "#/lib/http-effect";
-import { getQueryEnvelopeEffect } from "#/lib/queries";
+import { getQueryEnvelopeEffect } from "#/lib/query-status";
 
 export const Route = createFileRoute("/api/status")({
 	server: {
@@ -17,8 +18,11 @@ export const Route = createFileRoute("/api/status")({
 						const denied = sensitiveRequestErrorResponse(request);
 						if (denied) return denied;
 
-						yield* maybeAutoUpdateBackupEffect();
-						return jsonResponse(yield* getQueryEnvelopeEffect());
+						requestBackupAutoUpdate();
+						const envelope = yield* getQueryEnvelopeEffect({
+							includeArchives: false,
+						});
+						return jsonResponse(queryEnvelopeSchema.parse(envelope));
 					}),
 				),
 		},

@@ -5,13 +5,16 @@ import net from "node:net";
 import { Readable } from "node:stream";
 import { createBrotliDecompress, createGunzip, createInflate } from "node:zlib";
 import { Effect } from "effect";
+import type { LinkPreviewResponse } from "./api-contracts";
 import { getNativeDb } from "./db";
+import { isReadOnlyDeployment } from "./config";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
 import type { Database } from "./sqlite";
 import {
 	__test__ as urlSafetyTest,
 	assertSafePreviewUrl,
 	isBlockedAddress,
+	isTcoUrl,
 } from "./url-safety";
 import {
 	normalizeUrlExpansionForIndex,
@@ -23,14 +26,7 @@ const MAX_HTML_CHARS = 2_000_000;
 const MAX_REDIRECTS = 4;
 const NO_BODY_STATUS_CODES = new Set([204, 205, 304]);
 
-export interface LinkPreviewMetadata {
-	url: string;
-	title: string | null;
-	description: string | null;
-	imageUrl: string | null;
-	siteName: string | null;
-	error?: string | null;
-}
+export type LinkPreviewMetadata = LinkPreviewResponse["preview"];
 
 export interface GetLinkPreviewOptions {
 	shortUrl?: string | null;
@@ -161,19 +157,6 @@ function stripAddressBrackets(value: string) {
 	return value.replace(/^\[|\]$/g, "");
 }
 
-function withTimeout<T>(promise: Promise<T>, ms: number) {
-	let timer: NodeJS.Timeout | null = null;
-	const timeout = new Promise<never>((_resolve, reject) => {
-		timer = setTimeout(
-			() => reject(new Error("Link preview request timed out")),
-			ms,
-		);
-	});
-	return Promise.race([promise, timeout]).finally(() => {
-		if (timer) clearTimeout(timer);
-	});
-}
-
 export async function resolvePublicAddresses(
 	hostname: string,
 ): Promise<string[]> {
@@ -192,26 +175,39 @@ function validateResolvedAddresses(addresses: string[]) {
 	}
 }
 
-async function resolveSafeAddresses(
-	hostname: string,
-	resolveHost: (hostname: string) => Promise<string[]>,
-	timeoutMs: number,
-): Promise<ResolvedAddress[]> {
-	const normalizedHostname = stripAddressBrackets(hostname);
-	const addresses = await withTimeout(
-		resolveHost(normalizedHostname),
-		timeoutMs,
-	);
-	validateResolvedAddresses(addresses);
-	return addresses.map((address) => {
-		const normalized = stripAddressBrackets(address);
-		const family = net.isIP(normalized);
-		if (family !== 4 && family !== 6) {
-			throw new Error("Link preview host resolved to an invalid address");
-		}
-		return { address: normalized, family };
-	});
-}
+const resolveSafeAddressesEffect = Effect.fn(
+	"linkPreview.resolveSafeAddresses",
+)(
+	(
+		hostname: string,
+		resolveHost: (hostname: string) => Promise<string[]>,
+		timeoutMs: number,
+	) =>
+		tryPromise(() => resolveHost(stripAddressBrackets(hostname))).pipe(
+			Effect.timeoutFail({
+				duration: timeoutMs,
+				onTimeout: () => new Error("Link preview request timed out"),
+			}),
+			Effect.flatMap((addresses) =>
+				Effect.try({
+					try: (): ResolvedAddress[] => {
+						validateResolvedAddresses(addresses);
+						return addresses.map((address) => {
+							const normalized = stripAddressBrackets(address);
+							const family = net.isIP(normalized);
+							if (family !== 4 && family !== 6) {
+								throw new Error(
+									"Link preview host resolved to an invalid address",
+								);
+							}
+							return { address: normalized, family };
+						});
+					},
+					catch: (error) => error,
+				}),
+			),
+		),
+);
 
 function headersFromIncoming(headers: http.IncomingHttpHeaders): HeadersInit {
 	const result = new Headers();
@@ -225,7 +221,7 @@ function headersFromIncoming(headers: http.IncomingHttpHeaders): HeadersInit {
 	return result;
 }
 
-function decodedResponseBody(response: Response) {
+export function decodedResponseBody(response: Response) {
 	const body = response.body;
 	if (!body) return null;
 	const encoding = response.headers
@@ -376,31 +372,31 @@ function nodeSafeFetch(
 	);
 }
 
-export function safePreviewFetchEffect(
-	url: string,
-	options: Pick<
-		GetLinkPreviewOptions,
-		"fetchImpl" | "method" | "resolveHost" | "timeoutMs"
-	>,
-) {
-	const resolveHost =
-		options.resolveHost ??
-		(options.fetchImpl
-			? null
-			: (hostname: string) => resolvePublicAddresses(hostname));
-	const timeoutMs = options.timeoutMs ?? FETCH_TIMEOUT_MS;
-	const method = options.method ?? "GET";
-	const deadline = Date.now() + timeoutMs;
-	const remainingTimeoutMs = () => Math.max(1, deadline - Date.now());
-	const headers: Record<string, string> = {
-		"user-agent":
-			"Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 birdclaw/0.4",
-		accept:
-			"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-		"accept-language": "en-US,en;q=0.9",
-	};
+export const safePreviewFetchEffect = Effect.fn("linkPreview.safePreviewFetch")(
+	function* (
+		url: string,
+		options: Pick<
+			GetLinkPreviewOptions,
+			"fetchImpl" | "method" | "resolveHost" | "timeoutMs"
+		>,
+	) {
+		const resolveHost =
+			options.resolveHost ??
+			(options.fetchImpl
+				? null
+				: (hostname: string) => resolvePublicAddresses(hostname));
+		const timeoutMs = options.timeoutMs ?? FETCH_TIMEOUT_MS;
+		const method = options.method ?? "GET";
+		const deadline = Date.now() + timeoutMs;
+		const remainingTimeoutMs = () => Math.max(1, deadline - Date.now());
+		const headers: Record<string, string> = {
+			"user-agent":
+				"Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 birdclaw/0.4",
+			accept:
+				"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+			"accept-language": "en-US,en;q=0.9",
+		};
 
-	return Effect.gen(function* () {
 		if (options.fetchImpl && !isInjectedFetchAllowed()) {
 			return yield* Effect.fail(
 				new Error("Custom link preview fetch is only available in tests"),
@@ -412,45 +408,53 @@ export function safePreviewFetchEffect(
 			if (Date.now() >= deadline) {
 				return yield* Effect.fail(new Error("Link preview request timed out"));
 			}
-			let remainingMs = remainingTimeoutMs();
 			const parsed = yield* Effect.try({
 				try: () => assertSafePreviewUrl(currentUrl),
 				catch: (error) => error,
 			});
 			if (options.fetchImpl && resolveHost) {
-				yield* tryPromise(() =>
-					resolveSafeAddresses(parsed.hostname, resolveHost, remainingMs),
+				yield* resolveSafeAddressesEffect(
+					parsed.hostname,
+					resolveHost,
+					remainingTimeoutMs(),
 				);
 			}
 			if (Date.now() >= deadline) {
 				return yield* Effect.fail(new Error("Link preview request timed out"));
 			}
-			remainingMs = remainingTimeoutMs();
 
+			// t.co serves HTML redirects to browsers; request its HTTP redirect instead.
+			const requestHeaders = isTcoUrl(currentUrl)
+				? { ...headers, "user-agent": "birdclaw/0.3 url-expander" }
+				: headers;
 			const response = options.fetchImpl
 				? yield* tryPromise(
 						() =>
 							options.fetchImpl?.(parsed.toString(), {
-								headers,
+								headers: requestHeaders,
 								method,
 								redirect: "manual",
-								signal: AbortSignal.timeout(remainingMs),
+								signal: AbortSignal.timeout(remainingTimeoutMs()),
 							}) as Promise<Response>,
 					)
-				: yield* tryPromise(() =>
-						resolveSafeAddresses(
-							parsed.hostname,
-							options.resolveHost ?? resolvePublicAddresses,
-							remainingMs,
-						).then((addresses) =>
-							Date.now() >= deadline
-								? Promise.reject(new Error("Link preview request timed out"))
-								: nodeSafeFetch(parsed, {
-										addresses,
-										headers,
-										method,
-										timeoutMs: remainingTimeoutMs(),
-									}),
+				: yield* resolveSafeAddressesEffect(
+						parsed.hostname,
+						options.resolveHost ?? resolvePublicAddresses,
+						remainingTimeoutMs(),
+					).pipe(
+						Effect.filterOrFail(
+							() => Date.now() < deadline,
+							() => new Error("Link preview request timed out"),
+						),
+						Effect.flatMap((addresses) =>
+							tryPromise(() =>
+								nodeSafeFetch(parsed, {
+									addresses,
+									headers: requestHeaders,
+									method,
+									timeoutMs: remainingTimeoutMs(),
+								}),
+							),
 						),
 					);
 			if (response.status < 300 || response.status >= 400) return response;
@@ -465,15 +469,15 @@ export function safePreviewFetchEffect(
 			}
 			const nextUrl = yield* Effect.try({
 				try: () => new URL(location, parsed).toString(),
-				catch: (error) => error,
+				catch: () => new Error("Invalid URL"),
 			});
 			currentUrl = nextUrl;
 		}
 		return yield* Effect.fail(
 			new Error("Link preview redirected too many times"),
 		);
-	});
-}
+	},
+);
 
 function readResponseTextEffect(response: Response) {
 	const contentLength = Number(response.headers.get("content-length") ?? 0);
@@ -574,15 +578,17 @@ export function extractLinkPreviewMetadata(
 	};
 }
 
-export function fetchLinkPreviewMetadataEffect(
-	url: string,
-	options: Pick<
-		GetLinkPreviewOptions,
-		"fetchImpl" | "resolveHost" | "timeoutMs"
-	> = {},
-): Effect.Effect<LinkPreviewMetadata> {
-	return Effect.gen(function* () {
-		const response = yield* safePreviewFetchEffect(url, options);
+export const fetchLinkPreviewMetadataEffect = Effect.fn(
+	"linkPreview.fetchMetadata",
+)(
+	function* (
+		url: string,
+		_options: Pick<
+			GetLinkPreviewOptions,
+			"fetchImpl" | "resolveHost" | "timeoutMs"
+		> = {},
+	): Effect.fn.Return<LinkPreviewMetadata, unknown> {
+		const response = yield* safePreviewFetchEffect(url, _options);
 		const finalUrl = response.url || url;
 		const contentType = response.headers.get("content-type") ?? "";
 		if (!response.ok) {
@@ -605,8 +611,10 @@ export function fetchLinkPreviewMetadataEffect(
 				extractLinkPreviewMetadata(content.slice(0, MAX_HTML_CHARS), finalUrl),
 			catch: (error) => error,
 		});
-	}).pipe(
-		Effect.catchAll((error) =>
+	},
+	// Any failure degrades to a host-label preview carrying the error message.
+	(effect, url) =>
+		Effect.catchAll(effect, (error) =>
 			Effect.succeed({
 				url,
 				title: hostLabel(url),
@@ -614,10 +622,9 @@ export function fetchLinkPreviewMetadataEffect(
 				imageUrl: youtubeThumbnail(url),
 				siteName: hostLabel(url),
 				error: error instanceof Error ? error.message : String(error),
-			}),
+			} satisfies LinkPreviewMetadata),
 		),
-	);
-}
+);
 
 export function fetchLinkPreviewMetadata(
 	url: string,
@@ -719,13 +726,21 @@ function persistPreview(
 	);
 }
 
-export function getOrFetchLinkPreviewEffect(
-	url: string,
-	options: GetLinkPreviewOptions = {},
-): Effect.Effect<LinkPreviewMetadata> {
-	return Effect.gen(function* () {
+export const getOrFetchLinkPreviewEffect = Effect.fn("linkPreview.getOrFetch")(
+	function* (url: string, options: GetLinkPreviewOptions = {}) {
 		const db = getNativeDb({ seedDemoData: false });
 		const cached = readCachedPreview(db, url, options.shortUrl);
+		if (isReadOnlyDeployment()) {
+			return cached
+				? rowToPreview(cached)
+				: {
+						url,
+						title: null,
+						description: null,
+						imageUrl: null,
+						siteName: null,
+					};
+		}
 		if (cached && hasUsefulPreview(cached) && !options.refresh) {
 			return rowToPreview(cached);
 		}
@@ -736,8 +751,8 @@ export function getOrFetchLinkPreviewEffect(
 		);
 		persistPreview(db, url, options.shortUrl, cached, preview);
 		return preview;
-	});
-}
+	},
+);
 
 export function getOrFetchLinkPreview(
 	url: string,

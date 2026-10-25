@@ -11,41 +11,30 @@ function mediaKeys(tweet: TweetWithMediaAttachments) {
 		: [];
 }
 
-export function countTweetMedia(tweet: TweetWithMediaAttachments) {
-	const keys = mediaKeys(tweet);
-	if (keys.length > 0) {
-		return keys.length;
-	}
-
-	const urls = Array.isArray(tweet.entities?.urls) ? tweet.entities.urls : [];
-	return urls.filter(
-		(url) =>
-			url &&
-			typeof url === "object" &&
-			typeof (url as Record<string, unknown>).media_key === "string",
-	).length;
+export function indexMediaIncludes(media: XurlMediaItem[] = []) {
+	return new Map(media.map((item) => [item.media_key, item]));
 }
 
 function localType(media: XurlMediaItem): TweetMediaItem["type"] {
-	if (media.type === "photo") {
-		return "image";
-	}
-	if (media.type === "animated_gif") {
-		return "gif";
-	}
-	if (media.type === "video") {
-		return "video";
-	}
-	return "unknown";
+	if (media.type === "photo") return "image";
+	if (media.type === "animated_gif") return "gif";
+	return media.type === "video" ? "video" : "unknown";
 }
 
-function mp4Variants(
+function videoVariants(
 	media: XurlMediaItem,
 ): NonNullable<TweetMediaItem["variants"]> {
 	return (media.variants ?? [])
 		.filter(
 			(variant) =>
-				variant.content_type === "video/mp4" && typeof variant.url === "string",
+				[
+					"video/mp4",
+					"video/webm",
+					"application/x-mpegurl",
+					"application/vnd.apple.mpegurl",
+				].includes(
+					(variant.content_type ?? "").split(";")[0].trim().toLowerCase(),
+				) && typeof variant.url === "string",
 		)
 		.map((variant) => ({
 			url: variant.url,
@@ -55,7 +44,10 @@ function mp4Variants(
 				: {}),
 		}))
 		.sort(
-			(left, right) => Number(right.bitRate ?? 0) - Number(left.bitRate ?? 0),
+			(left, right) =>
+				Number(!left.contentType?.toLowerCase().startsWith("video/")) -
+					Number(!right.contentType?.toLowerCase().startsWith("video/")) ||
+				Number(right.bitRate ?? 0) - Number(left.bitRate ?? 0),
 		);
 }
 
@@ -109,28 +101,29 @@ function birdEntityMedia(tweet: TweetWithMediaAttachments) {
 	const urls = Array.isArray(tweet.entities?.urls) ? tweet.entities.urls : [];
 	const seen = new Set<string>();
 	const items: TweetMediaItem[] = [];
+	let count = 0;
 	for (const url of urls) {
 		const item = record(url);
 		if (!item || typeof item.media_key !== "string") continue;
+		count += 1;
 		const mediaUrl = entityMediaUrl(item);
 		if (!mediaUrl || seen.has(mediaUrl)) continue;
 		seen.add(mediaUrl);
 		items.push({ url: mediaUrl, type: "image" });
 	}
-	return items;
+	return { count, items };
 }
 
-export function buildMediaJsonFromIncludes(
+export function buildTweetMedia(
 	tweet: TweetWithMediaAttachments,
-	media: XurlMediaItem[] = [],
+	mediaByKey: ReadonlyMap<string, XurlMediaItem>,
 ) {
-	const byKey = new Map(media.map((item) => [item.media_key, item]));
 	const keys = mediaKeys(tweet);
 	const items = keys
-		.map((key) => byKey.get(key))
+		.map((key) => mediaByKey.get(key))
 		.filter((item): item is XurlMediaItem => item !== undefined)
 		.map((item) => {
-			const variants = mp4Variants(item);
+			const variants = videoVariants(item);
 			const type = localType(item);
 			const url =
 				type === "image"
@@ -160,6 +153,10 @@ export function buildMediaJsonFromIncludes(
 			} satisfies TweetMediaItem;
 		})
 		.filter((item): item is TweetMediaItem => item !== null);
+	const fallback = keys.length === 0 ? birdEntityMedia(tweet) : null;
 
-	return JSON.stringify(keys.length > 0 ? items : birdEntityMedia(tweet));
+	return {
+		count: keys.length || fallback?.count || 0,
+		json: JSON.stringify(keys.length > 0 ? items : (fallback?.items ?? [])),
+	};
 }

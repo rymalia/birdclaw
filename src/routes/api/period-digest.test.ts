@@ -7,11 +7,16 @@ const maybeAutoUpdateBackupMock = vi.fn();
 const streamPeriodDigestMock = vi.fn();
 
 vi.mock("#/lib/backup", () => ({
-	maybeAutoUpdateBackup: () => maybeAutoUpdateBackupMock(),
-	maybeAutoUpdateBackupEffect: () =>
-		Effect.promise(() => Promise.resolve(maybeAutoUpdateBackupMock())),
+	requestBackupAutoUpdate: () => maybeAutoUpdateBackupMock(),
 }));
 vi.mock("#/lib/period-digest", () => ({
+	normalizeDigestLanguage: (value: string | undefined) => {
+		if (!value) return undefined;
+		if (value === "ZH-cn") return "zh-CN";
+		throw new Error(
+			"Digest language must be a valid Unicode locale identifier",
+		);
+	},
 	streamPeriodDigest: (...args: unknown[]) => streamPeriodDigestMock(...args),
 	streamPeriodDigestEffect: (...args: unknown[]) =>
 		Effect.promise(() => streamPeriodDigestMock(...args)),
@@ -45,6 +50,7 @@ describe("api period digest route", () => {
 							window: { label: "Week" },
 							counts: { home: 1, mentions: 0, links: 0, dms: 0 },
 							includeDms: true,
+							tweets: [],
 						},
 						digest: { actionItems: [] },
 					},
@@ -56,14 +62,16 @@ describe("api period digest route", () => {
 	it("streams NDJSON and passes query options to the digest runner", async () => {
 		const response = await GET({
 			request: new Request(
-				"http://localhost/api/period-digest?period=week&since=2026-05-01&until=2026-05-16&account=acct_primary&includeDms=yes&refresh=1&model=gpt-5.5&maxTweets=42&maxLinks=7",
+				"http://localhost/api/period-digest?period=week&since=2026-05-01&until=2026-05-16&account=acct_primary&includeDms=yes&refresh=1&model=gpt-5.5&language=ZH-cn&maxTweets=42&maxLinks=7",
 			),
 		});
 
 		expect(response.headers.get("content-type")).toContain(
 			"application/x-ndjson",
 		);
-		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("cache-control")).toBe(
+			"no-store, no-transform",
+		);
 		expect(await response.text()).toContain('"type":"done"');
 		expect(maybeAutoUpdateBackupMock).toHaveBeenCalledWith();
 		expect(streamPeriodDigestMock).toHaveBeenCalledWith(
@@ -75,6 +83,7 @@ describe("api period digest route", () => {
 				includeDms: true,
 				refresh: true,
 				model: "gpt-5.5",
+				language: "zh-CN",
 				maxTweets: 42,
 				maxLinks: 7,
 				liveSync: true,
@@ -85,6 +94,94 @@ describe("api period digest route", () => {
 			},
 			expect.objectContaining({ onEvent: expect.any(Function) }),
 		);
+	});
+
+	it("prefers the liveSyncMode query param over the environment", async () => {
+		vi.stubEnv("BIRDCLAW_DIGEST_LIVE_MODE", "xurl");
+		try {
+			const response = await GET({
+				request: new Request(
+					"http://localhost/api/period-digest?liveSyncMode=bird",
+				),
+			});
+
+			expect(response.headers.get("content-type")).toContain(
+				"application/x-ndjson",
+			);
+			expect(await response.text()).toContain('"type":"done"');
+			expect(streamPeriodDigestMock).toHaveBeenCalledWith(
+				expect.objectContaining({ liveSyncMode: "bird" }),
+				expect.objectContaining({ onEvent: expect.any(Function) }),
+			);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
+
+	it("defaults liveSyncMode from BIRDCLAW_DIGEST_LIVE_MODE", async () => {
+		const previous = process.env.BIRDCLAW_DIGEST_LIVE_MODE;
+		process.env.BIRDCLAW_DIGEST_LIVE_MODE = "bird";
+		try {
+			const response = await GET({
+				request: new Request("http://localhost/api/period-digest"),
+			});
+
+			expect(response.headers.get("content-type")).toContain(
+				"application/x-ndjson",
+			);
+			expect(await response.text()).toContain('"type":"done"');
+			expect(streamPeriodDigestMock).toHaveBeenCalledWith(
+				expect.objectContaining({ liveSyncMode: "bird" }),
+				expect.objectContaining({ onEvent: expect.any(Function) }),
+			);
+		} finally {
+			if (previous === undefined) {
+				delete process.env.BIRDCLAW_DIGEST_LIVE_MODE;
+			} else {
+				process.env.BIRDCLAW_DIGEST_LIVE_MODE = previous;
+			}
+		}
+	});
+
+	it("rejects invalid language tags before starting a digest", async () => {
+		const response = await GET({
+			request: new Request(
+				"http://localhost/api/period-digest?language=not_a_locale",
+			),
+		});
+
+		expect(response.status).toBe(400);
+		expect(await response.json()).toEqual({
+			ok: false,
+			error: "Digest language must be a valid Unicode locale identifier",
+		});
+		expect(maybeAutoUpdateBackupMock).not.toHaveBeenCalled();
+		expect(streamPeriodDigestMock).not.toHaveBeenCalled();
+	});
+
+	it("opens the stream before backup auto-update completes", async () => {
+		let resolveBackup: ((value: unknown) => void) | undefined;
+		maybeAutoUpdateBackupMock.mockReturnValue(
+			new Promise((resolve) => {
+				resolveBackup = resolve;
+			}),
+		);
+
+		const response = await GET({
+			request: new Request("http://localhost/api/period-digest?period=today"),
+		});
+		const reader = response.body?.getReader();
+		expect(reader).toBeDefined();
+
+		const first = await reader!.read();
+		const text = new TextDecoder().decode(first.value);
+		expect(text).toContain('"type":"status"');
+		expect(text).toContain("Preparing local archive");
+		await vi.waitFor(() => expect(streamPeriodDigestMock).toHaveBeenCalled());
+		expect(maybeAutoUpdateBackupMock).toHaveBeenCalled();
+
+		resolveBackup?.({ skipped: true });
+		await reader!.cancel();
 	});
 
 	it("emits an error event when the digest runner rejects", async () => {

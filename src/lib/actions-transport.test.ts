@@ -1,4 +1,7 @@
 // @vitest-environment node
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -12,36 +15,52 @@ const mocks = vi.hoisted(() => ({
 	unblockUserViaXurl: vi.fn(),
 	muteUserViaXurl: vi.fn(),
 	unmuteUserViaXurl: vi.fn(),
-	blockUserViaXWeb: vi.fn(),
-	unblockUserViaXWeb: vi.fn(),
 	lookupAuthenticatedUser: vi.fn(),
+	getAuthenticatedBirdAccount: vi.fn(),
 }));
 
-vi.mock("./bird-actions", () => ({
-	blockUserViaBird: mocks.blockUserViaBird,
-	unblockUserViaBird: mocks.unblockUserViaBird,
-	muteUserViaBird: mocks.muteUserViaBird,
-	readBirdStatusViaBird: mocks.readBirdStatusViaBird,
-	unmuteUserViaBird: mocks.unmuteUserViaBird,
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		getAuthenticatedBirdAccountEffect: fromMock(
+			mocks.getAuthenticatedBirdAccount,
+		),
+	};
+});
 
-vi.mock("./xurl", () => ({
-	blockUserViaXurl: mocks.blockUserViaXurl,
-	unblockUserViaXurl: mocks.unblockUserViaXurl,
-	muteUserViaXurl: mocks.muteUserViaXurl,
-	unmuteUserViaXurl: mocks.unmuteUserViaXurl,
-	lookupAuthenticatedUser: mocks.lookupAuthenticatedUser,
-	lookupAuthenticatedUserFresh: mocks.lookupAuthenticatedUser,
-}));
+vi.mock("./bird-actions", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		blockUserViaBirdEffect: fromMock(mocks.blockUserViaBird),
+		unblockUserViaBirdEffect: fromMock(mocks.unblockUserViaBird),
+		muteUserViaBirdEffect: fromMock(mocks.muteUserViaBird),
+		readBirdStatusViaBirdEffect: fromMock(mocks.readBirdStatusViaBird),
+		unmuteUserViaBirdEffect: fromMock(mocks.unmuteUserViaBird),
+	};
+});
 
-vi.mock("./x-web", () => ({
-	blockUserViaXWeb: mocks.blockUserViaXWeb,
-	unblockUserViaXWeb: mocks.unblockUserViaXWeb,
-}));
+vi.mock("./xurl", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		blockUserViaXurlEffect: fromMock(mocks.blockUserViaXurl),
+		unblockUserViaXurlEffect: fromMock(mocks.unblockUserViaXurl),
+		muteUserViaXurlEffect: fromMock(mocks.muteUserViaXurl),
+		unmuteUserViaXurlEffect: fromMock(mocks.unmuteUserViaXurl),
+		lookupAuthenticatedUserEffect: fromMock(mocks.lookupAuthenticatedUser),
+		lookupAuthenticatedUserFreshEffect: fromMock(mocks.lookupAuthenticatedUser),
+	};
+});
 
 describe("actions transport", () => {
+	let birdclawHome: string | undefined;
+
 	beforeEach(() => {
 		delete process.env.BIRDCLAW_ACTIONS_TRANSPORT;
+		delete process.env.BIRDCLAW_CONFIG;
+		birdclawHome = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-actions-transport-"),
+		);
+		process.env.BIRDCLAW_HOME = birdclawHome;
 		delete process.env.BIRDCLAW_DISABLE_LIVE_WRITES;
 		vi.resetModules();
 		mocks.blockUserViaBird.mockReset();
@@ -53,10 +72,13 @@ describe("actions transport", () => {
 		mocks.unblockUserViaXurl.mockReset();
 		mocks.muteUserViaXurl.mockReset();
 		mocks.unmuteUserViaXurl.mockReset();
-		mocks.blockUserViaXWeb.mockReset();
-		mocks.unblockUserViaXWeb.mockReset();
 		mocks.lookupAuthenticatedUser.mockReset();
+		mocks.getAuthenticatedBirdAccount.mockReset();
 		mocks.lookupAuthenticatedUser.mockResolvedValue({ id: "1" });
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue({
+			id: "1",
+			username: "steipete",
+		});
 		mocks.blockUserViaBird.mockResolvedValue({
 			ok: true,
 			output: "bird block ok",
@@ -79,33 +101,59 @@ describe("actions transport", () => {
 		});
 		mocks.blockUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "xurl block ok",
+			output: "xurl block ok\nverified blocking=true",
 		});
 		mocks.unblockUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "xurl unblock ok",
+			output: "xurl unblock ok\nverified blocking=false",
 		});
 		mocks.muteUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "xurl mute ok",
+			output: "xurl mute ok\nverified muting=true",
 		});
 		mocks.unmuteUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "xurl unmute ok",
-		});
-		mocks.blockUserViaXWeb.mockResolvedValue({
-			ok: true,
-			output: "x-web block ok",
-		});
-		mocks.unblockUserViaXWeb.mockResolvedValue({
-			ok: true,
-			output: "x-web unblock ok",
+			output: "xurl unmute ok\nverified muting=false",
 		});
 	});
 
 	afterEach(() => {
+		delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 		delete process.env.BIRDCLAW_ACTIONS_TRANSPORT;
+		delete process.env.BIRDCLAW_CONFIG;
+		delete process.env.BIRDCLAW_HOME;
 		delete process.env.BIRDCLAW_DISABLE_LIVE_WRITES;
+		if (birdclawHome) {
+			rmSync(birdclawHome, { force: true, recursive: true });
+			birdclawHome = undefined;
+		}
+	});
+
+	it("tries xurl before Bird when the global preference requests it", async () => {
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "xurl";
+		mocks.blockUserViaXurl.mockResolvedValue({
+			ok: true,
+			output: "xurl block ok",
+		});
+		const { runModerationAction } = await import("./actions-transport");
+		await expect(
+			runModerationAction({
+				action: "block",
+				query: "sam",
+				targetUserId: "42",
+				transport: "auto",
+			}),
+		).resolves.toMatchObject({ transport: "xurl", ok: true });
+		expect(mocks.blockUserViaBird).not.toHaveBeenCalled();
+		mocks.blockUserViaXurl.mockRejectedValueOnce(new Error("offline"));
+		await expect(
+			runModerationAction({
+				action: "block",
+				query: "sam",
+				targetUserId: "42",
+				transport: "auto",
+			}),
+		).resolves.toMatchObject({ transport: "bird", ok: true });
 	});
 
 	it("builds moderation action effects lazily", async () => {
@@ -143,10 +191,14 @@ describe("actions transport", () => {
 		expect(mocks.blockUserViaXurl).not.toHaveBeenCalled();
 	});
 
-	it("does not require xurl account verification before bird actions", async () => {
+	it("verifies the selected bird account without consulting xurl", async () => {
 		mocks.lookupAuthenticatedUser.mockResolvedValue({
 			id: "2",
 			username: "other",
+		});
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue({
+			id: "25401953",
+			username: "steipete",
 		});
 		const { runModerationAction } = await import("./actions-transport");
 		const result = await runModerationAction({
@@ -166,6 +218,7 @@ describe("actions transport", () => {
 			transport: "bird",
 		});
 		expect(mocks.blockUserViaBird).toHaveBeenCalledWith("7");
+		expect(mocks.getAuthenticatedBirdAccount).toHaveBeenCalledTimes(1);
 		expect(mocks.lookupAuthenticatedUser).not.toHaveBeenCalled();
 		expect(mocks.blockUserViaXurl).not.toHaveBeenCalled();
 	});
@@ -214,7 +267,7 @@ describe("actions transport", () => {
 		expect(mocks.blockUserViaXurl).toHaveBeenCalledWith("1", "7");
 	});
 
-	it("does not fall back to unverified x-web block in auto mode", async () => {
+	it("stops after xurl rejects a block in auto mode", async () => {
 		mocks.blockUserViaBird.mockResolvedValue({
 			ok: false,
 			output: "bird unavailable",
@@ -236,10 +289,9 @@ describe("actions transport", () => {
 			output: "bird: bird unavailable\nxurl: xurl rejected",
 			transport: "xurl",
 		});
-		expect(mocks.blockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
-	it("does not fall back to unverified x-web unblock in auto mode", async () => {
+	it("stops after xurl rejects an unblock in auto mode", async () => {
 		mocks.unblockUserViaBird.mockResolvedValue({
 			ok: false,
 			output: "bird unavailable",
@@ -261,10 +313,9 @@ describe("actions transport", () => {
 			output: "bird: bird unavailable\nxurl: xurl rejected",
 			transport: "xurl",
 		});
-		expect(mocks.unblockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
-	it("does not fall through to x-web when live writes are disabled", async () => {
+	it("reports both transport failures when live writes are disabled", async () => {
 		process.env.BIRDCLAW_DISABLE_LIVE_WRITES = "1";
 		mocks.blockUserViaBird.mockResolvedValue({
 			ok: false,
@@ -288,7 +339,6 @@ describe("actions transport", () => {
 			output: "bird: live writes disabled\nxurl: live writes disabled",
 			transport: "xurl",
 		});
-		expect(mocks.blockUserViaXWeb).not.toHaveBeenCalled();
 	});
 
 	it("reports missing target ids for forced xurl actions", async () => {
@@ -327,37 +377,26 @@ describe("actions transport", () => {
 		expect(mocks.blockUserViaXurl).not.toHaveBeenCalled();
 	});
 
-	it("reports xurl verification gaps and mismatches", async () => {
-		mocks.readBirdStatusViaBird
-			.mockResolvedValueOnce(null)
-			.mockResolvedValueOnce({ blocking: false, muting: false });
-		const { runModerationAction } = await import("./actions-transport");
-
-		await expect(
-			runModerationAction({
-				action: "block",
-				query: "7",
-				targetUserId: "7",
-				transport: "xurl",
-			}),
-		).resolves.toEqual({
-			ok: false,
-			output: "xurl block ok\nxurl verify unavailable from bird status",
-			transport: "xurl",
-		});
-		await expect(
-			runModerationAction({
-				action: "block",
-				query: "7",
-				targetUserId: "7",
-				transport: "xurl",
-			}),
-		).resolves.toEqual({
-			ok: false,
-			output: "xurl block ok\nxurl verify mismatch blocking=false",
-			transport: "xurl",
-		});
-	});
+	it.each(["block", "unblock", "mute", "unmute"] as const)(
+		"executes %s with xurl without consulting bird",
+		async (action) => {
+			mocks.readBirdStatusViaBird.mockRejectedValue(new Error("bird absent"));
+			mocks.getAuthenticatedBirdAccount.mockRejectedValue(
+				new Error("bird absent"),
+			);
+			const { runModerationAction } = await import("./actions-transport");
+			await expect(
+				runModerationAction({
+					action,
+					query: "7",
+					targetUserId: "7",
+					transport: "xurl",
+				}),
+			).resolves.toMatchObject({ ok: true, transport: "xurl" });
+			expect(mocks.readBirdStatusViaBird).not.toHaveBeenCalled();
+			expect(mocks.getAuthenticatedBirdAccount).not.toHaveBeenCalled();
+		},
+	);
 
 	it("checks expected xurl account identities before live writes", async () => {
 		mocks.lookupAuthenticatedUser.mockResolvedValueOnce({

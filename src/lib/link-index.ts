@@ -1,7 +1,11 @@
+import { profileSelect } from "./profile-row";
+import { parseJsonField } from "./json-codec";
 import { Effect } from "effect";
 import { getNativeDb } from "./db";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { nullableProfileFromDbRow } from "./profile-row";
 import type { Database } from "./sqlite";
+import { isTcoUrl } from "./url-safety";
 import {
 	normalizeUrlExpansionForIndex,
 	upsertUrlExpansion,
@@ -15,13 +19,19 @@ import type {
 	LinkIndexItem,
 	LinkOccurrenceItem,
 	LinkSearchItem,
-	ProfileRecord,
 	TimelineItem,
 	TweetEntities,
 	TweetMediaItem,
 } from "./types";
 
 const DEFAULT_EXPAND_CONCURRENCY = 12;
+
+// Extract the authority before matching so destination paths containing t.co stay resolved.
+const FINAL_URL_REMAINDER_SQL =
+	"substr(e.final_url, instr(e.final_url, '://') + 3)";
+const FINAL_URL_AUTHORITY_SQL = `lower(substr(${FINAL_URL_REMAINDER_SQL}, 1, instr(${FINAL_URL_REMAINDER_SQL} || '/', '/') - 1))`;
+const FINAL_URL_HOST_SQL = `substr(${FINAL_URL_AUTHORITY_SQL}, 1, instr(${FINAL_URL_AUTHORITY_SQL} || ':', ':') - 1)`;
+const NEEDS_EXPANSION_SQL = `(e.short_url is null or e.status in ('error', 'miss') or ${FINAL_URL_HOST_SQL} = 't.co' or ${FINAL_URL_HOST_SQL} glob '*.t.co')`;
 
 interface TweetUrlEntityLike {
 	url?: unknown;
@@ -72,18 +82,6 @@ export interface LinkSearchOptions {
 	limit?: number;
 }
 
-function parseJsonField<T>(value: unknown, fallback: T): T {
-	if (typeof value !== "string" || value.length === 0) {
-		return fallback;
-	}
-
-	try {
-		return JSON.parse(value) as T;
-	} catch {
-		return fallback;
-	}
-}
-
 function getString(value: unknown) {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -93,12 +91,7 @@ function isIndexedUrl(url: string, includeAllUrls: boolean) {
 		return true;
 	}
 
-	try {
-		const host = new URL(url).hostname.toLowerCase();
-		return host === "t.co" || host.endsWith(".t.co");
-	} catch {
-		return false;
-	}
+	return isTcoUrl(url);
 }
 
 function toTweetEntityUrls(entitiesJson: string): SourceUrl[] {
@@ -201,9 +194,19 @@ function rebuildOccurrences(
 				? []
 				: (db
 						.prepare(`
-      select id, account_id, created_at, text, entities_json
-      from tweets
-      where text like '%://%' or entities_json like '%://%'
+      select
+        tweet.id,
+        coalesce(
+          (select edge.account_id from tweet_account_edges edge where edge.tweet_id = tweet.id order by edge.last_seen_at desc limit 1),
+          (select collection.account_id from tweet_collections collection where collection.tweet_id = tweet.id order by collection.updated_at desc limit 1)
+        ) as account_id,
+        tweet.created_at,
+        tweet.text,
+        tweet.entities_json
+      from tweets tweet
+	  where tweet.deleted_at is null
+	    and tweet.superseded_at is null
+	    and (text like '%://%' or entities_json like '%://%')
     `)
 						.all() as Array<Record<string, unknown>>);
 		for (const row of tweetRows) {
@@ -219,7 +222,7 @@ function rebuildOccurrences(
 					String(row.id),
 					index,
 					entry.url,
-					String(row.account_id),
+					typeof row.account_id === "string" ? row.account_id : null,
 					null,
 					null,
 					String(row.created_at),
@@ -318,7 +321,7 @@ export function backfillLinkIndexEffect(
 				: undefined;
 		const needsExpansionClause = options.refresh
 			? "1 = 1"
-			: "(e.short_url is null or e.status in ('error', 'miss'))";
+			: NEEDS_EXPANSION_SQL;
 
 		const urlsToExpand = db
 			.prepare(`
@@ -355,7 +358,7 @@ export function backfillLinkIndexEffect(
     select count(distinct o.short_url) as count
     from link_occurrences o
     left join url_expansions e on e.short_url = o.short_url
-    where (e.short_url is null or e.status in ('error', 'miss'))
+    where ${NEEDS_EXPANSION_SQL}
       ${options.source ? "and o.source_kind = ?" : ""}
   `)
 			.get(...(options.source ? [options.source] : [])) as { count: number };
@@ -380,44 +383,17 @@ function likePattern(value: string) {
 	return `%${value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_").toLowerCase()}%`;
 }
 
-function toProfile(
-	row: Record<string, unknown>,
-	prefix: string,
-): ProfileRecord | null {
-	if (!row[`${prefix}id`]) {
-		return null;
-	}
-	return {
-		id: String(row[`${prefix}id`]),
-		handle: String(row[`${prefix}handle`]),
-		displayName: String(row[`${prefix}display_name`]),
-		bio: String(row[`${prefix}bio`]),
-		followersCount: Number(row[`${prefix}followers_count`]),
-		followingCount: Number(row[`${prefix}following_count`]),
-		avatarHue: Number(row[`${prefix}avatar_hue`]),
-		avatarUrl: getString(row[`${prefix}avatar_url`]),
-		location: getString(row[`${prefix}location`]),
-		url: getString(row[`${prefix}url`]),
-		verifiedType: getString(row[`${prefix}verified_type`]),
-		entities: parseJsonField<Record<string, unknown>>(
-			row[`${prefix}entities_json`],
-			{},
-		),
-		createdAt: String(row[`${prefix}created_at`]),
-	};
-}
-
 function toLinkedTweet(row: Record<string, unknown>): TimelineItem | null {
-	const author = toProfile(row, "linked_author_");
+	const author = nullableProfileFromDbRow(row, "linked_author_");
 	if (!row.linked_id || !author) {
 		return null;
 	}
 
 	return {
 		id: String(row.linked_id),
-		accountId: String(row.linked_account_id),
+		accountId: String(row.linked_account_id ?? ""),
 		accountHandle: String(row.linked_account_handle ?? ""),
-		kind: String(row.linked_kind) as TimelineItem["kind"],
+		kind: String(row.linked_kind ?? "thread") as TimelineItem["kind"],
 		text: String(row.linked_text),
 		createdAt: String(row.linked_created_at),
 		isReplied: Boolean(row.linked_is_replied),
@@ -460,8 +436,8 @@ function toLinkSearchItem(row: Record<string, unknown>): LinkSearchItem {
 			updatedAt: String(row.updated_at),
 		},
 		sourceText: String(row.source_text),
-		sourceAuthor: toProfile(row, "source_author_"),
-		participant: toProfile(row, "participant_"),
+		sourceAuthor: nullableProfileFromDbRow(row, "source_author_"),
+		participant: nullableProfileFromDbRow(row, "participant_"),
 		linkedTweet: toLinkedTweet(row),
 	};
 }
@@ -560,58 +536,33 @@ export function searchLinks(query: string, options: LinkSearchOptions = {}) {
       e.updated_at,
       coalesce(dm.text, source_tweet.text, '') as source_text,
       account.handle as account_handle,
-      source_author.id as source_author_id,
-      source_author.handle as source_author_handle,
-      source_author.display_name as source_author_display_name,
-      source_author.bio as source_author_bio,
-      source_author.followers_count as source_author_followers_count,
-      source_author.following_count as source_author_following_count,
-      source_author.avatar_hue as source_author_avatar_hue,
-      source_author.avatar_url as source_author_avatar_url,
-      source_author.location as source_author_location,
-      source_author.url as source_author_url,
-      source_author.verified_type as source_author_verified_type,
-      source_author.entities_json as source_author_entities_json,
-      source_author.created_at as source_author_created_at,
-      participant.id as participant_id,
-      participant.handle as participant_handle,
-      participant.display_name as participant_display_name,
-      participant.bio as participant_bio,
-      participant.followers_count as participant_followers_count,
-      participant.following_count as participant_following_count,
-      participant.avatar_hue as participant_avatar_hue,
-      participant.avatar_url as participant_avatar_url,
-      participant.location as participant_location,
-      participant.url as participant_url,
-      participant.verified_type as participant_verified_type,
-      participant.entities_json as participant_entities_json,
-      participant.created_at as participant_created_at,
+      ${profileSelect("source_author", "source_author_")},
+      ${profileSelect("participant", "participant_")},
       linked.id as linked_id,
-      linked.account_id as linked_account_id,
-      linked_account.handle as linked_account_handle,
-      linked.kind as linked_kind,
+			coalesce(
+				o.account_id,
+				(select edge.account_id from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				(select collection.account_id from tweet_collections collection where collection.tweet_id = linked.id order by collection.updated_at desc limit 1)
+			) as linked_account_id,
+			(select linked_account.handle from accounts linked_account where linked_account.id = coalesce(
+				o.account_id,
+				(select edge.account_id from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				(select collection.account_id from tweet_collections collection where collection.tweet_id = linked.id order by collection.updated_at desc limit 1)
+			)) as linked_account_handle,
+			coalesce(
+				(select edge.kind from tweet_account_edges edge where edge.tweet_id = linked.id order by edge.last_seen_at desc limit 1),
+				'thread'
+			) as linked_kind,
       linked.text as linked_text,
       linked.created_at as linked_created_at,
       linked.is_replied as linked_is_replied,
       linked.like_count as linked_like_count,
       linked.media_count as linked_media_count,
-      linked.bookmarked as linked_bookmarked,
-      linked.liked as linked_liked,
+			exists(select 1 from tweet_collections collection where collection.tweet_id = linked.id and collection.kind = 'bookmarks') as linked_bookmarked,
+			exists(select 1 from tweet_collections collection where collection.tweet_id = linked.id and collection.kind = 'likes') as linked_liked,
       linked.entities_json as linked_entities_json,
       linked.media_json as linked_media_json,
-      linked_author.id as linked_author_id,
-      linked_author.handle as linked_author_handle,
-      linked_author.display_name as linked_author_display_name,
-      linked_author.bio as linked_author_bio,
-      linked_author.followers_count as linked_author_followers_count,
-      linked_author.following_count as linked_author_following_count,
-      linked_author.avatar_hue as linked_author_avatar_hue,
-      linked_author.avatar_url as linked_author_avatar_url,
-      linked_author.location as linked_author_location,
-      linked_author.url as linked_author_url,
-      linked_author.verified_type as linked_author_verified_type,
-      linked_author.entities_json as linked_author_entities_json,
-      linked_author.created_at as linked_author_created_at
+      ${profileSelect("linked_author", "linked_author_")}
     from link_occurrences o
     join url_expansions e on e.short_url = o.short_url
     left join accounts account on account.id = o.account_id
@@ -627,8 +578,6 @@ export function searchLinks(query: string, options: LinkSearchOptions = {}) {
       on source_author.id = source_tweet.author_profile_id
     left join tweets linked
       on linked.id = e.expanded_tweet_id
-    left join accounts linked_account
-      on linked_account.id = linked.account_id
     left join profiles linked_author
       on linked_author.id = linked.author_profile_id
     ${conditions.length > 0 ? `where ${conditions.join(" and ")}` : ""}

@@ -1,20 +1,33 @@
+import {
+	type AnalysisReport,
+	type AnalysisHandlers,
+	type AnalysisEvent,
+	readAnalysisReport,
+	analysisReportCacheKey,
+	generateAnalysisReportEffect,
+	emitCachedAnalysis,
+} from "./analysis-report";
 import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { z } from "zod";
+import { fitAnalysisDataset } from "./analysis-runtime";
 import { prefetchCachedAvatarsForProfileIdsEffect } from "./avatar-cache";
 import {
 	runEffectBackground,
 	runEffectPromise,
-	tryPromise,
+	trySync,
 } from "./effect-runtime";
-import { listDmConversations, listTimelineItems } from "./queries";
-import { readSyncCache, writeSyncCache } from "./sync-cache";
+import { getNativeDb } from "./db";
+import { defaultLiveSyncMode } from "./config";
+import { listDmConversations } from "./dm-read-model";
+import { parseJsonField } from "./query-read-model-shared";
+import { listTimelineItems } from "./timeline-read-model";
 import {
 	syncTweetSearchEffect,
 	type SyncTweetSearchResult,
 	type TweetSearchMode,
 } from "./tweet-search-live";
-import type { ProfileRecord } from "./types";
+import type { ProfileRecord, TweetEntities, TweetMediaItem } from "./types";
 
 export type SearchDiscussionSource =
 	| "all"
@@ -46,10 +59,8 @@ export interface SearchDiscussionOptions {
 	prefetchAvatars?: boolean;
 }
 
-export interface SearchDiscussionStreamHandlers {
-	onDelta?: (delta: string) => void;
-	onEvent?: (event: SearchDiscussionStreamEvent) => void;
-}
+export type SearchDiscussionStreamHandlers =
+	AnalysisHandlers<SearchDiscussionStreamEvent>;
 
 interface CompactSearchTweet {
 	id: string;
@@ -60,6 +71,8 @@ interface CompactSearchTweet {
 	authorProfile: ProfileRecord;
 	createdAt: string;
 	text: string;
+	entities?: TweetEntities;
+	media: TweetMediaItem[];
 	likeCount: number;
 	liked: boolean;
 	bookmarked: boolean;
@@ -111,58 +124,17 @@ const SearchDiscussionSchema = z.object({
 
 export type SearchDiscussion = z.infer<typeof SearchDiscussionSchema>;
 
-export interface SearchDiscussionRunResult {
-	context: SearchDiscussionContext;
-	discussion: SearchDiscussion;
-	markdown: string;
-	model: string;
-	reasoningEffort: string;
-	serviceTier: string;
-	cached: boolean;
-	updatedAt: string;
-}
+export type SearchDiscussionRunResult = AnalysisReport<
+	SearchDiscussionContext,
+	SearchDiscussion,
+	"discussion"
+>;
 
 export type SearchDiscussionStreamEvent =
-	| { type: "start"; context: SearchDiscussionContext; cached: boolean }
-	| { type: "delta"; delta: string }
-	| { type: "done"; result: SearchDiscussionRunResult }
-	| { type: "error"; error: string };
+	AnalysisEvent<SearchDiscussionRunResult>;
 
-interface OpenAIStreamState {
-	eventBuffer: string;
-	rawText: string;
-	pendingVisible: string;
-	jsonMode: boolean;
-	responseId?: string;
-	usage?: unknown;
-	error?: string;
-}
-
-const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_REASONING_EFFORT = "medium";
-const DEFAULT_SERVICE_TIER = "priority";
-const DEFAULT_LIMIT = 5_000;
-const DEFAULT_MAX_PAGES = 50;
-const MAX_PROMPT_DATA_CHARS = 1_200_000;
-const DELIMITER_PATTERN = /\n---\s*\n/;
-const VISIBLE_DELIMITER_HOLD = 8;
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySearchSync<T>(try_: () => T): Effect.Effect<T, Error> {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
-function trySearchPromise<T>(
-	try_: () => PromiseLike<T>,
-): Effect.Effect<T, Error> {
-	return tryPromise(try_).pipe(Effect.mapError(toError));
-}
+const DEFAULT_LIMIT = 20_000;
+const DEFAULT_MAX_PAGES = 200;
 
 function tweetUrl(handle: string, id: string) {
 	return `https://x.com/${handle}/status/${id}`;
@@ -193,6 +165,8 @@ function compactTweet(
 		authorProfile: item.author,
 		createdAt: item.createdAt,
 		text: item.text,
+		entities: item.entities,
+		media: item.media,
 		likeCount: item.likeCount,
 		liked: item.liked,
 		bookmarked: item.bookmarked,
@@ -218,6 +192,123 @@ function collectTweetsForSource(
 		bookmarkedOnly: source === "bookmarks",
 		limit: options.limit,
 	}).map((item) => compactTweet(source, item));
+}
+
+function collectLiveSearchTweets(
+	options: SearchDiscussionOptions & {
+		limit: number;
+		liveSearch?: SyncTweetSearchResult;
+	},
+) {
+	if (options.source !== "search" || options.liveSearch?.ok !== true) {
+		return null;
+	}
+	if (options.liveSearch.tweetIds.length === 0) return [];
+	const ids = [...new Set(options.liveSearch.tweetIds)].slice(0, options.limit);
+	const positionById = new Map(ids.map((id, index) => [id, index]));
+	const placeholders = ids.map(() => "?").join(",");
+	const accountId = options.liveSearch.accountId;
+	const rows = getNativeDb({ seedDemoData: false })
+		.prepare(`
+      select
+        t.id,
+        t.text,
+        t.created_at,
+        t.is_replied,
+        t.like_count,
+			t.media_count,
+			t.entities_json,
+			t.media_json,
+        exists (
+            select 1 from tweet_collections collection
+            where collection.account_id = ?
+              and collection.tweet_id = t.id
+              and collection.kind = 'bookmarks'
+          ) as bookmarked,
+        exists (
+            select 1 from tweet_collections collection
+            where collection.account_id = ?
+              and collection.tweet_id = t.id
+              and collection.kind = 'likes'
+          ) as liked,
+        p.id as profile_id,
+        p.handle,
+        p.display_name,
+        p.bio,
+        p.followers_count,
+        p.following_count,
+        p.avatar_hue,
+        p.avatar_url,
+        p.created_at as profile_created_at
+      from tweets t
+      join profiles p on p.id = t.author_profile_id
+	  where t.deleted_at is null and t.superseded_at is null
+	    and t.id in (${placeholders})
+    `)
+		.all(accountId, accountId, ...ids) as Array<Record<string, unknown>>;
+
+	return rows
+		.sort(
+			(left, right) =>
+				(positionById.get(String(left.id)) ?? Number.MAX_SAFE_INTEGER) -
+				(positionById.get(String(right.id)) ?? Number.MAX_SAFE_INTEGER),
+		)
+		.filter((row) => liveSearchRowPassesFilters(row, options))
+		.map((row): CompactSearchTweet => ({
+			id: String(row.id),
+			url: tweetUrl(String(row.handle), String(row.id)),
+			source: "search",
+			author: String(row.handle),
+			name: String(row.display_name),
+			authorProfile: {
+				id: String(row.profile_id),
+				handle: String(row.handle),
+				displayName: String(row.display_name),
+				bio: String(row.bio),
+				followersCount: Number(row.followers_count),
+				followingCount: Number(row.following_count ?? 0),
+				avatarHue: Number(row.avatar_hue),
+				avatarUrl:
+					typeof row.avatar_url === "string"
+						? String(row.avatar_url)
+						: undefined,
+				createdAt: String(row.profile_created_at),
+			},
+			createdAt: String(row.created_at),
+			text: String(row.text),
+			entities: parseJsonField<TweetEntities>(row.entities_json, {}),
+			media: parseJsonField<TweetMediaItem[]>(row.media_json, []),
+			likeCount: Number(row.like_count),
+			liked: Boolean(row.liked),
+			bookmarked: Boolean(row.bookmarked),
+			needsReply: !row.is_replied,
+		}));
+}
+
+function liveSearchRowPassesFilters(
+	row: Record<string, unknown>,
+	options: SearchDiscussionOptions,
+) {
+	const text = String(row.text);
+	const createdAt = String(row.created_at);
+	if (options.originalsOnly && text.startsWith("@")) return false;
+	if (options.since?.trim() && createdAt < options.since.trim()) return false;
+	if (options.until?.trim() && createdAt >= options.until.trim()) return false;
+	if (!options.hideLowQuality) return true;
+
+	const trimmed = text.trim();
+	const strippedShortUrlText = text.replaceAll("https://t.co/", "").trim();
+	const likeCount = Number(row.like_count);
+	const mediaCount = Number(row.media_count);
+	return !(
+		text.startsWith("RT @") ||
+		(likeCount < 50 &&
+			((strippedShortUrlText.length < 16 && mediaCount === 0) ||
+				(text.startsWith("@") && trimmed.length < 60) ||
+				(text.includes("https://t.co/") &&
+					mediaCount === 0 &&
+					strippedShortUrlText.length < 45)))
+	);
 }
 
 function collectDms(options: SearchDiscussionOptions & { limit: number }) {
@@ -330,16 +421,27 @@ export function collectSearchDiscussionContext(
 		bookmarks: 0,
 		dms: 0,
 	};
-	const tweets = sourceList(source).flatMap((item) => {
-		const sourceTweets = collectTweetsForSource(item, {
-			...options,
-			query,
-			source,
-			limit,
-		});
-		counts[item] = sourceTweets.length;
-		return sourceTweets;
+	const liveSearchTweets = collectLiveSearchTweets({
+		...options,
+		query,
+		source,
+		limit,
 	});
+	const tweets =
+		liveSearchTweets ??
+		sourceList(source).flatMap((item) => {
+			const sourceTweets = collectTweetsForSource(item, {
+				...options,
+				query,
+				source,
+				limit,
+			});
+			counts[item] = sourceTweets.length;
+			return sourceTweets;
+		});
+	if (liveSearchTweets) {
+		counts.search = liveSearchTweets.length;
+	}
 	const dms = collectDms({ ...options, query, source, limit });
 	counts.dms = dms.length;
 	const limitedTweets = dedupeTweets(tweets).slice(0, limit);
@@ -369,59 +471,17 @@ function prefetchDiscussionAvatars(context: SearchDiscussionContext) {
 	if (profileIds.length === 0) {
 		return;
 	}
-	runEffectBackground(
-		prefetchCachedAvatarsForProfileIdsEffect(profileIds).pipe(
-			Effect.catchAll(() =>
-				Effect.succeed({
-					requested: 0,
-					available: 0,
-					missing: 0,
-					failed: 0,
-				}),
-			),
-		),
-		{
-			onSuccess: () => {},
-			onFailure: () => {},
-		},
-	);
-}
-
-function modelFromOptions(options: SearchDiscussionOptions) {
-	return options.model ?? process.env.BIRDCLAW_AI_MODEL ?? DEFAULT_MODEL;
-}
-
-function reasoningEffortFromOptions(options: SearchDiscussionOptions) {
-	return (
-		options.reasoningEffort ??
-		(process.env.BIRDCLAW_OPENAI_REASONING_EFFORT as
-			| SearchDiscussionOptions["reasoningEffort"]
-			| undefined) ??
-		DEFAULT_REASONING_EFFORT
-	);
-}
-
-function serviceTierFromOptions(options: SearchDiscussionOptions) {
-	return (
-		options.serviceTier ??
-		(process.env.BIRDCLAW_OPENAI_SERVICE_TIER as
-			| SearchDiscussionOptions["serviceTier"]
-			| undefined) ??
-		DEFAULT_SERVICE_TIER
-	);
+	runEffectBackground(prefetchCachedAvatarsForProfileIdsEffect(profileIds), {
+		onSuccess: () => {},
+		onFailure: () => {},
+	});
 }
 
 function cacheKey(
 	context: SearchDiscussionContext,
 	options: SearchDiscussionOptions,
 ) {
-	return [
-		"search-discussion:v1",
-		modelFromOptions(options),
-		reasoningEffortFromOptions(options),
-		serviceTierFromOptions(options),
-		context.hash,
-	].join(":");
+	return analysisReportCacheKey("search-discussion:v1", options, context.hash);
 }
 
 function buildPrompt(context: SearchDiscussionContext) {
@@ -440,46 +500,17 @@ function buildPrompt(context: SearchDiscussionContext) {
 		bookmarked: tweet.bookmarked,
 		needsReply: tweet.needsReply,
 	}));
-	const fitDataset = () => {
-		let tweetCount = promptTweets.length;
-		let dmCount = context.dms.length;
-		const datasetFor = (tweets: number, dms: number) => ({
+	const {
+		dataset,
+		counts: { tweets: tweetCount },
+	} = fitAnalysisDataset(
+		{ tweets: promptTweets.length, dms: context.dms.length },
+		({ tweets, dms }) => ({
 			tweets: promptTweets.slice(0, tweets),
 			dms: context.dms.slice(0, dms),
-		});
-		const lengthFor = (tweets: number, dms: number) =>
-			JSON.stringify(datasetFor(tweets, dms)).length;
-		const fitCount = (max: number, fits: (count: number) => boolean) => {
-			let low = 0;
-			let high = max;
-			let best = 0;
-			while (low <= high) {
-				const mid = Math.floor((low + high) / 2);
-				if (fits(mid)) {
-					best = mid;
-					low = mid + 1;
-				} else {
-					high = mid - 1;
-				}
-			}
-			return best;
-		};
-		if (lengthFor(tweetCount, dmCount) <= MAX_PROMPT_DATA_CHARS) {
-			return { dataset: datasetFor(tweetCount, dmCount), tweetCount };
-		}
-		dmCount = fitCount(
-			dmCount,
-			(count) => lengthFor(tweetCount, count) <= MAX_PROMPT_DATA_CHARS,
-		);
-		if (lengthFor(tweetCount, dmCount) > MAX_PROMPT_DATA_CHARS) {
-			tweetCount = fitCount(
-				tweetCount,
-				(count) => lengthFor(count, dmCount) <= MAX_PROMPT_DATA_CHARS,
-			);
-		}
-		return { dataset: datasetFor(tweetCount, dmCount), tweetCount };
-	};
-	const { dataset, tweetCount } = fitDataset();
+		}),
+		["dms", "tweets"],
+	);
 
 	return `Search query: ${context.query}
 ${context.question ? `Discussion question: ${context.question}\n` : ""}Account: ${context.account ?? "all"}
@@ -525,254 +556,12 @@ function fallbackDiscussion(
 	};
 }
 
-function parseDiscussionFromHybridText(
-	context: SearchDiscussionContext,
-	rawText: string,
-): { discussion: SearchDiscussion; markdown: string } {
-	const [markdownPart, jsonPart] = rawText.split(DELIMITER_PATTERN);
-	const markdown = (markdownPart ?? rawText).trim();
-	const candidate = jsonPart?.slice(
-		jsonPart.indexOf("{"),
-		jsonPart.lastIndexOf("}") + 1,
-	);
-	if (candidate?.startsWith("{")) {
-		try {
-			return {
-				markdown,
-				discussion: SearchDiscussionSchema.parse(JSON.parse(candidate)),
-			};
-		} catch {
-			return { markdown, discussion: fallbackDiscussion(context, markdown) };
-		}
-	}
-	return { markdown, discussion: fallbackDiscussion(context, markdown) };
-}
-
-function emitVisibleDelta(
-	state: OpenAIStreamState,
-	delta: string,
-	handlers: SearchDiscussionStreamHandlers,
-) {
-	state.rawText += delta;
-	if (state.jsonMode) return;
-
-	const combined = state.pendingVisible + delta;
-	const delimiterIndex = combined.search(DELIMITER_PATTERN);
-	if (delimiterIndex >= 0) {
-		const visible = combined.slice(0, delimiterIndex);
-		if (visible) {
-			handlers.onDelta?.(visible);
-			handlers.onEvent?.({ type: "delta", delta: visible });
-		}
-		state.pendingVisible = "";
-		state.jsonMode = true;
-		return;
-	}
-
-	if (combined.length <= VISIBLE_DELIMITER_HOLD) {
-		state.pendingVisible = combined;
-		return;
-	}
-
-	const visible = combined.slice(0, -VISIBLE_DELIMITER_HOLD);
-	state.pendingVisible = combined.slice(-VISIBLE_DELIMITER_HOLD);
-	if (visible) {
-		handlers.onDelta?.(visible);
-		handlers.onEvent?.({ type: "delta", delta: visible });
-	}
-}
-
-function flushPendingVisible(
-	state: OpenAIStreamState,
-	handlers: SearchDiscussionStreamHandlers,
-) {
-	if (state.jsonMode || !state.pendingVisible) return;
-	const delta = state.pendingVisible;
-	state.pendingVisible = "";
-	handlers.onDelta?.(delta);
-	handlers.onEvent?.({ type: "delta", delta });
-}
-
-function handleOpenAIEvent(
-	state: OpenAIStreamState,
-	event: Record<string, unknown>,
-	handlers: SearchDiscussionStreamHandlers,
-) {
-	const type = typeof event.type === "string" ? event.type : "";
-	if (
-		type === "response.output_text.delta" &&
-		typeof event.delta === "string"
-	) {
-		emitVisibleDelta(state, event.delta, handlers);
-		return;
-	}
-	if (type === "response.completed") {
-		const response = event.response;
-		if (response && typeof response === "object") {
-			const record = response as Record<string, unknown>;
-			state.responseId = typeof record.id === "string" ? record.id : undefined;
-			state.usage = record.usage;
-		}
-		return;
-	}
-	if (type === "response.error" || type === "error") {
-		const error = event.error;
-		state.error =
-			error && typeof error === "object" && "message" in error
-				? String((error as { message?: unknown }).message)
-				: "OpenAI stream failed";
-		return;
-	}
-	if (type === "response.failed" || type === "response.incomplete") {
-		const response = event.response;
-		const record =
-			response && typeof response === "object"
-				? (response as Record<string, unknown>)
-				: {};
-		const error = record.error;
-		const incomplete = record.incomplete_details;
-		state.error =
-			error && typeof error === "object" && "message" in error
-				? String((error as { message?: unknown }).message)
-				: incomplete && typeof incomplete === "object" && "reason" in incomplete
-					? `OpenAI response incomplete: ${String((incomplete as { reason?: unknown }).reason)}`
-					: "OpenAI stream failed";
-	}
-}
-
-function processSseChunk(
-	state: OpenAIStreamState,
-	chunk: string,
-	handlers: SearchDiscussionStreamHandlers,
-) {
-	state.eventBuffer += chunk;
-	let boundary = state.eventBuffer.indexOf("\n\n");
-	while (boundary >= 0) {
-		const block = state.eventBuffer.slice(0, boundary);
-		state.eventBuffer = state.eventBuffer.slice(boundary + 2);
-		const data = block
-			.split("\n")
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trimStart())
-			.join("\n");
-		if (data && data !== "[DONE]") {
-			try {
-				handleOpenAIEvent(
-					state,
-					JSON.parse(data) as Record<string, unknown>,
-					handlers,
-				);
-			} catch {
-				// Final hybrid parse decides whether malformed output can be used.
-			}
-		}
-		boundary = state.eventBuffer.indexOf("\n\n");
-	}
-}
-
-function createOpenAIRequestBody(
-	context: SearchDiscussionContext,
-	options: SearchDiscussionOptions,
-) {
-	return {
-		model: modelFromOptions(options),
-		reasoning: { effort: reasoningEffortFromOptions(options) },
-		service_tier: serviceTierFromOptions(options),
-		store: false,
-		stream: true,
-		max_output_tokens: 7000,
-		input: [
-			{
-				role: "system",
-				content:
-					"You are a precise local Twitter archive analyst. Stream Markdown first, then emit the requested JSON object after the delimiter. Do not invent events not present in the dataset.",
-			},
-			{
-				role: "user",
-				content: buildPrompt(context),
-			},
-		],
-	};
-}
-
-function readOpenAIStreamEffect(
-	response: Response,
-	context: SearchDiscussionContext,
-	options: SearchDiscussionOptions,
-	handlers: SearchDiscussionStreamHandlers,
-): Effect.Effect<SearchDiscussionRunResult, Error> {
-	const reader = response.body?.getReader();
-	if (!reader) {
-		return Effect.fail(new Error("OpenAI response did not include a stream"));
-	}
-
-	const decoder = new TextDecoder();
-	const state: OpenAIStreamState = {
-		eventBuffer: "",
-		rawText: "",
-		pendingVisible: "",
-		jsonMode: false,
-	};
-
-	return Effect.gen(function* () {
-		for (;;) {
-			const { done, value } = yield* trySearchPromise(() => reader.read());
-			if (!done) {
-				processSseChunk(
-					state,
-					decoder.decode(value, { stream: true }),
-					handlers,
-				);
-				continue;
-			}
-
-			flushPendingVisible(state, handlers);
-			if (state.error) {
-				return yield* Effect.fail(new Error(state.error));
-			}
-
-			const parsed = yield* trySearchSync(() =>
-				parseDiscussionFromHybridText(context, state.rawText),
-			);
-			const updatedAt = yield* trySearchSync(() =>
-				writeSyncCache(cacheKey(context, options), {
-					discussion: parsed.discussion,
-					markdown: parsed.markdown,
-					model: modelFromOptions(options),
-					reasoningEffort: reasoningEffortFromOptions(options),
-					serviceTier: serviceTierFromOptions(options),
-					usage: state.usage,
-					responseId: state.responseId,
-				}),
-			);
-			const result = {
-				context,
-				discussion: parsed.discussion,
-				markdown: parsed.markdown,
-				model: modelFromOptions(options),
-				reasoningEffort: reasoningEffortFromOptions(options),
-				serviceTier: serviceTierFromOptions(options),
-				cached: false,
-				updatedAt,
-			};
-			handlers.onEvent?.({ type: "done", result });
-			return result;
-		}
-	}).pipe(
-		Effect.ensuring(
-			Effect.sync(() => {
-				reader.releaseLock();
-			}),
-		),
-	);
-}
-
 export function streamSearchDiscussionEffect(
 	options: SearchDiscussionOptions,
 	handlers: SearchDiscussionStreamHandlers = {},
 ): Effect.Effect<SearchDiscussionRunResult, Error> {
 	return Effect.gen(function* () {
-		const mode = options.mode ?? "auto";
+		const mode = options.mode ?? defaultLiveSyncMode("xurl");
 		const liveSearch =
 			mode === "local"
 				? undefined
@@ -794,7 +583,7 @@ export function streamSearchDiscussionEffect(
 				),
 			);
 		}
-		const context = yield* trySearchSync(() =>
+		const context = yield* trySync(() =>
 			collectSearchDiscussionContext({
 				...options,
 				source: options.source ?? "search",
@@ -806,62 +595,31 @@ export function streamSearchDiscussionEffect(
 		}
 		const cached = options.refresh
 			? null
-			: yield* trySearchSync(() =>
-					readSyncCache<{
-						discussion: SearchDiscussion;
-						markdown: string;
-						model: string;
-						reasoningEffort: string;
-						serviceTier: string;
-					}>(cacheKey(context, options)),
+			: yield* trySync(() =>
+					readAnalysisReport(
+						cacheKey(context, options),
+						context,
+						"discussion",
+						(value) => SearchDiscussionSchema.parse(value),
+					),
 				);
 		if (cached) {
-			const result: SearchDiscussionRunResult = yield* trySearchSync(() => ({
-				context,
-				discussion: SearchDiscussionSchema.parse(cached.value.discussion),
-				markdown: cached.value.markdown,
-				model: cached.value.model,
-				reasoningEffort: cached.value.reasoningEffort,
-				serviceTier: cached.value.serviceTier,
-				cached: true,
-				updatedAt: cached.updatedAt,
-			}));
-			handlers.onEvent?.({ type: "start", context, cached: true });
-			handlers.onDelta?.(result.markdown);
-			handlers.onEvent?.({ type: "delta", delta: result.markdown });
-			handlers.onEvent?.({ type: "done", result });
-			return result;
+			emitCachedAnalysis(cached, handlers);
+			return cached;
 		}
 
-		const apiKey = process.env.OPENAI_API_KEY;
-		if (!apiKey) {
-			return yield* Effect.fail(new Error("OPENAI_API_KEY is not set"));
-		}
-
-		handlers.onEvent?.({ type: "start", context, cached: false });
-		const response = yield* trySearchPromise(() =>
-			fetch("https://api.openai.com/v1/responses", {
-				method: "POST",
-				signal: options.signal,
-				headers: {
-					authorization: `Bearer ${apiKey}`,
-					"content-type": "application/json",
-				},
-				body: JSON.stringify(createOpenAIRequestBody(context, options)),
-			}),
-		);
-		if (!response.ok) {
-			const text = yield* trySearchPromise(() => response.text());
-			return yield* Effect.fail(
-				new Error(
-					`OpenAI request failed: ${String(response.status)} ${text.slice(
-						0,
-						400,
-					)}`,
-				),
-			);
-		}
-		return yield* readOpenAIStreamEffect(response, context, options, handlers);
+		return yield* generateAnalysisReportEffect({
+			context,
+			key: "discussion",
+			cacheKey: () => cacheKey(context, options),
+			options,
+			system:
+				"You are a precise local Twitter archive analyst. Stream Markdown first, then emit the requested JSON object after the delimiter. Do not invent events not present in the dataset.",
+			prompt: () => buildPrompt(context),
+			parse: SearchDiscussionSchema.parse,
+			fallback: (markdown) => fallbackDiscussion(context, markdown),
+			handlers,
+		});
 	});
 }
 
@@ -875,6 +633,4 @@ export function streamSearchDiscussion(
 export const __test__ = {
 	SearchDiscussionSchema,
 	buildPrompt,
-	parseDiscussionFromHybridText,
-	processSseChunk,
 };

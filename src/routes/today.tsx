@@ -1,13 +1,36 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
-import { CheckCircle2, Loader2, RefreshCw, Sparkles } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+	CheckCircle2,
+	FileDown,
+	Loader2,
+	RefreshCw,
+	Sparkles,
+} from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MarkdownViewer } from "#/components/MarkdownViewer";
+import { useNdjsonRun } from "#/components/useNdjsonRun";
+import {
+	isTerminalStreamEvent,
+	periodDigestStreamEventSchema,
+} from "#/lib/client-stream-contracts";
 import type {
 	PeriodDigestContext,
 	PeriodDigestRunResult,
 	PeriodDigestStreamEvent,
 } from "#/lib/period-digest";
 import type { ProfileRecord } from "#/lib/types";
+import {
+	hydrateProfileHandles,
+	normalizeProfileHydrationHandle as normalizeHandle,
+} from "#/lib/profile-hydration-client";
+import {
+	type PeriodRouteSearch,
+	type RouteSearchChange,
+	type TodayRouteSearch,
+	validateTodaySearch,
+} from "#/lib/route-search";
 import {
 	cx,
 	errorCopyClass,
@@ -17,24 +40,22 @@ import {
 	pageSubtitleClass,
 	pageTitleClass,
 	secondaryButtonClass,
-	segmentActiveClass,
+	segmentAccentActiveClass,
 	segmentClass,
 	segmentedClass,
 } from "#/lib/ui";
 
 export const Route = createFileRoute("/today")({
 	component: TodayRoute,
+	validateSearch: validateTodaySearch,
 });
 
-type PeriodOption = "today" | "24h" | "yesterday" | "week";
-type HydrateProfileResult = {
-	handle: string;
-	status: "hit" | "miss" | "error";
-	profile?: ProfileRecord;
-};
-
+type PeriodOption = PeriodRouteSearch;
 const PROFILE_HYDRATION_LIMIT = 12;
 const PROFILE_HYDRATION_DELAY_MS = 300;
+const DIGEST_STATUS_MESSAGES = {
+	524: "Digest startup timed out at Cloudflare (524). Retry to open a new stream.",
+} as const;
 
 const periods: Array<{ value: PeriodOption; label: string }> = [
 	{ value: "today", label: "Today" },
@@ -42,6 +63,26 @@ const periods: Array<{ value: PeriodOption; label: string }> = [
 	{ value: "yesterday", label: "Yesterday" },
 	{ value: "week", label: "Week" },
 ];
+
+function periodLabel(period: PeriodOption) {
+	return periods.find((item) => item.value === period)?.label ?? "Digest";
+}
+
+function exportCurrentDigestPdf(title: string) {
+	const previousTitle = document.title;
+	let cleanedUp = false;
+	const cleanup = () => {
+		if (cleanedUp) return;
+		cleanedUp = true;
+		document.title = previousTitle;
+		window.removeEventListener("afterprint", cleanup);
+	};
+
+	document.title = title;
+	window.addEventListener("afterprint", cleanup, { once: true });
+	window.setTimeout(cleanup, 3000);
+	window.print();
+}
 
 function digestUrl(
 	period: PeriodOption,
@@ -53,35 +94,26 @@ function digestUrl(
 	url.searchParams.set("includeDms", String(includeDms));
 	url.searchParams.set("maxTweets", "5000");
 	url.searchParams.set("maxLinks", "20");
+	// Cloudflare caps proxied requests; live timeline sync remains a separate job/UI action.
+	url.searchParams.set("liveSync", "false");
 	if (refresh) {
 		url.searchParams.set("refresh", "true");
 	}
 	return url;
 }
 
-async function digestRequestError(response: Response) {
-	const status = `${String(response.status)}${response.statusText ? ` ${response.statusText}` : ""}`;
-	let detail = "";
-	try {
-		const contentType = response.headers.get("content-type") ?? "";
-		if (contentType.includes("application/json")) {
-			const payload = (await response.json()) as {
-				error?: unknown;
-				message?: unknown;
-			};
-			if (typeof payload.message === "string") detail = payload.message;
-			else if (typeof payload.error === "string") detail = payload.error;
-		} else {
-			detail = (await response.text()).trim();
-		}
-	} catch {
-		detail = "";
+function digestStreamError(cause: unknown, phase: string) {
+	const message = cause instanceof Error ? cause.message : String(cause);
+	if (
+		cause instanceof TypeError &&
+		/network error|failed to fetch|load failed/i.test(message)
+	) {
+		return `Digest connection was interrupted while ${phase.toLowerCase()}. Retry to continue.`;
 	}
-	return new Error(
-		detail
-			? `Digest request failed (${status}): ${detail}`
-			: `Digest request failed (${status})`,
-	);
+	if (cause instanceof SyntaxError) {
+		return `Digest stream returned invalid data while ${phase.toLowerCase()}. Retry to continue.`;
+	}
+	return message || "Digest failed";
 }
 
 function formatCounts(context: PeriodDigestContext | null) {
@@ -95,10 +127,6 @@ function formatCounts(context: PeriodDigestContext | null) {
 	]
 		.filter(Boolean)
 		.join(" · ");
-}
-
-function normalizeHandle(value: string) {
-	return value.trim().replace(/^@/, "").toLowerCase();
 }
 
 function collectProfilesForHydration(result: PeriodDigestRunResult) {
@@ -126,13 +154,11 @@ function collectProfilesForHydration(result: PeriodDigestRunResult) {
 		if (!tweet) continue;
 		const handle = normalizeHandle(tweet.author);
 		if (handle) handles.add(handle);
-		if (handles.size >= PROFILE_HYDRATION_LIMIT) return [...handles];
 	}
 
 	for (const tweet of result.context.tweets) {
 		const handle = normalizeHandle(tweet.author);
 		if (handle) handles.add(handle);
-		if (handles.size >= PROFILE_HYDRATION_LIMIT) return [...handles];
 	}
 	return [...handles];
 }
@@ -172,151 +198,93 @@ function applyHydratedProfilesToResult(
 }
 
 function useDigestStream(period: PeriodOption, includeDms: boolean) {
+	const queryClient = useQueryClient();
 	const [markdown, setMarkdown] = useState("");
 	const [context, setContext] = useState<PeriodDigestContext | null>(null);
 	const [result, setResult] = useState<PeriodDigestRunResult | null>(null);
-	const [error, setError] = useState<string | null>(null);
-	const [loading, setLoading] = useState(false);
 	const [status, setStatus] = useState("Starting digest");
-	const abortRef = useRef<AbortController | null>(null);
-	const requestIdRef = useRef(0);
-	const hydratedHandlesRef = useRef(new Set<string>());
-	const hydratedProfilesRef = useRef(new Map<string, ProfileRecord>());
+	const latestStatusRef = useRef("Starting digest");
 
-	const run = useCallback(
-		(refresh = false) => {
-			abortRef.current?.abort();
-			const controller = new AbortController();
-			const requestId = requestIdRef.current + 1;
-			requestIdRef.current = requestId;
-			abortRef.current = controller;
-			const isActiveRequest = () =>
-				abortRef.current === controller &&
-				requestIdRef.current === requestId &&
-				!controller.signal.aborted;
-			setMarkdown("");
-			setContext(null);
-			setResult(null);
-			setError(null);
-			setStatus("Starting digest");
-			setLoading(true);
-
+	const onStart = useCallback(() => {
+		setMarkdown("");
+		setContext(null);
+		setResult(null);
+		setStatus("Starting digest");
+		latestStatusRef.current = "Starting digest";
+	}, []);
+	const request = useCallback(
+		(signal: AbortSignal, refresh: boolean) =>
 			fetch(digestUrl(period, includeDms, refresh), {
-				signal: controller.signal,
-			})
-				.then(async (response) => {
-					if (!response.ok) {
-						throw await digestRequestError(response);
-					}
-					if (!response.body) {
-						throw new Error("Digest request failed: empty response body");
-					}
-					const reader = response.body.getReader();
-					const decoder = new TextDecoder();
-					let buffer = "";
-					const pump = (): Promise<void> =>
-						reader.read().then(({ done, value }) => {
-							if (!isActiveRequest()) return;
-							if (done) return;
-							buffer += decoder.decode(value, { stream: true });
-							let newline = buffer.indexOf("\n");
-							while (newline >= 0) {
-								const line = buffer.slice(0, newline).trim();
-								buffer = buffer.slice(newline + 1);
-								if (line) {
-									const event = JSON.parse(line) as PeriodDigestStreamEvent;
-									if (!isActiveRequest()) return;
-									if (event.type === "status") {
-										setStatus(
-											event.detail
-												? `${event.label} · ${event.detail}`
-												: event.label,
-										);
-									} else if (event.type === "start") {
-										setContext(event.context);
-									} else if (event.type === "delta") {
-										setStatus("Streaming AI summary");
-										setMarkdown((current) => current + event.delta);
-									} else if (event.type === "done") {
-										setResult(event.result);
-										setContext(event.result.context);
-										setMarkdown(event.result.markdown);
-										setStatus(
-											event.result.cached ? "Loaded cached report" : "Ready",
-										);
-									} else if (event.type === "error") {
-										setError(event.error);
-										setStatus("Digest failed");
-									}
-								}
-								newline = buffer.indexOf("\n");
-							}
-							return pump();
-						});
-					return pump();
-				})
-				.catch((cause: unknown) => {
-					if (!isActiveRequest()) return;
-					setError(cause instanceof Error ? cause.message : "Digest failed");
-					setStatus("Digest failed");
-				})
-				.finally(() => {
-					if (isActiveRequest()) {
-						setLoading(false);
-					}
-				});
-		},
+				cache: "no-store",
+				signal,
+			}),
 		[includeDms, period],
 	);
+	const onEvent = useCallback((event: PeriodDigestStreamEvent) => {
+		if (event.type === "status") {
+			latestStatusRef.current = event.detail
+				? `${event.label} · ${event.detail}`
+				: event.label;
+			setStatus(latestStatusRef.current);
+		} else if (event.type === "start") setContext(event.context);
+		else if (event.type === "delta") {
+			latestStatusRef.current = "Streaming AI summary";
+			setStatus(latestStatusRef.current);
+			setMarkdown((current) => current + event.delta);
+		} else if (event.type === "done") {
+			setResult(event.result);
+			setContext(event.result.context);
+			setMarkdown(event.result.markdown);
+			setStatus(event.result.cached ? "Loaded cached report" : "Ready");
+		} else if (event.type === "error") {
+			throw new Error(event.error);
+		}
+	}, []);
+	const onError = useCallback(() => setStatus("Digest failed"), []);
+	const prematureEofError = useCallback(
+		() =>
+			new Error(
+				`Digest connection closed while ${latestStatusRef.current.toLowerCase()}. Retry to continue.`,
+			),
+		[],
+	);
+	const formatError = useCallback(
+		(cause: unknown) => digestStreamError(cause, latestStatusRef.current),
+		[],
+	);
+	const { error, loading, run } = useNdjsonRun({
+		schema: periodDigestStreamEventSchema,
+		request,
+		onStart,
+		onEvent,
+		onError,
+		isTerminal: isTerminalStreamEvent,
+		errorLabel: "Digest request failed",
+		emptyBodyMessage: "Digest request failed: empty response body",
+		prematureEofError,
+		formatError,
+		statusMessages: DIGEST_STATUS_MESSAGES,
+	});
 
 	useEffect(() => {
 		run(false);
-		return () => abortRef.current?.abort();
 	}, [run]);
 
 	useEffect(() => {
 		if (!result) return;
-		if (hydratedProfilesRef.current.size > 0) {
-			const cachedProfiles = [...hydratedProfilesRef.current.values()];
-			setResult((current) =>
-				current
-					? applyHydratedProfilesToResult(current, cachedProfiles)
-					: current,
-			);
-			setContext((current) =>
-				current
-					? applyHydratedProfilesToContext(current, hydratedProfilesRef.current)
-					: current,
-			);
-		}
-		const handles = collectProfilesForHydration(result).filter(
-			(handle) => !hydratedHandlesRef.current.has(handle),
-		);
+		const handles = collectProfilesForHydration(result);
 		if (handles.length === 0) return;
 
-		const controller = new AbortController();
-		const url = new URL("/api/profile-hydrate", window.location.origin);
-		url.searchParams.set("handles", handles.join(","));
-
+		let active = true;
 		let idleId: number | null = null;
 		const runHydration = () => {
-			fetch(url, { signal: controller.signal })
-				.then((response) => response.json())
-				.then((response: { results?: HydrateProfileResult[] }) => {
-					for (const handle of handles) hydratedHandlesRef.current.add(handle);
-					const profiles =
-						response.results
-							?.map((item) => item.profile)
-							.filter((profile): profile is ProfileRecord =>
-								Boolean(profile),
-							) ?? [];
+			hydrateProfileHandles(queryClient, handles, {
+				limit: PROFILE_HYDRATION_LIMIT,
+			})
+				.then((response) => {
+					if (!active) return;
+					const { profiles } = response;
 					if (profiles.length === 0) return;
-					for (const profile of profiles) {
-						hydratedProfilesRef.current.set(
-							normalizeHandle(profile.handle),
-							profile,
-						);
-					}
 					setResult((current) =>
 						current
 							? applyHydratedProfilesToResult(current, profiles)
@@ -335,9 +303,7 @@ function useDigestStream(period: PeriodOption, includeDms: boolean) {
 					);
 				})
 				.catch((error: unknown) => {
-					if (error instanceof DOMException && error.name === "AbortError") {
-						return;
-					}
+					if (!active) return;
 					console.warn("Profile hydration failed", error);
 				});
 		};
@@ -350,36 +316,90 @@ function useDigestStream(period: PeriodOption, includeDms: boolean) {
 		}, PROFILE_HYDRATION_DELAY_MS);
 
 		return () => {
-			controller.abort();
+			active = false;
 			window.clearTimeout(timer);
 			if (idleId !== null && "cancelIdleCallback" in window) {
 				window.cancelIdleCallback(idleId);
 			}
 		};
-	}, [result]);
+	}, [queryClient, result]);
 
 	return { context, error, loading, markdown, result, run, status };
 }
 
 function TodayRoute() {
-	const [period, setPeriod] = useState<PeriodOption>("today");
-	const [includeDms, setIncludeDms] = useState(false);
+	const search = Route.useSearch();
+	const navigate = Route.useNavigate();
+	return (
+		<TodayRouteView
+			searchState={search}
+			onSearchChange={(next, options) =>
+				void navigate({ search: next, replace: options?.replace })
+			}
+		/>
+	);
+}
+
+export function TodayRouteView({
+	searchState: controlledSearch,
+	onSearchChange,
+}: {
+	searchState?: TodayRouteSearch;
+	onSearchChange?: RouteSearchChange<TodayRouteSearch>;
+} = {}) {
+	const { searchState, updateSearch } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateTodaySearch,
+	);
+	const { period, includeDms } = searchState;
 	const { context, error, loading, markdown, result, run, status } =
 		useDigestStream(period, includeDms);
+	useEffect(() => {
+		const root = document.documentElement;
+		root.classList.add("today-pdf-route");
+		return () => root.classList.remove("today-pdf-route");
+	}, []);
 	const sourceLabel = useMemo(
 		() => formatCounts(result?.context ?? context),
 		[context, result],
 	);
+	const digestLabel =
+		result?.context.window.label ??
+		context?.window.label ??
+		periodLabel(period);
+	const canExportPdf = Boolean(result?.markdown.trim()) && !loading;
+	const exportTitle = `BirdClaw ${digestLabel} digest`;
+	const exportUpdatedAt = result
+		? new Date(result.updatedAt).toLocaleString(undefined, {
+				dateStyle: "medium",
+				timeStyle: "short",
+			})
+		: null;
+	const handleExportPdf = useCallback(() => {
+		if (!canExportPdf) return;
+		exportCurrentDigestPdf(exportTitle);
+	}, [canExportPdf, exportTitle]);
 
 	return (
-		<div className="flex min-h-screen flex-col">
-			<header className={pageHeaderClass}>
+		<div className="today-pdf-root flex min-h-screen flex-col">
+			<header className={cx("today-pdf-header", pageHeaderClass)}>
 				<div className={pageHeaderRowClass}>
 					<div className="min-w-0">
 						<h1 className={pageTitleClass}>What happened</h1>
 						<p className={pageSubtitleClass}>{sourceLabel}</p>
 					</div>
-					<div className={pageHeaderActionsClass}>
+					<div className={cx("today-screen-only", pageHeaderActionsClass)}>
+						{canExportPdf ? (
+							<button
+								type="button"
+								className={secondaryButtonClass}
+								onClick={handleExportPdf}
+							>
+								<FileDown className="size-4" aria-hidden="true" />
+								Export PDF
+							</button>
+						) : null}
 						<button
 							type="button"
 							className={secondaryButtonClass}
@@ -394,17 +414,31 @@ function TodayRoute() {
 						</button>
 					</div>
 				</div>
-				<div className="flex flex-wrap items-center gap-2 px-4 pb-3">
+				<div className="today-pdf-meta" aria-hidden="true">
+					<span>{digestLabel}</span>
+					<span>·</span>
+					<span>Sources: {sourceLabel}</span>
+					{exportUpdatedAt ? (
+						<>
+							<span>·</span>
+							<span>Generated {exportUpdatedAt}</span>
+						</>
+					) : null}
+				</div>
+				<div className="today-screen-only flex flex-wrap items-center gap-2 px-4 pb-3">
 					<div className={segmentedClass} aria-label="Digest period">
 						{periods.map((item) => (
 							<button
 								key={item.value}
 								type="button"
+								aria-pressed={period === item.value}
 								className={cx(
 									segmentClass,
-									period === item.value && segmentActiveClass,
+									period === item.value && segmentAccentActiveClass,
 								)}
-								onClick={() => setPeriod(item.value)}
+								onClick={() =>
+									updateSearch({ ...searchState, period: item.value })
+								}
 							>
 								{item.label}
 							</button>
@@ -414,16 +448,38 @@ function TodayRoute() {
 						<input
 							type="checkbox"
 							checked={includeDms}
-							onChange={(event) => setIncludeDms(event.currentTarget.checked)}
+							onChange={(event) =>
+								updateSearch({
+									...searchState,
+									includeDms: event.currentTarget.checked,
+								})
+							}
 						/>
 						DMs
 					</label>
 				</div>
 			</header>
 
-			{error ? <div className={errorCopyClass}>{error}</div> : null}
+			{error ? (
+				<div
+					className={cx(
+						errorCopyClass,
+						"flex items-center justify-between gap-3",
+					)}
+					role="alert"
+				>
+					<span>{error}</span>
+					<button
+						className="shrink-0 font-semibold underline underline-offset-2"
+						onClick={() => run(true)}
+						type="button"
+					>
+						Retry
+					</button>
+				</div>
+			) : null}
 
-			<div className="border-b border-[var(--line)] px-4 py-2 text-[13px] text-[var(--ink-soft)]">
+			<div className="today-screen-only border-b border-[var(--line)] px-4 py-2 text-[13px] text-[var(--ink-soft)]">
 				<span className="inline-flex items-center gap-1">
 					{loading ? (
 						<Loader2 className="size-4 animate-spin" aria-hidden="true" />
@@ -436,7 +492,9 @@ function TodayRoute() {
 						? status
 						: result
 							? `${result.cached ? "Cached" : "Ready"} · ${result.context.window.label}`
-							: "Ready"}
+							: error
+								? "Digest failed"
+								: "Ready"}
 				</span>
 			</div>
 
@@ -447,7 +505,11 @@ function TodayRoute() {
 				/>
 			) : (
 				<div className="px-4 py-5 text-[14px] text-[var(--ink-soft)]">
-					{loading ? status : "Waiting for the first tokens..."}
+					{loading
+						? status
+						: error
+							? "No digest was generated. Retry to start a new run."
+							: "Waiting for the first tokens..."}
 				</div>
 			)}
 		</div>

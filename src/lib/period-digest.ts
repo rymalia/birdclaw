@@ -1,15 +1,37 @@
+import {
+	type AnalysisReport,
+	type AnalysisHandlers,
+	type AnalysisEvent,
+	type AnalysisStatus,
+	type CachedReport,
+	cachedAnalysisReport,
+	generateAnalysisReportEffect,
+	analysisReportCacheKey,
+	emitCachedAnalysis,
+} from "./analysis-report";
 import { createHash } from "node:crypto";
 import { Effect } from "effect";
 import { z } from "zod";
+import {
+	fitAnalysisDataset,
+	resolveAnalysisModelSettings,
+} from "./analysis-runtime";
 import { maybeAutoSyncBackupEffect } from "./backup";
-import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { getLinkInsights } from "./link-insights";
 import { syncMentionThreadsEffect } from "./mention-threads-live";
 import { syncMentionsEffect } from "./mentions-live";
-import { listDmConversations, listTimelineItems } from "./queries";
+import { listDmConversations } from "./dm-read-model";
+import { getTweetsByIds, listTimelineItems } from "./timeline-read-model";
 import { readSyncCache, writeSyncCache } from "./sync-cache";
 import { syncHomeTimelineEffect, type HomeTimelineMode } from "./timeline-live";
-import type { ProfileRecord } from "./types";
+import { defaultDigestLiveSyncMode } from "./digest-live-mode";
+import type {
+	EmbeddedTweet,
+	ProfileRecord,
+	TweetEntities,
+	TweetMediaItem,
+} from "./types";
 
 export type PeriodDigestPreset = "today" | "yesterday" | "24h" | "week";
 export type PeriodDigestSourceKind =
@@ -28,6 +50,7 @@ export interface PeriodDigestOptions {
 	includeDms?: boolean;
 	refresh?: boolean;
 	model?: string;
+	language?: string;
 	reasoningEffort?: "minimal" | "low" | "medium" | "high";
 	serviceTier?: "default" | "flex" | "priority";
 	signal?: AbortSignal;
@@ -48,28 +71,18 @@ export interface PeriodDigestWindow {
 	until: string;
 }
 
-export interface PeriodDigestRunResult {
-	context: PeriodDigestContext;
-	digest: PeriodDigest;
-	markdown: string;
-	model: string;
-	reasoningEffort: string;
-	serviceTier: string;
-	cached: boolean;
-	updatedAt: string;
-}
+export type PeriodDigestRunResult = AnalysisReport<
+	PeriodDigestContext,
+	PeriodDigest,
+	"digest"
+>;
 
-export interface PeriodDigestStreamHandlers {
-	onDelta?: (delta: string) => void;
-	onEvent?: (event: PeriodDigestStreamEvent) => void;
-}
+export type PeriodDigestStreamHandlers =
+	AnalysisHandlers<PeriodDigestStreamEvent>;
 
 export type PeriodDigestStreamEvent =
-	| { type: "status"; label: string; detail?: string }
-	| { type: "start"; context: PeriodDigestContext; cached: boolean }
-	| { type: "delta"; delta: string }
-	| { type: "done"; result: PeriodDigestRunResult }
-	| { type: "error"; error: string };
+	| AnalysisEvent<PeriodDigestRunResult>
+	| AnalysisStatus;
 
 const PeriodDigestSchema = z.object({
 	title: z.string().min(1),
@@ -108,6 +121,32 @@ const PeriodDigestSchema = z.object({
 	sourceTweetIds: z.array(z.string()).default([]),
 });
 
+const MAX_DIGEST_LANGUAGE_LENGTH = 64;
+
+export function normalizeDigestLanguage(
+	value: string | undefined,
+): string | undefined {
+	const trimmed = value?.trim();
+	if (!trimmed) return undefined;
+	if (
+		trimmed.length > MAX_DIGEST_LANGUAGE_LENGTH ||
+		!/^[a-z0-9]+(?:-[a-z0-9]+)*$/i.test(trimmed)
+	) {
+		throw new Error(
+			"Digest language must be a valid Unicode locale identifier such as en, zh-CN, or pt-BR",
+		);
+	}
+	try {
+		const [canonical] = Intl.getCanonicalLocales(trimmed);
+		if (!canonical) throw new Error("missing canonical locale");
+		return canonical;
+	} catch {
+		throw new Error(
+			"Digest language must be a valid Unicode locale identifier such as en, zh-CN, or pt-BR",
+		);
+	}
+}
+
 export type PeriodDigest = z.infer<typeof PeriodDigestSchema>;
 
 interface CompactTweet {
@@ -119,6 +158,8 @@ interface CompactTweet {
 	authorProfile: ProfileRecord;
 	createdAt: string;
 	text: string;
+	entities?: TweetEntities;
+	media: TweetMediaItem[];
 	likeCount: number;
 	liked: boolean;
 	bookmarked: boolean;
@@ -174,19 +215,6 @@ export interface PeriodDigestContext {
 	hash: string;
 }
 
-interface OpenAIStreamState {
-	eventBuffer: string;
-	rawText: string;
-	pendingVisible: string;
-	jsonMode: boolean;
-	responseId?: string;
-	usage?: unknown;
-	error?: string;
-}
-
-const DEFAULT_MODEL = "gpt-5.5";
-const DEFAULT_REASONING_EFFORT = "medium";
-const DEFAULT_SERVICE_TIER = "priority";
 const DEFAULT_MAX_TWEETS = 2_500;
 const DEFAULT_MAX_LINKS = 12;
 const DEFAULT_LIVE_TIMELINE_MAX_PAGES = undefined;
@@ -194,26 +222,7 @@ const DEFAULT_LIVE_MENTIONS_LIMIT = 100;
 const DEFAULT_LIVE_MENTIONS_MAX_PAGES = undefined;
 const DEFAULT_LIVE_THREAD_LIMIT = 12;
 const DEFAULT_LIVE_THREAD_TIMEOUT_MS = 5_000;
-const MAX_PROMPT_DATA_CHARS = 1_200_000;
-const DELIMITER_PATTERN = /\n---\s*\n/;
-const VISIBLE_DELIMITER_HOLD = 8;
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function tryDigestSync<T>(try_: () => T): Effect.Effect<T, Error> {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
-function tryDigestPromise<T>(
-	try_: () => PromiseLike<T>,
-): Effect.Effect<T, Error> {
-	return tryPromise(try_).pipe(Effect.mapError(toError));
-}
+const DEFAULT_DIGEST_FRESHNESS_MS = 5 * 60_000;
 
 function localDateStart(date: Date) {
 	return new Date(date.getFullYear(), date.getMonth(), date.getDate());
@@ -325,12 +334,35 @@ function compactTweet(
 		authorProfile: item.author,
 		createdAt: item.createdAt,
 		text: item.text,
+		entities: item.entities,
+		media: item.media,
 		likeCount: item.likeCount,
 		liked: item.liked,
 		bookmarked: item.bookmarked,
 		needsReply: !item.isReplied,
 		replyToId: item.replyToId ?? null,
 		replyToTweet,
+	};
+}
+
+function compactEmbeddedTweet(item: EmbeddedTweet): CompactTweet {
+	return {
+		id: item.id,
+		url: tweetUrl(item.author.handle, item.id),
+		source: "home",
+		author: item.author.handle,
+		name: item.author.displayName,
+		authorProfile: item.author,
+		createdAt: item.createdAt,
+		text: item.text,
+		entities: item.entities,
+		media: item.media,
+		likeCount: item.likeCount ?? 0,
+		liked: Boolean(item.liked),
+		bookmarked: Boolean(item.bookmarked),
+		needsReply: !item.isReplied,
+		replyToId: item.replyToId ?? null,
+		replyToTweet: null,
 	};
 }
 
@@ -388,17 +420,15 @@ function collectDms(options: {
 		until: options.window.until,
 		sort: "recent",
 		limit: options.limit,
-	}).map(
-		(item): CompactDm => ({
-			id: item.id,
-			participant: item.participant.handle,
-			name: item.participant.displayName,
-			lastMessageAt: item.lastMessageAt,
-			text: item.lastMessagePreview,
-			needsReply: item.needsReply,
-			influenceScore: item.influenceScore,
-		}),
-	);
+	}).map((item): CompactDm => ({
+		id: item.id,
+		participant: item.participant.handle,
+		name: item.participant.displayName,
+		lastMessageAt: item.lastMessageAt,
+		text: item.lastMessagePreview,
+		needsReply: item.needsReply,
+		influenceScore: item.influenceScore,
+	}));
 }
 
 function compactLinks(options: {
@@ -415,27 +445,24 @@ function compactLinks(options: {
 		until: options.window.until,
 		limit: options.limit,
 		commentsLimit: 5,
-	}).items.map(
-		(item): CompactLink => ({
-			title: item.title ?? item.displayUrl,
-			url: item.url,
-			displayUrl: item.displayUrl,
-			description: item.description,
-			shareCount: item.shareCount,
-			commentCount: item.commentCount,
-			lastSeenAt: item.lastSeenAt,
-			mentions: item.mentions.slice(0, 5).map((mention) => ({
-				id: mention.id,
-				sourceKind: mention.sourceKind,
-				sourceId: mention.sourceId,
-				createdAt: mention.createdAt,
-				author: mention.sharedBy?.handle,
-				text:
-					mention.commentText || mention.sharedContentText || mention.rawText,
-				tweetId: mention.timelineTweetId ?? mention.contentTweetId,
-			})),
-		}),
-	);
+	}).items.map((item): CompactLink => ({
+		title: item.title ?? item.displayUrl,
+		url: item.url,
+		displayUrl: item.displayUrl,
+		description: item.description,
+		shareCount: item.shareCount,
+		commentCount: item.commentCount,
+		lastSeenAt: item.lastSeenAt,
+		mentions: item.mentions.slice(0, 5).map((mention) => ({
+			id: mention.id,
+			sourceKind: mention.sourceKind,
+			sourceId: mention.sourceId,
+			createdAt: mention.createdAt,
+			author: mention.sharedBy?.handle,
+			text: mention.commentText || mention.sharedContentText || mention.rawText,
+			tweetId: mention.timelineTweetId ?? mention.contentTweetId,
+		})),
+	}));
 }
 
 function contextHash(context: Omit<PeriodDigestContext, "hash">) {
@@ -561,27 +588,9 @@ export function collectPeriodDigestContext(
 	};
 }
 
-function modelFromOptions(options: PeriodDigestOptions) {
-	return options.model ?? process.env.BIRDCLAW_AI_MODEL ?? DEFAULT_MODEL;
-}
-
-function reasoningEffortFromOptions(options: PeriodDigestOptions) {
-	return (
-		options.reasoningEffort ??
-		(process.env.BIRDCLAW_OPENAI_REASONING_EFFORT as
-			| PeriodDigestOptions["reasoningEffort"]
-			| undefined) ??
-		DEFAULT_REASONING_EFFORT
-	);
-}
-
-function serviceTierFromOptions(options: PeriodDigestOptions) {
-	return (
-		options.serviceTier ??
-		(process.env.BIRDCLAW_OPENAI_SERVICE_TIER as
-			| PeriodDigestOptions["serviceTier"]
-			| undefined) ??
-		DEFAULT_SERVICE_TIER
+function languageFromOptions(options: PeriodDigestOptions) {
+	return normalizeDigestLanguage(
+		options.language ?? process.env.BIRDCLAW_DIGEST_LANGUAGE,
 	);
 }
 
@@ -659,7 +668,7 @@ function refreshPeriodDigestInputsEffect(
 	const includeThreads = phase.threads ?? true;
 	const window = resolvePeriodDigestWindow(options);
 	const liveStartTime = floorIsoToHour(window.since);
-	const mode = options.liveSyncMode ?? "xurl";
+	const mode = options.liveSyncMode ?? defaultDigestLiveSyncMode();
 	const contextTweetBudget = Math.max(
 		20,
 		Math.trunc(options.maxTweets ?? DEFAULT_MAX_TWEETS),
@@ -693,7 +702,7 @@ function refreshPeriodDigestInputsEffect(
 				emitDigestStatus(
 					handlers,
 					"Fetching home timeline from X",
-					"Walking the selected time window with xurl.",
+					`Walking the selected time window with ${mode}.`,
 				),
 			);
 			const result = yield* syncHomeTimelineEffect({
@@ -832,16 +841,106 @@ function digestCacheKey(
 	context: PeriodDigestContext,
 	options: PeriodDigestOptions,
 ) {
-	return [
-		"period-digest:v2",
-		modelFromOptions(options),
-		reasoningEffortFromOptions(options),
-		serviceTierFromOptions(options),
-		context.hash,
-	].join(":");
+	const key = analysisReportCacheKey("period-digest:v2", options, context.hash);
+	const lang = languageFromOptions(options);
+	return lang ? `${key}:lang:${lang}` : key;
 }
 
-function buildPrompt(context: PeriodDigestContext) {
+function latestDigestCacheKey(options: PeriodDigestOptions) {
+	const period = normalizePeriod(options.period);
+	const window = resolvePeriodDigestWindow(options);
+	const settings = resolveAnalysisModelSettings(options);
+	const identity = {
+		period,
+		day:
+			period === "today" || period === "yesterday"
+				? window.since
+				: localDateStart(new Date()).toISOString(),
+		since: options.since?.trim() || null,
+		until: options.until?.trim() || null,
+		account: options.account?.trim() || null,
+		includeDms: Boolean(options.includeDms),
+		maxTweets: Math.max(
+			20,
+			Math.trunc(options.maxTweets ?? DEFAULT_MAX_TWEETS),
+		),
+		maxLinks: Math.max(3, Math.trunc(options.maxLinks ?? DEFAULT_MAX_LINKS)),
+		model: settings.model,
+		language: languageFromOptions(options) ?? null,
+		reasoningEffort: settings.reasoningEffort,
+		serviceTier: settings.serviceTier,
+	};
+	return `period-digest-latest:v1:${createHash("sha1")
+		.update(JSON.stringify(identity))
+		.digest("hex")}`;
+}
+
+function collectDigestTweetIds(digest: PeriodDigest) {
+	const tweetIds = new Set(digest.sourceTweetIds);
+	for (const topic of digest.keyTopics) {
+		for (const tweetId of topic.tweetIds) tweetIds.add(tweetId);
+	}
+	for (const link of digest.notableLinks) {
+		for (const tweetId of link.sourceTweetIds) tweetIds.add(tweetId);
+	}
+	for (const action of digest.actionItems) {
+		if (action.tweetId) tweetIds.add(action.tweetId);
+	}
+	return [...tweetIds];
+}
+
+function enrichContextWithCitedTweets(
+	context: PeriodDigestContext,
+	digest: PeriodDigest,
+) {
+	const existingIds = new Set(context.tweets.map((tweet) => tweet.id));
+	const missingIds = collectDigestTweetIds(digest).filter(
+		(tweetId) => !existingIds.has(tweetId.replace(/^tweet_/, "")),
+	);
+	if (missingIds.length === 0) return context;
+	const citedTweets = getTweetsByIds(missingIds, context.account).map(
+		compactEmbeddedTweet,
+	);
+	return citedTweets.length > 0
+		? { ...context, tweets: [...context.tweets, ...citedTweets] }
+		: context;
+}
+
+interface CachedPeriodDigestValue extends CachedReport<PeriodDigest, "digest"> {
+	context?: PeriodDigestContext;
+	updatedAt?: string;
+}
+
+function cachedDigestResult(
+	cached: { value: CachedPeriodDigestValue; updatedAt: string },
+	context: PeriodDigestContext,
+): PeriodDigestRunResult {
+	const result = cachedAnalysisReport(
+		cached,
+		context,
+		"digest",
+		PeriodDigestSchema.parse,
+	);
+	return {
+		...result,
+		context: enrichContextWithCitedTweets(context, result.digest),
+		updatedAt: cached.value.updatedAt ?? cached.updatedAt,
+	};
+}
+
+function isFreshDigestCache(updatedAt: string) {
+	const timestamp = Date.parse(updatedAt);
+	return (
+		Number.isFinite(timestamp) &&
+		Date.now() - timestamp <= DEFAULT_DIGEST_FRESHNESS_MS
+	);
+}
+
+function buildPrompt(
+	context: PeriodDigestContext,
+	options?: { language?: string },
+) {
+	const language = normalizeDigestLanguage(options?.language);
 	const promptTweets = context.tweets.map((tweet) => ({
 		id: tweet.id,
 		url: tweet.url,
@@ -859,60 +958,22 @@ function buildPrompt(context: PeriodDigestContext) {
 		replyToId: tweet.replyToId,
 		replyToTweet: tweet.replyToTweet,
 	}));
-	const fitDataset = () => {
-		let tweetCount = promptTweets.length;
-		let dmCount = context.dms.length;
-		let linkCount = context.links.length;
-		const datasetFor = (tweets: number, dms: number, links: number) => ({
+	const {
+		dataset,
+		counts: { tweets: tweetCount },
+	} = fitAnalysisDataset(
+		{
+			tweets: promptTweets.length,
+			dms: context.dms.length,
+			links: context.links.length,
+		},
+		({ tweets, dms, links }) => ({
 			tweets: promptTweets.slice(0, tweets),
 			dms: context.dms.slice(0, dms),
 			links: context.links.slice(0, links),
-		});
-		const lengthFor = (tweets: number, dms: number, links: number) =>
-			JSON.stringify(datasetFor(tweets, dms, links)).length;
-		const fitCount = (max: number, fits: (count: number) => boolean) => {
-			let low = 0;
-			let high = max;
-			let best = 0;
-			while (low <= high) {
-				const mid = Math.floor((low + high) / 2);
-				if (fits(mid)) {
-					best = mid;
-					low = mid + 1;
-				} else {
-					high = mid - 1;
-				}
-			}
-			return best;
-		};
-		if (lengthFor(tweetCount, dmCount, linkCount) <= MAX_PROMPT_DATA_CHARS) {
-			return {
-				dataset: datasetFor(tweetCount, dmCount, linkCount),
-				tweetCount,
-			};
-		}
-		dmCount = fitCount(
-			dmCount,
-			(count) =>
-				lengthFor(tweetCount, count, linkCount) <= MAX_PROMPT_DATA_CHARS,
-		);
-		if (lengthFor(tweetCount, dmCount, linkCount) > MAX_PROMPT_DATA_CHARS) {
-			linkCount = fitCount(
-				linkCount,
-				(count) =>
-					lengthFor(tweetCount, dmCount, count) <= MAX_PROMPT_DATA_CHARS,
-			);
-		}
-		if (lengthFor(tweetCount, dmCount, linkCount) > MAX_PROMPT_DATA_CHARS) {
-			tweetCount = fitCount(
-				tweetCount,
-				(count) =>
-					lengthFor(count, dmCount, linkCount) <= MAX_PROMPT_DATA_CHARS,
-			);
-		}
-		return { dataset: datasetFor(tweetCount, dmCount, linkCount), tweetCount };
-	};
-	const { dataset, tweetCount } = fitDataset();
+		}),
+		["dms", "links", "tweets"],
+	);
 
 	return `Window: ${context.window.label}
 Since: ${context.window.since}
@@ -926,7 +987,7 @@ Requirements:
 - Stream one readable Markdown report first. The UI will show this text directly; do not rely on separate cards or structured summaries.
 - Target 700-1100 words when there is enough data.
 - Start with a 2-3 sentence lead that immediately says what people are talking about.
-- Use sections named "What people are talking about", "Important links shared", and "Worth opening". Add "Worth replying to" only if there are clearly high-signal replies.
+- Use sections named "What people are talking about", "Important links shared", and "Worth opening". Add "Worth replying to" only if there are clearly high-signal replies. Translate these section titles when a report language is requested.
 - When a tweet has replyToTweet, use that parent context to understand what the author was replying to and whether Peter already joined the conversation.
 - Use bullets under each section. Each bullet should be specific and explain why it matters.
 - For tweets: cite every claim with inline tweet ids at the end of the relevant sentence or bullet, e.g. (tweet_123, tweet_456). These citations become hoverable source links.
@@ -940,6 +1001,7 @@ Requirements:
 - Keep actionItems empty unless you wrote a "Worth replying to" section.
 - Put every tweet id cited in the Markdown into sourceTweetIds.
 - JSON shape: { "title": string, "summary": string, "keyTopics": [{ "title": string, "summary": string, "tweetIds": string[], "handles": string[] }], "notableLinks": [{ "title": string, "url": string, "why": string, "sourceTweetIds": string[] }], "people": [{ "handle": string, "name"?: string, "why": string }], "actionItems": [{ "kind": "reply"|"follow_up"|"read"|"sync", "label": string, "tweetId"?: string, "dmConversationId"?: string }], "sourceTweetIds": string[] }
+${language ? `- Write all human-readable prose, including section titles and JSON prose fields, in ${language}.\n- Preserve handles, URLs, tweet ids, and JSON property names exactly.` : ""}
 
 Dataset:
 ${JSON.stringify(dataset)}`;
@@ -948,12 +1010,22 @@ ${JSON.stringify(dataset)}`;
 function fallbackDigest(
 	context: PeriodDigestContext,
 	markdown: string,
+	language?: string,
 ): PeriodDigest {
-	const title = `${context.window.label} digest`;
+	const normalized = markdown.replaceAll(/\s+/g, " ").trim();
+	const heading = markdown
+		.split("\n")
+		.map((line) => line.match(/^#{1,6}\s+(.+)$/)?.[1]?.trim())
+		.find(Boolean);
+	const neutralFallback = language ? `[${language}]` : undefined;
 	return {
-		title,
+		title:
+			heading?.slice(0, 160) ??
+			neutralFallback ??
+			`${context.window.label} digest`,
 		summary:
-			markdown.replaceAll(/\s+/g, " ").trim().slice(0, 280) ||
+			normalized.slice(0, 280) ||
+			neutralFallback ||
 			"No model summary was returned.",
 		keyTopics: [],
 		notableLinks: [],
@@ -963,247 +1035,12 @@ function fallbackDigest(
 	};
 }
 
-function parseDigestFromHybridText(
-	context: PeriodDigestContext,
-	rawText: string,
-): { digest: PeriodDigest; markdown: string } {
-	const [markdownPart, jsonPart] = rawText.split(DELIMITER_PATTERN);
-	const markdown = (markdownPart ?? rawText).trim();
-	const candidate = jsonPart?.slice(
-		jsonPart.indexOf("{"),
-		jsonPart.lastIndexOf("}") + 1,
-	);
-	if (candidate?.startsWith("{")) {
-		try {
-			return {
-				markdown,
-				digest: PeriodDigestSchema.parse(JSON.parse(candidate)),
-			};
-		} catch {
-			return { markdown, digest: fallbackDigest(context, markdown) };
-		}
-	}
-	return { markdown, digest: fallbackDigest(context, markdown) };
-}
-
-function emitVisibleDelta(
-	state: OpenAIStreamState,
-	delta: string,
-	handlers: PeriodDigestStreamHandlers,
-) {
-	state.rawText += delta;
-	if (state.jsonMode) return;
-
-	const combined = state.pendingVisible + delta;
-	const delimiterIndex = combined.search(DELIMITER_PATTERN);
-	if (delimiterIndex >= 0) {
-		const visible = combined.slice(0, delimiterIndex);
-		if (visible) {
-			handlers.onDelta?.(visible);
-			handlers.onEvent?.({ type: "delta", delta: visible });
-		}
-		state.pendingVisible = "";
-		state.jsonMode = true;
-		return;
-	}
-
-	if (combined.length <= VISIBLE_DELIMITER_HOLD) {
-		state.pendingVisible = combined;
-		return;
-	}
-
-	const visible = combined.slice(0, -VISIBLE_DELIMITER_HOLD);
-	state.pendingVisible = combined.slice(-VISIBLE_DELIMITER_HOLD);
-	if (visible) {
-		handlers.onDelta?.(visible);
-		handlers.onEvent?.({ type: "delta", delta: visible });
-	}
-}
-
-function flushPendingVisible(
-	state: OpenAIStreamState,
-	handlers: PeriodDigestStreamHandlers,
-) {
-	if (state.jsonMode || !state.pendingVisible) return;
-	const delta = state.pendingVisible;
-	state.pendingVisible = "";
-	handlers.onDelta?.(delta);
-	handlers.onEvent?.({ type: "delta", delta });
-}
-
-function handleOpenAIEvent(
-	state: OpenAIStreamState,
-	event: Record<string, unknown>,
-	handlers: PeriodDigestStreamHandlers,
-) {
-	const type = typeof event.type === "string" ? event.type : "";
-	if (
-		type === "response.output_text.delta" &&
-		typeof event.delta === "string"
-	) {
-		emitVisibleDelta(state, event.delta, handlers);
-		return;
-	}
-	if (type === "response.completed") {
-		const response = event.response;
-		if (response && typeof response === "object") {
-			const record = response as Record<string, unknown>;
-			state.responseId = typeof record.id === "string" ? record.id : undefined;
-			state.usage = record.usage;
-		}
-		return;
-	}
-	if (type === "response.error" || type === "error") {
-		const error = event.error;
-		state.error =
-			error && typeof error === "object" && "message" in error
-				? String((error as { message?: unknown }).message)
-				: "OpenAI stream failed";
-		return;
-	}
-	if (type === "response.failed" || type === "response.incomplete") {
-		const response = event.response;
-		const record =
-			response && typeof response === "object"
-				? (response as Record<string, unknown>)
-				: {};
-		const error = record.error;
-		const incomplete = record.incomplete_details;
-		state.error =
-			error && typeof error === "object" && "message" in error
-				? String((error as { message?: unknown }).message)
-				: incomplete && typeof incomplete === "object" && "reason" in incomplete
-					? `OpenAI response incomplete: ${String((incomplete as { reason?: unknown }).reason)}`
-					: "OpenAI stream failed";
-	}
-}
-
-function processSseChunk(
-	state: OpenAIStreamState,
-	chunk: string,
-	handlers: PeriodDigestStreamHandlers,
-) {
-	state.eventBuffer += chunk;
-	let boundary = state.eventBuffer.indexOf("\n\n");
-	while (boundary >= 0) {
-		const block = state.eventBuffer.slice(0, boundary);
-		state.eventBuffer = state.eventBuffer.slice(boundary + 2);
-		const data = block
-			.split("\n")
-			.filter((line) => line.startsWith("data:"))
-			.map((line) => line.slice(5).trimStart())
-			.join("\n");
-		if (data && data !== "[DONE]") {
-			try {
-				handleOpenAIEvent(
-					state,
-					JSON.parse(data) as Record<string, unknown>,
-					handlers,
-				);
-			} catch {
-				// Ignore malformed event frames; the final JSON parse will decide result quality.
-			}
-		}
-		boundary = state.eventBuffer.indexOf("\n\n");
-	}
-}
-
-function createOpenAIRequestBody(
-	context: PeriodDigestContext,
+function cacheLatestDigest(
+	result: PeriodDigestRunResult,
 	options: PeriodDigestOptions,
 ) {
-	return {
-		model: modelFromOptions(options),
-		reasoning: { effort: reasoningEffortFromOptions(options) },
-		service_tier: serviceTierFromOptions(options),
-		store: false,
-		stream: true,
-		max_output_tokens: 7000,
-		input: [
-			{
-				role: "system",
-				content:
-					"You are a precise local Twitter archive analyst. Stream Markdown first, then emit the requested JSON object after the delimiter. Do not invent events not present in the dataset.",
-			},
-			{
-				role: "user",
-				content: buildPrompt(context),
-			},
-		],
-	};
-}
-
-function readOpenAIStreamEffect(
-	response: Response,
-	context: PeriodDigestContext,
-	options: PeriodDigestOptions,
-	handlers: PeriodDigestStreamHandlers,
-): Effect.Effect<PeriodDigestRunResult, Error> {
-	const reader = response.body?.getReader();
-	if (!reader) {
-		return Effect.fail(new Error("OpenAI response did not include a stream"));
-	}
-
-	const decoder = new TextDecoder();
-	const state: OpenAIStreamState = {
-		eventBuffer: "",
-		rawText: "",
-		pendingVisible: "",
-		jsonMode: false,
-	};
-
-	return Effect.gen(function* () {
-		for (;;) {
-			const { done, value } = yield* tryDigestPromise(() => reader.read());
-			if (!done) {
-				processSseChunk(
-					state,
-					decoder.decode(value, { stream: true }),
-					handlers,
-				);
-				continue;
-			}
-
-			flushPendingVisible(state, handlers);
-			if (state.error) {
-				return yield* Effect.fail(new Error(state.error));
-			}
-
-			const parsed = yield* tryDigestSync(() =>
-				parseDigestFromHybridText(context, state.rawText),
-			);
-			const cacheKey = digestCacheKey(context, options);
-			const updatedAt = yield* tryDigestSync(() =>
-				writeSyncCache(cacheKey, {
-					digest: parsed.digest,
-					markdown: parsed.markdown,
-					model: modelFromOptions(options),
-					reasoningEffort: reasoningEffortFromOptions(options),
-					serviceTier: serviceTierFromOptions(options),
-					usage: state.usage,
-					responseId: state.responseId,
-				}),
-			);
-			const result: PeriodDigestRunResult = {
-				context,
-				digest: parsed.digest,
-				markdown: parsed.markdown,
-				model: modelFromOptions(options),
-				reasoningEffort: reasoningEffortFromOptions(options),
-				serviceTier: serviceTierFromOptions(options),
-				cached: false,
-				updatedAt,
-			};
-			handlers.onEvent?.({ type: "done", result });
-			return result;
-		}
-	}).pipe(
-		Effect.ensuring(
-			Effect.sync(() => {
-				reader.releaseLock();
-			}),
-		),
-	);
+	const { cached: _cached, ...value } = result;
+	writeSyncCache(latestDigestCacheKey(options), value);
 }
 
 export function streamPeriodDigestEffect(
@@ -1211,47 +1048,54 @@ export function streamPeriodDigestEffect(
 	handlers: PeriodDigestStreamHandlers = {},
 ): Effect.Effect<PeriodDigestRunResult, Error> {
 	return Effect.gen(function* () {
-		yield* refreshPeriodDigestInputsEffect(
-			options,
-			{ threads: false },
-			handlers,
-		).pipe(Effect.catchAll(() => Effect.void));
-		let context = yield* tryDigestSync(() =>
-			collectPeriodDigestContext(options),
-		);
-		let cacheKey = digestCacheKey(context, options);
-		const cached = options.refresh
+		const resolvedOptions = {
+			...options,
+			language: yield* trySync(() => languageFromOptions(options)),
+		};
+		const latestCached = resolvedOptions.refresh
 			? null
-			: yield* tryDigestSync(() =>
-					readSyncCache<{
-						digest: PeriodDigest;
-						markdown: string;
-						model: string;
-						reasoningEffort: string;
-						serviceTier: string;
-					}>(cacheKey),
-				);
-
-		if (cached) {
-			const result: PeriodDigestRunResult = yield* tryDigestSync(() => ({
-				context,
-				digest: PeriodDigestSchema.parse(cached.value.digest),
-				markdown: cached.value.markdown,
-				model: cached.value.model,
-				reasoningEffort: cached.value.reasoningEffort,
-				serviceTier: cached.value.serviceTier,
-				cached: true,
-				updatedAt: cached.updatedAt,
-			}));
-			handlers.onEvent?.({ type: "start", context, cached: true });
-			handlers.onDelta?.(result.markdown);
-			handlers.onEvent?.({ type: "delta", delta: result.markdown });
-			handlers.onEvent?.({ type: "done", result });
+			: !resolvedOptions.liveSync
+				? yield* trySync(() =>
+						readSyncCache<CachedPeriodDigestValue>(
+							latestDigestCacheKey(resolvedOptions),
+						),
+					)
+				: null;
+		const latestContext = latestCached?.value.context;
+		if (
+			latestCached &&
+			latestContext &&
+			isFreshDigestCache(latestCached.value.updatedAt ?? latestCached.updatedAt)
+		) {
+			const result = yield* trySync(() =>
+				cachedDigestResult(latestCached, latestContext),
+			);
+			emitCachedAnalysis(result, handlers);
 			return result;
 		}
 
 		yield* refreshPeriodDigestInputsEffect(
-			options,
+			resolvedOptions,
+			{ threads: false },
+			handlers,
+		).pipe(Effect.catchAll(() => Effect.void));
+		let context = yield* trySync(() =>
+			collectPeriodDigestContext(resolvedOptions),
+		);
+		const cacheKey = digestCacheKey(context, resolvedOptions);
+		const cached = resolvedOptions.refresh
+			? null
+			: yield* trySync(() => readSyncCache<CachedPeriodDigestValue>(cacheKey));
+
+		if (cached) {
+			const result = yield* trySync(() => cachedDigestResult(cached, context));
+			yield* trySync(() => cacheLatestDigest(result, resolvedOptions));
+			emitCachedAnalysis(result, handlers);
+			return result;
+		}
+
+		yield* refreshPeriodDigestInputsEffect(
+			resolvedOptions,
 			{
 				timeline: false,
 				mentions: false,
@@ -1262,39 +1106,26 @@ export function streamPeriodDigestEffect(
 			},
 			handlers,
 		).pipe(Effect.catchAll(() => Effect.void));
-		context = yield* tryDigestSync(() => collectPeriodDigestContext(options));
-		cacheKey = digestCacheKey(context, options);
-
-		const apiKey = process.env.OPENAI_API_KEY;
-		if (!apiKey) {
-			return yield* Effect.fail(new Error("OPENAI_API_KEY is not set"));
-		}
-
-		handlers.onEvent?.({ type: "start", context, cached: false });
-		emitDigestStatus(handlers, "Streaming AI summary");
-		const response = yield* tryDigestPromise(() =>
-			fetch("https://api.openai.com/v1/responses", {
-				method: "POST",
-				signal: options.signal,
-				headers: {
-					authorization: `Bearer ${apiKey}`,
-					"content-type": "application/json",
-				},
-				body: JSON.stringify(createOpenAIRequestBody(context, options)),
-			}),
-		);
-		if (!response.ok) {
-			const text = yield* tryDigestPromise(() => response.text());
-			return yield* Effect.fail(
-				new Error(
-					`OpenAI request failed: ${String(response.status)} ${text.slice(
-						0,
-						400,
-					)}`,
-				),
-			);
-		}
-		return yield* readOpenAIStreamEffect(response, context, options, handlers);
+		context = yield* trySync(() => collectPeriodDigestContext(resolvedOptions));
+		return yield* generateAnalysisReportEffect({
+			context,
+			key: "digest",
+			cacheKey: () => digestCacheKey(context, resolvedOptions),
+			options: resolvedOptions,
+			system:
+				"You are a precise local Twitter archive analyst. Stream Markdown first, then emit the requested JSON object after the delimiter. Do not invent events not present in the dataset.",
+			prompt: () =>
+				buildPrompt(context, {
+					language: languageFromOptions(resolvedOptions),
+				}),
+			parse: PeriodDigestSchema.parse,
+			fallback: (markdown) =>
+				fallbackDigest(context, markdown, languageFromOptions(resolvedOptions)),
+			handlers,
+			onStart: () => emitDigestStatus(handlers, "Streaming AI summary"),
+			enrichContext: (digest) => enrichContextWithCitedTweets(context, digest),
+			onSaved: (result) => cacheLatestDigest(result, resolvedOptions),
+		});
 	});
 }
 
@@ -1308,8 +1139,8 @@ export function streamPeriodDigest(
 export const __test__ = {
 	PeriodDigestSchema,
 	buildPrompt,
-	readOpenAIStreamEffect,
-	parseDigestFromHybridText,
-	processSseChunk,
+	digestCacheKey,
+	languageFromOptions,
+	normalizeDigestLanguage,
 	resolvePeriodDigestWindow,
 };

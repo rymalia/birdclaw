@@ -30,8 +30,16 @@ vi.mock("./bird", () => ({
 }));
 
 vi.mock("./xurl", () => ({
-	lookupUsersByHandles: mocks.lookupUsersByHandles,
-	lookupUsersByIds: mocks.lookupUsersByIds,
+	lookupUsersByHandlesEffect: (handles: string[]) =>
+		Effect.tryPromise({
+			try: () => mocks.lookupUsersByHandles(handles),
+			catch: (error) => error,
+		}),
+	lookupUsersByIdsEffect: (ids: string[]) =>
+		Effect.tryPromise({
+			try: () => mocks.lookupUsersByIds(ids),
+			catch: (error) => error,
+		}),
 }));
 
 let homeDir = "";
@@ -86,10 +94,27 @@ describe("profile resolver", () => {
 	});
 
 	afterEach(() => {
+		delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 		resetDatabaseForTests();
 		resetBirdclawPathsForTests();
 		delete process.env.BIRDCLAW_HOME;
 		rmSync(homeDir, { recursive: true, force: true });
+	});
+
+	it("prefers xurl for inferred profile lookups and falls back only for unresolved handles", async () => {
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "xurl";
+		mocks.lookupUsersByHandles.mockResolvedValue([
+			{ id: "42", username: "sam", name: "Sam" },
+		]);
+		mocks.lookupProfileViaBird.mockResolvedValue({
+			id: "43",
+			username: "other",
+			name: "Other",
+		});
+		const { resolveProfilesForHandles } = await import("./profile-resolver");
+		const results = await resolveProfilesForHandles(["sam", "other"]);
+		expect(results.map((result) => result.source)).toEqual(["xurl", "bird"]);
+		expect(mocks.lookupProfilesViaBird).toHaveBeenCalledWith(["other"]);
 	});
 
 	it("builds profile resolver effects lazily", async () => {
@@ -268,7 +293,7 @@ describe("profile resolver", () => {
 				status: "hit",
 				source: "xurl",
 				profile: expect.objectContaining({
-					id: "profile_local_fcoury",
+					id: "profile_user_123",
 					handle: "fcoury",
 					avatarUrl: "https://pbs.twimg.com/profile_images/123/avatar.jpg",
 					followersCount: 456,

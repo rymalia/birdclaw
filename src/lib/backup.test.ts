@@ -1,20 +1,31 @@
 // @vitest-environment node
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import {
 	appendFileSync,
+	chmodSync,
 	existsSync,
 	mkdirSync,
-	mkdtempSync,
 	readFileSync,
+	readlinkSync,
+	readdirSync,
+	realpathSync,
+	renameSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	insertTestAccount,
+	insertTestProfile,
+	insertTestTweet,
+	useTestHome,
+} from "../test/test-home";
+import {
+	__test__,
 	exportBackup,
 	exportBackupEffect,
 	getBackupDatabaseFingerprint,
@@ -22,21 +33,127 @@ import {
 	importBackupEffect,
 	maybeAutoSyncBackup,
 	maybeAutoUpdateBackup,
+	requestBackupAutoUpdate,
 	syncBackup,
 	updateBackupFromGitEffect,
 	validateBackup,
 	validateBackupEffect,
 } from "./backup";
-import { resetBirdclawPathsForTests } from "./config";
-import { getNativeDb, resetDatabaseForTests } from "./db";
+import { BACKUP_TABLE_CODECS } from "./backup-table-codecs";
+import { getBirdclawPaths, resetBirdclawPathsForTests } from "./config";
+import { getNativeDb } from "./db";
+import { refreshSearchRows } from "./search-index";
+import { syncIdentitySearchIndexForProfileIds } from "./identity-search-index";
+import NativeSqliteDatabase, { type Database } from "./sqlite";
+import { acquireScheduledJobLock } from "./scheduled-job";
+import { upsertProfileFromXUser } from "./x-profile";
 
-const tempDirs: string[] = [];
+const testHome = useTestHome({ prefix: "birdclaw-backup-home-" });
 
 function makeTempDir(prefix: string) {
-	const dir = mkdtempSync(path.join(os.tmpdir(), prefix));
-	tempDirs.push(dir);
-	return dir;
+	return testHome().makeTempDir(prefix);
 }
+
+function switchHome(prefix: string) {
+	return testHome().switchHome(prefix).root;
+}
+
+function snapshotTree(root: string) {
+	const files = new Map<string, Buffer>();
+	const visit = (directory: string) => {
+		for (const entry of readdirSync(directory).sort()) {
+			if (
+				entry === ".git" ||
+				entry.startsWith(".birdclaw-backup-transaction")
+			) {
+				continue;
+			}
+			const fullPath = path.join(directory, entry);
+			const relativePath = path.relative(root, fullPath);
+			if (statSync(fullPath).isDirectory()) visit(fullPath);
+			else files.set(relativePath, readFileSync(fullPath));
+		}
+	};
+	visit(root);
+	return files;
+}
+
+async function makeRecoveryJournalFixture(repoPath: string) {
+	const transactionRoot = (await __test__.transactionRootPaths(repoPath))[0]!;
+	mkdirSync(transactionRoot, { recursive: true, mode: 0o700 });
+	const stagePath = path.join(transactionRoot, "stage-adversarial");
+	const rollbackPath = path.join(transactionRoot, "rollback-adversarial");
+	mkdirSync(stagePath, { mode: 0o700 });
+	mkdirSync(rollbackPath, { mode: 0o700 });
+	const rawIndexPath = execFileSync(
+		"git",
+		["-C", repoPath, "rev-parse", "--git-path", "index"],
+		{ encoding: "utf8" },
+	).trim();
+	const gitIndexPath = path.isAbsolute(rawIndexPath)
+		? rawIndexPath
+		: path.resolve(repoPath, rawIndexPath);
+	const gitIndexBackupPath = path.join(rollbackPath, "git-index");
+	writeFileSync(gitIndexBackupPath, readFileSync(gitIndexPath));
+	const headBefore = execFileSync(
+		"git",
+		["-C", repoPath, "rev-parse", "HEAD"],
+		{ encoding: "utf8" },
+	).trim();
+	const repoStat = statSync(realpathSync(repoPath), { bigint: true });
+	const repoDevice = Number(repoStat.dev);
+	const repoInode = Number(repoStat.ino);
+	if (!Number.isSafeInteger(repoDevice) || !Number.isSafeInteger(repoInode)) {
+		throw new Error("test repository identity exceeds safe integer range");
+	}
+	const rawCommonDir = execFileSync(
+		"git",
+		["-C", repoPath, "rev-parse", "--git-common-dir"],
+		{ encoding: "utf8" },
+	).trim();
+	const gitCommonDir = realpathSync(
+		path.isAbsolute(rawCommonDir)
+			? rawCommonDir
+			: path.resolve(repoPath, rawCommonDir),
+	);
+	const commonStat = statSync(gitCommonDir);
+	return {
+		transactionRoot,
+		journalPath: path.join(transactionRoot, "journal.json"),
+		journal: {
+			version: 1,
+			repoPath: realpathSync(repoPath),
+			repoDevice,
+			repoInode,
+			repoBirthTimeNs: repoStat.birthtimeNs.toString(),
+			stagePath,
+			rollbackPath,
+			state: "committed",
+			liveExisted: {
+				data: true,
+				"README.md": true,
+				".gitattributes": true,
+				"manifest.json": true,
+			},
+			gitIndexPath,
+			gitIndexBackupPath,
+			gitIndexExisted: true,
+			headBefore,
+			gitCommonDir,
+			gitCommonDevice: commonStat.dev,
+			gitCommonInode: commonStat.ino,
+		},
+	};
+}
+
+afterEach(() => {
+	__test__.setBeforeStagedValidation(undefined);
+	__test__.setAfterPublicationRename(undefined);
+	__test__.setBeforeDatabaseOpen(undefined);
+	__test__.setBeforeCommittedCleanup(undefined);
+	__test__.setAfterPublication(undefined);
+	__test__.setAfterRecoveryCleanupBoundary(undefined);
+});
 
 function clearData() {
 	const db = getNativeDb();
@@ -49,15 +166,21 @@ function clearData() {
     delete from tweet_actions;
     delete from tweet_account_edges;
     delete from tweet_collections;
+		delete from tweet_sources;
+		delete from fxtwitter_observations;
+		delete from fxtwitter_fetches;
     delete from link_occurrences;
     delete from url_expansions;
     delete from blocks;
     delete from mutes;
     delete from dm_fts;
     delete from tweets_fts;
-    delete from dm_messages;
-    delete from dm_conversations;
-    delete from tweets;
+		delete from dm_messages;
+		delete from dm_conversations;
+		delete from tweet_subordinate_tombstones;
+		delete from tweet_revision_edges;
+		delete from tweet_revisions;
+		delete from tweets;
     delete from profile_bio_entities;
     delete from profile_snapshots;
     delete from profile_affiliations;
@@ -65,6 +188,19 @@ function clearData() {
     delete from accounts;
     delete from sync_cache;
 	`);
+}
+
+function setNoteTweet(
+	db: Database,
+	id: string,
+	text: string,
+	entities: object,
+) {
+	const entitiesJson = JSON.stringify(entities);
+	db.prepare(
+		"update tweets set text = ?, entities_json = ?, note_tweet_json = ? where id = ?",
+	).run(text, entitiesJson, JSON.stringify({ text, entities }), id);
+	refreshSearchRows(db, "tweet", [id]);
 }
 
 function writeBackupConfig(
@@ -78,6 +214,13 @@ function writeBackupConfig(
 ) {
 	writeFileSync(path.join(home, "config.json"), JSON.stringify({ backup }));
 	resetBirdclawPathsForTests();
+}
+
+function seedMinimalBackupFixture() {
+	const db = testHome().db;
+	insertTestAccount(db);
+	const profile = insertTestProfile(db);
+	return insertTestTweet(db, { authorProfileId: profile.id });
 }
 
 function seedBackupFixture() {
@@ -130,13 +273,13 @@ function seedBackupFixture() {
         '2025-01-01T00:00:00.000Z', '2025-01-02T00:00:00.000Z', '{}');
 
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at, is_replied,
-      reply_to_id, like_count, media_count, bookmarked, liked, entities_json,
+      id, author_profile_id, text, created_at, is_replied,
+      reply_to_id, like_count, media_count, entities_json,
       media_json, quoted_tweet_id
     ) values
-      ('tweet_2024', 'acct_primary', 'profile_me', 'home', 'Shipping text backups https://t.co/shared', '2024-12-31T23:59:00.000Z', 0, null, 12, 0, 0, 0, '{"hashtags":[{"text":"backup"}],"urls":[{"url":"https://t.co/shared","expandedUrl":"https://example.com/demo","displayUrl":"example.com/demo","start":22,"end":41}]}', '[]', null),
-      ('tweet_2025', 'acct_primary', 'profile_friend', 'bookmark', 'Saved useful thing', '2025-01-02T08:00:00.000Z', 0, null, 5, 1, 1, 1, '{}', '[{"type":"photo"}]', 'tweet_quote'),
-      ('tweet_unknown_date', 'acct_primary', 'profile_friend', 'like', 'Unknown creation date like', '1970-01-01T00:00:00.000Z', 0, null, 1, 0, 0, 1, '{}', '[]', null);
+      ('tweet_2024', 'profile_me', 'Shipping text backups https://t.co/shared', '2024-12-31T23:59:00.000Z', 0, null, 12, 0, '{"hashtags":[{"text":"backup"}],"urls":[{"url":"https://t.co/shared","expandedUrl":"https://example.com/demo","displayUrl":"example.com/demo","start":22,"end":41}]}', '[]', null),
+      ('tweet_2025', 'profile_friend', 'Saved useful thing', '2025-01-02T08:00:00.000Z', 0, null, 5, 1, '{}', '[{"type":"photo"}]', 'tweet_quote'),
+      ('tweet_unknown_date', 'profile_friend', 'Unknown creation date like', '1970-01-01T00:00:00.000Z', 0, null, 1, 0, '{}', '[]', null);
 
     insert into tweet_collections (
       account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
@@ -152,10 +295,33 @@ function seedBackupFixture() {
       ('acct_primary', 'tweet_2024', 'home', '2024-12-31T23:59:00.000Z', '2024-12-31T23:59:00.000Z', 1, 'archive', '{}', '2025-01-03T00:00:00.000Z'),
       ('acct_primary', 'tweet_2025', 'search', '2025-01-02T09:00:00.000Z', '2025-01-02T09:00:00.000Z', 1, 'bird', '{"query":"useful"}', '2025-01-03T00:00:00.000Z');
 
-    insert into tweets_fts (tweet_id, text) values
-      ('tweet_2024', 'Shipping text backups'),
-      ('tweet_2025', 'Saved useful thing'),
-      ('tweet_unknown_date', 'Unknown creation date like');
+    insert into tweet_sources (tweet_id, source, source_url, observed_at)
+    values (
+      'tweet_2024', 'fxtwitter',
+      'https://api.fxtwitter.com/2/status/tweet_2024',
+      '2025-01-03T00:00:00.000Z'
+    );
+
+		insert into fxtwitter_fetches (
+			id, endpoint_family, request_key, source_url, retrieved_at,
+			collection_state, partial_reasons_json, pages_fetched, items_observed,
+			terminal_cursor, next_cursor, upstream_count, failure_json
+		) values (
+			'fx_fetch_1', 'search', 'local-first',
+			'https://api.fxtwitter.com/2/search?q=local-first',
+			'2025-01-03T00:00:00.000Z', 'partial', '["caller_limit"]',
+			1, 1, null, 'next-cursor', null, null
+		);
+
+		insert into fxtwitter_observations (
+			endpoint_family, request_key, item_kind, item_id, source_url,
+			first_seen_at, last_seen_at, seen_count, last_fetch_id
+		) values (
+			'search', 'local-first', 'tweet', 'tweet_2024',
+			'https://api.fxtwitter.com/2/search?q=local-first',
+			'2025-01-03T00:00:00.000Z', '2025-01-03T00:00:00.000Z', 1,
+			'fx_fetch_1'
+		);
 
     insert into dm_conversations (
       id, account_id, participant_profile_id, title, inbox_kind, last_message_at, unread_count, needs_reply
@@ -169,18 +335,21 @@ function seedBackupFixture() {
       ('dm_1', 'dm:friend', 'profile_friend', 'Backup this please', '2025-01-05T09:00:00.000Z', 'inbound', 0, 0),
       ('dm_2', 'dm:friend', 'profile_me', 'On it', '2025-01-05T10:00:00.000Z', 'outbound', 1, 0);
 
-    insert into dm_fts (message_id, text) values
-      ('dm_1', 'Backup this please'),
-      ('dm_2', 'On it');
-
     insert into url_expansions (
       short_url, expanded_url, final_url, status, expanded_tweet_id,
       expanded_handle, title, description, error, source, updated_at
-    ) values (
+    ) values
+    (
       'https://t.co/shared', 'https://x.com/friend/status/2039395915421942108',
       'https://x.com/friend/status/2039395915421942108', 'hit',
       '2039395915421942108', 'friend', 'Shared tweet', 'An expanded DM share',
       null, 'network', '2025-01-05T10:01:00.000Z'
+    ),
+    (
+      'https://T.CO/shared', 'https://X.COM/friend/status/2039395915421942108',
+      'https://X.COM/friend/status/2039395915421942108', 'hit',
+      '2039395915421942108', 'friend', 'Shared tweet variant', 'Preserve valid URL spelling',
+      null, 'network', '2025-01-05T10:02:00.000Z'
     );
 
     insert into link_occurrences (
@@ -239,6 +408,12 @@ function seedBackupFixture() {
       'follow_snapshot_1'
     );
   `);
+	refreshSearchRows(db, "tweet", [
+		"tweet_2024",
+		"tweet_2025",
+		"tweet_unknown_date",
+	]);
+	refreshSearchRows(db, "dm", ["dm_1", "dm_2"]);
 }
 
 function expectNoDemoSeedRows() {
@@ -264,32 +439,22 @@ function expectNoDemoSeedRows() {
 	).toEqual({ count: 0 });
 }
 
-afterEach(() => {
-	resetDatabaseForTests();
-	resetBirdclawPathsForTests();
-	delete process.env.BIRDCLAW_HOME;
-	delete process.env.BIRDCLAW_CONFIG;
-	for (const dir of tempDirs.splice(0)) {
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
 describe("text backup", () => {
 	it("builds backup Git update effects lazily", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-lazy-home-");
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
+		switchHome("birdclaw-backup-lazy-home-");
 		const repoPath = path.join(
 			makeTempDir("birdclaw-backup-lazy-parent-"),
 			"repo",
 		);
+		const canonicalRepoPath =
+			await __test__.canonicalizeBackupRepoPath(repoPath);
 
 		const effect = updateBackupFromGitEffect({ repoPath });
 
 		expect(existsSync(repoPath)).toBe(false);
 		await expect(Effect.runPromise(effect)).resolves.toMatchObject({
 			ok: true,
-			repoPath,
+			repoPath: canonicalRepoPath,
 			pulled: false,
 			imported: false,
 		});
@@ -297,16 +462,14 @@ describe("text backup", () => {
 	}, 20000);
 
 	it("exposes backup export, import, and validation as Effects", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-effect-src-");
-		seedBackupFixture();
+		switchHome("birdclaw-backup-effect-src-");
+		const tweet = seedMinimalBackupFixture();
 		const repoPath = makeTempDir("birdclaw-backup-effect-store-");
 
 		const exported = await Effect.runPromise(exportBackupEffect({ repoPath }));
 		const validation = await Effect.runPromise(validateBackupEffect(repoPath));
 
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-effect-dst-");
+		switchHome("birdclaw-backup-effect-dst-");
 		const imported = await Effect.runPromise(
 			importBackupEffect({ repoPath, mode: "replace" }),
 		);
@@ -315,10 +478,28 @@ describe("text backup", () => {
 		expect(validation.ok).toBe(true);
 		expect(imported.ok).toBe(true);
 		expect(imported.mode).toBe("replace");
+		expect(exported.manifest.counts).toMatchObject({
+			accounts: 1,
+			profiles: 1,
+			tweets: 1,
+		});
+		const db = testHome().db;
+		expect(
+			db.prepare("select text from tweets where id = ?").get(tweet.id),
+		).toEqual({
+			text: tweet.text,
+		});
+		expect(
+			db
+				.prepare("select text from tweets_fts where tweet_id = ?")
+				.get(tweet.id),
+		).toEqual({
+			text: tweet.text,
+		});
 	}, 20000);
 
 	it("rejects backup export paths that traverse symlinked managed directories", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-symlink-src-");
+		switchHome("birdclaw-backup-symlink-src-");
 		seedBackupFixture();
 		const repoPath = makeTempDir("birdclaw-backup-symlink-store-");
 		const targetPath = makeTempDir("birdclaw-backup-symlink-target-");
@@ -363,9 +544,162 @@ describe("text backup", () => {
 		);
 	});
 
+	it.each([
+		"non-Git file",
+		"dangling symlink",
+		"Git-ignored file",
+		".DS_Store symlink",
+		".DS_Store directory",
+	] as const)(
+		"rejects a %s data extra before publication",
+		async (extra) => {
+			seedMinimalBackupFixture();
+			const repoPath = makeTempDir("birdclaw-backup-extra-repo-");
+			const ignored = extra === "Git-ignored file";
+			await exportBackup({ repoPath, commit: ignored });
+			if (ignored) {
+				writeFileSync(path.join(repoPath, ".gitignore"), "data/private.json\n");
+				execFileSync("git", ["-C", repoPath, "add", ".gitignore"]);
+				execFileSync("git", [
+					"-C",
+					repoPath,
+					"-c",
+					"commit.gpgsign=false",
+					"commit",
+					"-m",
+					"test: ignore private data",
+				]);
+			}
+			const before = snapshotTree(repoPath);
+			const dangling =
+				extra === "dangling symlink" || extra === ".DS_Store symlink";
+			const directory = extra === ".DS_Store directory";
+			const extraName = extra.startsWith(".DS_Store")
+				? ".DS_Store"
+				: dangling
+					? "dangling.jsonl"
+					: "private.json";
+			const extraPath = path.join(repoPath, "data", extraName);
+			const targetPath = path.join(repoPath, "missing-target");
+			if (dangling) symlinkSync(targetPath, extraPath);
+			else if (directory) mkdirSync(extraPath);
+			else writeFileSync(extraPath, "private\n");
+			if (ignored) {
+				execFileSync("git", [
+					"-C",
+					repoPath,
+					"check-ignore",
+					"--quiet",
+					"data/private.json",
+				]);
+			}
+			const error = dangling
+				? `Unexpected symlink in backup data: data/${extraName}`
+				: directory
+					? "Unexpected backup data directory: data/.DS_Store"
+					: "Unexpected backup data file: data/private.json";
+			await expect(validateBackup(repoPath)).resolves.toMatchObject({
+				ok: false,
+				errors: expect.arrayContaining([error]),
+			});
+			await expect(exportBackup({ repoPath })).rejects.toThrow(error);
+			for (const [relativePath, content] of before) {
+				expect(readFileSync(path.join(repoPath, relativePath))).toEqual(
+					content,
+				);
+			}
+			const preservedExtra = directory
+				? readdirSync(extraPath)
+				: dangling
+					? readlinkSync(extraPath)
+					: readFileSync(extraPath, "utf8");
+			expect(preservedExtra).toEqual(
+				directory ? [] : dangling ? targetPath : "private\n",
+			);
+		},
+		20000,
+	);
+
+	it("ignores regular .DS_Store files at every data depth during validation and sync without committing them", async () => {
+		seedMinimalBackupFixture();
+		const repoPath = makeTempDir("birdclaw-finder-metadata-repo-");
+		const remotePath = path.join(
+			makeTempDir("birdclaw-finder-metadata-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		await exportBackup({ repoPath });
+		const metadataPaths = ["data/.DS_Store", "data/tweets/.DS_Store"];
+		const writeMetadata = (root: string) => {
+			for (const relativePath of metadataPaths)
+				writeFileSync(path.join(root, relativePath), "Finder metadata\n");
+		};
+		writeMetadata(repoPath);
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		// Finder can also create metadata between export and publication.
+		__test__.setBeforeStagedValidation(writeMetadata);
+		await syncBackup({ repoPath, remote: remotePath });
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"config",
+			"core.excludesFile",
+			"/dev/null",
+		]);
+		writeMetadata(repoPath);
+		await syncBackup({ repoPath, remote: remotePath });
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		for (const relativePath of metadataPaths)
+			expect(existsSync(path.join(repoPath, relativePath))).toBe(true);
+		const trackedPaths = execFileSync(
+			"git",
+			["-C", repoPath, "ls-tree", "-r", "--name-only", "HEAD"],
+			{ encoding: "utf8" },
+		);
+		expect(trackedPaths).not.toContain(".DS_Store");
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "ls-tree", "-r", "--name-only", "main"],
+				{ encoding: "utf8" },
+			),
+		).not.toContain(".DS_Store");
+	}, 30000);
+
+	it("removes previously tracked .DS_Store metadata from the next backup commit", async () => {
+		seedMinimalBackupFixture();
+		const repoPath = makeTempDir("birdclaw-tracked-metadata-repo-");
+		await exportBackup({ repoPath, commit: true });
+		writeFileSync(
+			path.join(repoPath, "data", ".DS_Store"),
+			"old Finder metadata\n",
+		);
+		execFileSync("git", ["-C", repoPath, "add", "-f", "--", "data/.DS_Store"]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"-c",
+			"commit.gpgsign=false",
+			"commit",
+			"-m",
+			"test: previously tracked metadata",
+		]);
+		expect(await exportBackup({ repoPath, commit: true })).toMatchObject({
+			git: { committed: true },
+			validation: { ok: true },
+		});
+		expect(
+			execFileSync(
+				"git",
+				["-C", repoPath, "ls-tree", "-r", "--name-only", "HEAD"],
+				{ encoding: "utf8" },
+			),
+		).not.toContain(".DS_Store");
+	});
+
 	it("builds backup import effects lazily", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-import-src-");
-		seedBackupFixture();
+		switchHome("birdclaw-backup-import-src-");
+		const tweet = seedMinimalBackupFixture();
 		const repoPath = makeTempDir("birdclaw-backup-import-store-");
 
 		const effect = importBackupEffect({ repoPath, mode: "replace" });
@@ -373,23 +707,36 @@ describe("text backup", () => {
 		expect(existsSync(path.join(repoPath, "manifest.json"))).toBe(false);
 		await exportBackup({ repoPath });
 
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-import-dst-");
+		switchHome("birdclaw-backup-import-dst-");
 		const imported = await Effect.runPromise(effect);
 
 		expect(imported.ok).toBe(true);
 		expect(imported.mode).toBe("replace");
 		expect(
 			getNativeDb({ seedDemoData: false })
-				.prepare("select count(*) as count from tweets where id = 'tweet_2025'")
-				.get(),
+				.prepare("select count(*) as count from tweets where id = ?")
+				.get(tweet.id),
 		).toEqual({ count: 1 });
 	}, 20000);
 
 	it("exports JSONL shards and imports them without changing the portable fingerprint", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-src-");
+		switchHome("birdclaw-backup-src-");
 		seedBackupFixture();
+		const collectionRawJson = JSON.stringify({
+			id: "tweet_2025",
+			text: "line\u2028separator\u2029done",
+		});
+		getNativeDb()
+			.prepare(
+				`
+        update tweet_collections
+        set raw_json = ?
+        where account_id = 'acct_primary'
+          and tweet_id = 'tweet_2025'
+          and kind = 'likes'
+        `,
+			)
+			.run(collectionRawJson);
 		const before = getBackupDatabaseFingerprint();
 		const repoPath = makeTempDir("birdclaw-store-");
 
@@ -403,13 +750,16 @@ describe("text backup", () => {
 			profile_snapshots: 1,
 			profile_bio_entities: 2,
 			tweets: 3,
+			tweet_sources: 1,
+			fxtwitter_fetches: 1,
+			fxtwitter_observations: 1,
 			timeline_edges_home: 1,
 			timeline_edges_search: 1,
 			collections_bookmarks: 1,
 			collections_likes: 2,
 			dm_conversations: 1,
 			dm_messages: 2,
-			url_expansions: 1,
+			url_expansions: 2,
 			link_occurrences: 1,
 			blocks: 1,
 			mutes: 1,
@@ -429,6 +779,15 @@ describe("text backup", () => {
 		expect(existsSync(path.join(repoPath, "data/tweets/unknown.jsonl"))).toBe(
 			true,
 		);
+		expect(existsSync(path.join(repoPath, "data/tweet_sources.jsonl"))).toBe(
+			true,
+		);
+		expect(
+			existsSync(path.join(repoPath, "data/fxtwitter/fetches.jsonl")),
+		).toBe(true);
+		expect(
+			existsSync(path.join(repoPath, "data/fxtwitter/observations.jsonl")),
+		).toBe(true);
 		expect(existsSync(path.join(repoPath, "data/dms/2025.jsonl"))).toBe(true);
 		expect(
 			existsSync(path.join(repoPath, "data/links/url_expansions.jsonl")),
@@ -437,8 +796,19 @@ describe("text backup", () => {
 			existsSync(path.join(repoPath, "data/links/occurrences.jsonl")),
 		).toBe(true);
 		expect(
-			readFileSync(path.join(repoPath, "data/tweets/2025.jsonl"), "utf8"),
-		).toContain('"bookmarked":1');
+			readFileSync(
+				path.join(repoPath, "data/collections/bookmarks.jsonl"),
+				"utf8",
+			),
+		).toContain('"kind":"bookmarks"');
+		const likesJsonl = readFileSync(
+			path.join(repoPath, "data/collections/likes.jsonl"),
+			"utf8",
+		);
+		expect(likesJsonl).not.toContain("\u2028");
+		expect(likesJsonl).not.toContain("\u2029");
+		expect(likesJsonl).toContain("\\u2028");
+		expect(likesJsonl).toContain("\\u2029");
 		expect(
 			readFileSync(
 				path.join(repoPath, "data/timeline_edges/search.jsonl"),
@@ -464,9 +834,7 @@ describe("text backup", () => {
 			true,
 		);
 
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-dst-");
+		switchHome("birdclaw-backup-dst-");
 		const staleDb = getNativeDb();
 		staleDb.exec(`
       insert into url_expansions (
@@ -494,6 +862,10 @@ describe("text backup", () => {
 				)
 				.all(),
 		).toEqual([
+			{
+				short_url: "https://T.CO/shared",
+				expanded_tweet_id: "2039395915421942108",
+			},
 			{
 				short_url: "https://t.co/shared",
 				expanded_tweet_id: "2039395915421942108",
@@ -530,10 +902,55 @@ describe("text backup", () => {
 		expect(
 			getNativeDb({ seedDemoData: false })
 				.prepare(
+					`
+          select raw_json
+          from tweet_collections
+          where account_id = 'acct_primary'
+            and tweet_id = 'tweet_2025'
+            and kind = 'likes'
+          `,
+				)
+				.get(),
+		).toEqual({ raw_json: collectionRawJson });
+		expect(
+			getNativeDb({ seedDemoData: false })
+				.prepare(
 					"select kind, source from tweet_account_edges where tweet_id = 'tweet_2025' and kind = 'search'",
 				)
 				.get(),
 		).toEqual({ kind: "search", source: "bird" });
+		expect(
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					"select source, source_url from tweet_sources where tweet_id = 'tweet_2024'",
+				)
+				.get(),
+		).toEqual({
+			source: "fxtwitter",
+			source_url: "https://api.fxtwitter.com/2/status/tweet_2024",
+		});
+		expect(
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					"select collection_state, partial_reasons_json, next_cursor from fxtwitter_fetches where id = 'fx_fetch_1'",
+				)
+				.get(),
+		).toEqual({
+			collection_state: "partial",
+			partial_reasons_json: '["caller_limit"]',
+			next_cursor: "next-cursor",
+		});
+		expect(
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					"select endpoint_family, request_key, item_id from fxtwitter_observations where item_id = 'tweet_2024'",
+				)
+				.get(),
+		).toEqual({
+			endpoint_family: "search",
+			request_key: "local-first",
+			item_id: "tweet_2024",
+		});
 		expect(
 			getNativeDb({ seedDemoData: false })
 				.prepare(
@@ -556,25 +973,192 @@ describe("text backup", () => {
 		expect(validation.ok).toBe(true);
 	}, 20000);
 
-	it("does not downgrade a fresh DM request when merging a stale backup", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-dm-merge-");
+	it("round-trips Note Tweets and their FTS content through backups", async () => {
+		switchHome("birdclaw-backup-note-src-");
 		seedBackupFixture();
-		const repoPath = makeTempDir("birdclaw-backup-dm-merge-repo-");
+		const text = "Full backup Note Tweet backuptailneedle #longform";
+		const entities = {
+			hashtags: [{ tag: "longform", start: 45, end: 54 }],
+		};
+		setNoteTweet(getNativeDb(), "tweet_2024", text, entities);
+		const repoPath = makeTempDir("birdclaw-backup-note-store-");
 		await exportBackup({ repoPath });
 
-		const conversationsPath = path.join(
-			repoPath,
-			"data/dms/conversations.jsonl",
+		switchHome("birdclaw-backup-note-dst-");
+		await importBackup({ repoPath, mode: "replace" });
+		const db = getNativeDb({ seedDemoData: false });
+		const row = db
+			.prepare(
+				"select text, entities_json, note_tweet_json from tweets where id = 'tweet_2024'",
+			)
+			.get() as {
+			text: string;
+			entities_json: string;
+			note_tweet_json: string;
+		};
+
+		expect(row.text).toBe(text);
+		expect(JSON.parse(row.entities_json)).toEqual(entities);
+		expect(JSON.parse(row.note_tweet_json)).toEqual({ text, entities });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweets_fts match 'backuptailneedle'",
+				)
+				.get(),
+		).toEqual({ count: 1 });
+	}, 20000);
+
+	it("exports and syncs a fresh empty store with a staged data directory", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-empty-remote-"),
+			"remote.git",
 		);
-		writeFileSync(
-			conversationsPath,
-			readFileSync(conversationsPath, "utf8").replace(
-				'"inbox_kind":"request"',
-				'"inbox_kind":"accepted"',
-			),
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-empty-store-home-");
+		const db = getNativeDb({ seedDemoData: false });
+		const exportPath = makeTempDir("birdclaw-empty-export-");
+		const exported = await exportBackup({ repoPath: exportPath, db });
+		expect(exported.validation.ok).toBe(true);
+		expect(statSync(path.join(exportPath, "data")).isDirectory()).toBe(true);
+
+		const syncPath = makeTempDir("birdclaw-empty-sync-");
+		const synced = await syncBackup({
+			repoPath: syncPath,
+			remote: remotePath,
+			db,
+		});
+		expect(synced.exportResult.validation.ok).toBe(true);
+		expect(statSync(path.join(syncPath, "data")).isDirectory()).toBe(true);
+	}, 20000);
+
+	it("streams fingerprint rows instead of materializing every table", () => {
+		let iterateCalls = 0;
+		const database = {
+			prepare(sql: string) {
+				return {
+					all() {
+						throw new Error("fingerprinting must not materialize result sets");
+					},
+					iterate() {
+						iterateCalls += 1;
+						return [{ sql }].values();
+					},
+				};
+			},
+		} as unknown as Database;
+
+		const fingerprint = getBackupDatabaseFingerprint(database);
+
+		expect(iterateCalls).toBe(BACKUP_TABLE_CODECS.length);
+		expect(Object.values(fingerprint.counts)).toEqual(
+			BACKUP_TABLE_CODECS.map(() => 1),
+		);
+	});
+
+	it("skips topology normalization for canonical singleton revisions", async () => {
+		switchHome("birdclaw-backup-singleton-src-");
+		seedBackupFixture();
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		sourceDb.exec(`
+			insert into tweet_revisions (
+				root_tweet_id, revision_id, revision_index, payload_json, source, observed_at
+			) values (
+				'singleton', 'singleton', 0, null, 'xurl', '2026-08-01T00:00:00.000Z'
+			)
+		`);
+		const repoPath = makeTempDir("birdclaw-singleton-store-");
+		await exportBackup({ repoPath });
+
+		switchHome("birdclaw-backup-singleton-dst-");
+		const db = getNativeDb({ seedDemoData: false });
+		let topologyQueries = 0;
+		const instrumentedDb = new Proxy(db, {
+			get(target, property, receiver) {
+				if (property === "prepare") {
+					return (sql: string) => {
+						if (sql.includes("with recursive component")) topologyQueries += 1;
+						return target.prepare(sql);
+					};
+				}
+				const value = Reflect.get(target, property, receiver) as unknown;
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		}) as Database;
+
+		await importBackup({ repoPath, db: instrumentedDb, mode: "replace" });
+
+		expect(topologyQueries).toBe(0);
+	});
+
+	it("emits byte-identical current-schema data and hashes for the same database", async () => {
+		switchHome("birdclaw-backup-stable-src-");
+		seedBackupFixture();
+		const firstRepoPath = makeTempDir("birdclaw-backup-stable-first-");
+		const secondRepoPath = makeTempDir("birdclaw-backup-stable-second-");
+
+		const first = await exportBackup({ repoPath: firstRepoPath });
+		const second = await exportBackup({ repoPath: secondRepoPath });
+
+		expect(first.manifest.schemaVersion).toBe(8);
+		expect(second.manifest.files).toEqual(first.manifest.files);
+		expect(second.manifest.counts).toEqual(first.manifest.counts);
+		expect(second.manifest.backupHash).toBe(first.manifest.backupHash);
+		for (const file of first.manifest.files) {
+			expect(readFileSync(path.join(secondRepoPath, file.path))).toEqual(
+				readFileSync(path.join(firstRepoPath, file.path)),
+			);
+		}
+	}, 20000);
+
+	it("splits oversized logical shards into deterministic bounded part files", async () => {
+		switchHome("birdclaw-backup-parts-src-");
+		seedBackupFixture();
+		const db = getNativeDb();
+		const largeRawJson = JSON.stringify({ blob: "x".repeat(700_000) });
+		db.prepare("update profiles set raw_json = ?").run(largeRawJson);
+		const before = getBackupDatabaseFingerprint();
+		const repoPath = makeTempDir("birdclaw-backup-parts-store-");
+
+		const exported = await exportBackup({
+			repoPath,
+			maxShardBytes: 1_000_000,
+		});
+		const profileFiles = exported.manifest.files.filter((file) =>
+			file.path.startsWith("data/profiles.part-"),
 		);
 
-		await importBackup({ repoPath, validate: false });
+		expect(profileFiles.map((file) => file.path)).toEqual([
+			"data/profiles.part-0001.jsonl",
+			"data/profiles.part-0002.jsonl",
+		]);
+		expect(profileFiles.every((file) => file.bytes <= 1_000_000)).toBe(true);
+		expect(profileFiles.reduce((sum, file) => sum + file.rows, 0)).toBe(2);
+		expect(existsSync(path.join(repoPath, "data/profiles.jsonl"))).toBe(false);
+		expect(exported.validation.ok).toBe(true);
+
+		switchHome("birdclaw-backup-parts-dst-");
+		const imported = await importBackup({ repoPath, mode: "replace" });
+		expect(imported.fingerprint).toEqual(before);
+	}, 20000);
+
+	it("does not downgrade a fresh DM request when merging a stale backup", async () => {
+		switchHome("birdclaw-backup-dm-merge-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-dm-merge-repo-");
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update dm_conversations set inbox_kind = 'accepted' where id = 'dm:friend'",
+			)
+			.run();
+		await exportBackup({ repoPath });
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update dm_conversations set inbox_kind = 'request' where id = 'dm:friend'",
+			)
+			.run();
+
+		await importBackup({ repoPath });
 
 		expect(
 			getNativeDb({ seedDemoData: false })
@@ -585,37 +1169,87 @@ describe("text backup", () => {
 		).toEqual({ inbox_kind: "request" });
 	});
 
+	it("merges backup tweets using the richer Note Tweet representation", async () => {
+		switchHome("birdclaw-backup-note-merge-src-");
+		seedBackupFixture();
+		const incomingText = "Incoming backup Note Tweet incomingnoteneedle";
+		const incomingEntities = {
+			hashtags: [{ tag: "incoming", start: 21, end: 30 }],
+		};
+		setNoteTweet(getNativeDb(), "tweet_2024", incomingText, incomingEntities);
+		const repoPath = makeTempDir("birdclaw-backup-note-merge-store-");
+		await exportBackup({ repoPath });
+
+		switchHome("birdclaw-backup-note-merge-dst-");
+		seedBackupFixture();
+		const db = getNativeDb({ seedDemoData: false });
+		const localText = "Local Note Tweet localnoteneedle";
+		const localEntities = {
+			hashtags: [{ tag: "local", start: 17, end: 23 }],
+		};
+		setNoteTweet(db, "tweet_2025", localText, localEntities);
+
+		await importBackup({ repoPath });
+
+		const rows = db
+			.prepare(
+				"select id, text, entities_json, note_tweet_json from tweets where id in ('tweet_2024', 'tweet_2025') order by id",
+			)
+			.all() as Array<{
+			id: string;
+			text: string;
+			entities_json: string;
+			note_tweet_json: string;
+		}>;
+		expect(rows.map((row) => row.text)).toEqual([incomingText, localText]);
+		expect(rows.map((row) => JSON.parse(row.entities_json))).toEqual([
+			incomingEntities,
+			localEntities,
+		]);
+		expect(rows.map((row) => JSON.parse(row.note_tweet_json))).toEqual([
+			{ text: incomingText, entities: incomingEntities },
+			{ text: localText, entities: localEntities },
+		]);
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweets_fts match 'incomingnoteneedle OR localnoteneedle'",
+				)
+				.get(),
+		).toEqual({ count: 2 });
+	}, 20000);
+
 	it("merges backup rows without deleting local-only tweets", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-src-");
+		switchHome("birdclaw-backup-src-");
 		seedBackupFixture();
 		const repoPath = makeTempDir("birdclaw-store-");
 		await exportBackup({ repoPath });
 
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-backup-merge-");
+		switchHome("birdclaw-backup-merge-");
 		const db = getNativeDb();
 		clearData();
-		db.exec(`
-      insert into accounts (
-        id, name, handle, external_user_id, transport, is_default, created_at
-      ) values (
-        'acct_primary', 'Peter Steinberger', '@steipete', '25401953', 'archive', 1, '2009-03-19T22:54:05.000Z'
-      );
-      insert into profiles (
-        id, handle, display_name, bio, followers_count, avatar_hue, avatar_url, created_at
-      ) values (
-        'profile_me', 'steipete', 'Peter Steinberger', '', 0, 42, null, '2009-03-19T22:54:05.000Z'
-      );
-      insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at, is_replied,
-        reply_to_id, like_count, media_count, bookmarked, liked, entities_json,
-        media_json, quoted_tweet_id
-      ) values (
-        'local_only', 'acct_primary', 'profile_me', 'home', 'Local-only tweet', '2026-01-01T00:00:00.000Z', 0,
-        null, 0, 0, 0, 0, '{}', '[]', null
-      );
-    `);
+		insertTestAccount(db, {
+			id: "acct_primary",
+			name: "Peter Steinberger",
+			handle: "@steipete",
+			externalUserId: "25401953",
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestProfile(db, {
+			id: "profile_me",
+			handle: "steipete",
+			displayName: "Peter Steinberger",
+			bio: "",
+			followersCount: 0,
+			followingCount: 0,
+			publicMetricsJson: "{}",
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestTweet(db, {
+			id: "local_only",
+			authorProfileId: "profile_me",
+			text: "Local-only tweet",
+		});
 
 		await importBackup({ repoPath });
 
@@ -631,11 +1265,1322 @@ describe("text backup", () => {
 		).toEqual({ "count(*)": 1 });
 	}, 20000);
 
+	it.each([
+		"older snapshot",
+		"no snapshot",
+		"two legacy aliases",
+		"newer snapshot",
+	])(
+		"folds a raw-proven legacy friend after importing all references with %s",
+		async (snapshot) => {
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			insertTestAccount(sourceDb, {
+				id: "acct_primary",
+				handle: "@owner",
+				externalUserId: "9000",
+			});
+			insertTestProfile(sourceDb, {
+				id: "profile_friend",
+				handle: "friend",
+				displayName: "Old Friend",
+				bio: "Old bio",
+				followersCount: 500,
+				rawJson: '{"id":"4242","username":"friend","name":"Old Friend"}',
+			});
+			if (snapshot === "two legacy aliases")
+				insertTestProfile(sourceDb, {
+					id: "profile_other_friend",
+					handle: "other_friend",
+					followersCount: 700,
+					rawJson: '{"id":"4242","username":"other_friend"}',
+				});
+			insertTestTweet(sourceDb, {
+				id: "legacy_tweet",
+				authorProfileId: "profile_friend",
+				text: "Legacy tweet",
+			});
+			sourceDb.exec(`
+				insert into dm_conversations (id, account_id, participant_profile_id, title, inbox_kind, last_message_at, unread_count, needs_reply)
+				values ('legacy_dm', 'acct_primary', 'profile_friend', 'Friend', 'primary', '2025-01-01T00:00:00.000Z', 0, 0);
+				insert into dm_messages (id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count)
+				values ('legacy_message', 'legacy_dm', 'profile_friend', 'Hello', '2025-01-01T00:00:00.000Z', 'inbound', 0, 0);
+				insert into follow_snapshots (id, account_id, direction, source, status, page_count, result_count, started_at, completed_at, raw_meta_json)
+				values ('legacy_snapshot', 'acct_primary', 'following', 'test', 'complete', 1, 1, '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', '{}');
+				insert into follow_snapshot_members (snapshot_id, profile_id, external_user_id, position)
+				values ('legacy_snapshot', 'profile_friend', '4242', 0);
+				insert into follow_edges (account_id, direction, profile_id, external_user_id, source, current, first_seen_at, last_seen_at, updated_at)
+				values ('acct_primary', 'following', 'profile_friend', '4242', 'test', 1, '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z');
+				insert into follow_events (id, account_id, direction, profile_id, external_user_id, kind, event_at, snapshot_id)
+				values ('legacy_event', 'acct_primary', 'following', 'profile_friend', '4242', 'started', '2025-01-01T00:00:00.000Z', 'legacy_snapshot');
+				insert into blocks (account_id, profile_id, source, created_at)
+				values ('acct_primary', 'profile_friend', 'test', '2025-01-01T00:00:00.000Z');
+				insert into mutes (account_id, profile_id, source, created_at)
+				values ('acct_primary', 'profile_friend', 'test', '2025-01-01T00:00:00.000Z');
+				insert into profile_bio_entities (profile_id, kind, value, source, is_active, first_seen_at, last_seen_at, raw_json)
+				values ('profile_friend', 'company_phrase', 'Synthetic Company', 'test', 1, '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', '{}');
+				insert into profile_affiliations (subject_profile_id, organization_profile_id, organization_name, organization_handle, source, is_active, first_seen_at, last_seen_at, raw_json, updated_at)
+				values ('profile_friend', 'profile_friend', 'Synthetic Company', 'friend', 'test', 1, '2025-01-01T00:00:00.000Z', '2025-01-01T00:00:00.000Z', '{}', '2025-01-01T00:00:00.000Z');
+			`);
+			const hasSnapshot =
+				snapshot === "older snapshot" || snapshot === "newer snapshot";
+			if (hasSnapshot) {
+				const timestamp =
+					snapshot === "newer snapshot"
+						? "2027-01-01T00:00:00.000Z"
+						: "2025-01-01T00:00:00.000Z";
+				sourceDb
+					.prepare(`
+					insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count, affiliations_json, raw_json)
+					select id, 'imported_friend', ?, ?, 'test', handle, display_name, bio, followers_count, following_count, '[]', raw_json from profiles where id = 'profile_friend';
+				`)
+					.run(timestamp, timestamp);
+			}
+			const repoPath = makeTempDir("birdclaw-legacy-friend-store-");
+			await exportBackup({ repoPath, db: sourceDb });
+
+			switchHome("birdclaw-legacy-friend-destination-");
+			const db = getNativeDb({ seedDemoData: false });
+			insertTestAccount(db, {
+				id: "acct_primary",
+				handle: "@owner",
+				externalUserId: "9000",
+			});
+			insertTestProfile(db, {
+				id: "profile_user_4242",
+				handle: "friend",
+				displayName: "Current Friend",
+				bio: "Current bio",
+				followersCount: snapshot === "newer snapshot" ? 1000 : 10,
+				rawJson: '{"id":"4242","username":"friend"}',
+			});
+			insertTestTweet(db, {
+				id: "local_tweet",
+				authorProfileId: "profile_user_4242",
+				text: "Local tweet",
+			});
+			db.exec(`
+				insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count, affiliations_json, raw_json)
+				select id, 'current_friend', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'test', handle, display_name, bio, followers_count, following_count, '[]', raw_json from profiles where id = 'profile_user_4242';
+			`);
+
+			expect(await importBackup({ repoPath, db })).toMatchObject({
+				ok: true,
+				mode: "merge",
+			});
+			expect(
+				db
+					.prepare(
+						"select id, handle, display_name, bio, followers_count from profiles order by id",
+					)
+					.all(),
+			).toEqual([
+				{
+					id: "profile_user_4242",
+					handle: "friend",
+					display_name:
+						snapshot === "newer snapshot" ? "Old Friend" : "Current Friend",
+					bio: snapshot === "newer snapshot" ? "Old bio" : "Current bio",
+					followers_count: snapshot === "newer snapshot" ? 500 : 10,
+				},
+			]);
+			for (const [table, column, count] of [
+				["tweets", "author_profile_id", 2],
+				["dm_conversations", "participant_profile_id", 1],
+				["dm_messages", "sender_profile_id", 1],
+				["follow_snapshot_members", "profile_id", 1],
+				["follow_edges", "profile_id", 1],
+				["follow_events", "profile_id", 1],
+				["blocks", "profile_id", 1],
+				["mutes", "profile_id", 1],
+				["profile_affiliations", "subject_profile_id", 1],
+				["profile_affiliations", "organization_profile_id", 1],
+			] as const) {
+				expect(
+					db
+						.prepare(
+							`select count(*) as count from ${table} where ${column} = 'profile_friend'`,
+						)
+						.get(),
+				).toEqual({ count: 0 });
+				expect(
+					db
+						.prepare(
+							`select count(*) as count from ${table} where ${column} = 'profile_user_4242'`,
+						)
+						.get(),
+				).toEqual({ count });
+			}
+			for (const table of [
+				"profile_snapshots",
+				"profile_bio_entities",
+				"identity_search_index",
+			]) {
+				expect(
+					db
+						.prepare(
+							`select count(*) as count from ${table} where profile_id = 'profile_friend'`,
+						)
+						.get(),
+				).toEqual({ count: 0 });
+				expect(
+					db
+						.prepare(
+							`select 1 from ${table} where profile_id = 'profile_user_4242' limit 1`,
+						)
+						.get(),
+				).toBeDefined();
+			}
+			expect(
+				db
+					.prepare(
+						"select count(*) as count from profile_snapshots where handle like 'birdclaw_stale_%'",
+					)
+					.get(),
+			).toEqual({ count: hasSnapshot ? 0 : 1 });
+			expect((await exportBackup({ repoPath, db })).validation.ok).toBe(true);
+			expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		},
+		20000,
+	);
+
+	it.each([
+		{ name: "missing identity", rawJson: "{}" },
+		{ name: "contradictory identity", rawJson: '{"id":"4242","rest_id":"77"}' },
+		{
+			name: "imported conflict marker",
+			rawJson: '{"id":"4242","birdclaw_identity_conflicts":["4242"]}',
+		},
+		{
+			name: "existing contradictory identity",
+			rawJson: '{"id":"4242"}',
+			existingRawJson: '{"id":"77"}',
+		},
+		{
+			name: "existing conflict marker",
+			rawJson: '{"id":"4242"}',
+			existingRawJson: '{"birdclaw_identity_conflicts":["4242"]}',
+		},
+	])(
+		"keeps an unproven legacy friend separate for $name",
+		async ({ rawJson, existingRawJson }) => {
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			insertTestProfile(sourceDb, {
+				id: "profile_friend",
+				handle: "FRIEND",
+				rawJson,
+			});
+			const repoPath = makeTempDir("birdclaw-unproven-friend-store-");
+			await exportBackup({ repoPath, db: sourceDb });
+			switchHome("birdclaw-unproven-friend-destination-");
+			const db = getNativeDb({ seedDemoData: false });
+			insertTestProfile(db, {
+				id: "profile_user_4242",
+				handle: "friend",
+				rawJson: '{"id":"4242"}',
+			});
+			if (existingRawJson)
+				insertTestProfile(db, {
+					id: "profile_friend",
+					handle: "legacy_friend",
+					rawJson: existingRawJson,
+				});
+			expect(await importBackup({ repoPath, db })).toMatchObject({ ok: true });
+			expect(await importBackup({ repoPath, db })).toMatchObject({ ok: true });
+			expect(
+				db.prepare("select id, handle from profiles order by id").all(),
+			).toEqual([
+				{
+					id: "profile_friend",
+					handle: expect.stringMatching(/^birdclaw_stale_/u),
+				},
+				{ id: "profile_user_4242", handle: "friend" },
+			]);
+		},
+	);
+
+	it.each([
+		'{"birdclaw_identity_conflicts":["4242"]}',
+		'{"id":"77"}',
+		'{"id":"77","rest_id":"88"}',
+	])(
+		"preserves legacy identity vetoes through an unproven import for %s",
+		async (existingRawJson) => {
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			insertTestProfile(sourceDb, {
+				id: "profile_friend",
+				handle: "friend",
+				rawJson: '{"username":"friend"}',
+			});
+			const unprovenRepo = makeTempDir("birdclaw-unproven-identity-store-");
+			await exportBackup({ repoPath: unprovenRepo, db: sourceDb });
+			sourceDb
+				.prepare("update profiles set raw_json = ? where id = 'profile_friend'")
+				.run('{"id":"4242","username":"friend"}');
+			const provenRepo = makeTempDir("birdclaw-proven-identity-store-");
+			await exportBackup({ repoPath: provenRepo, db: sourceDb });
+			switchHome("birdclaw-preserved-veto-destination-");
+			const db = getNativeDb({ seedDemoData: false });
+			insertTestProfile(db, {
+				id: "profile_friend",
+				handle: "legacy_friend",
+				rawJson: existingRawJson,
+			});
+			insertTestProfile(db, {
+				id: "profile_user_4242",
+				handle: "friend",
+				rawJson: '{"id":"4242"}',
+			});
+			await importBackup({ repoPath: unprovenRepo, db });
+			await importBackup({ repoPath: provenRepo, db });
+			expect(db.prepare("select id from profiles order by id").all()).toEqual([
+				{ id: "profile_friend" },
+				{ id: "profile_user_4242" },
+			]);
+		},
+	);
+
+	it.each(["no snapshot", "older snapshot", "newer snapshot"])(
+		"respects canonical handle-owner recency when importing a legacy alias with %s",
+		async (snapshot) => {
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			insertTestProfile(sourceDb, {
+				id: "profile_friend",
+				handle: "friend",
+				rawJson: '{"id":"4242","username":"friend"}',
+			});
+			if (snapshot !== "no snapshot") {
+				const timestamp =
+					snapshot === "older snapshot"
+						? "2025-01-01T00:00:00.000Z"
+						: "2027-01-01T00:00:00.000Z";
+				sourceDb
+					.prepare(`
+				insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count, affiliations_json, raw_json)
+				select id, 'imported_friend', ?, ?, 'test', handle, display_name, bio, followers_count, following_count, '[]', raw_json from profiles where id = 'profile_friend';
+			`)
+					.run(timestamp, timestamp);
+			}
+			const repoPath = makeTempDir("birdclaw-legacy-reused-handle-store-");
+			await exportBackup({ repoPath, db: sourceDb });
+			switchHome("birdclaw-legacy-reused-handle-destination-");
+			const db = getNativeDb({ seedDemoData: false });
+			upsertProfileFromXUser(db, {
+				id: "77",
+				username: "friend",
+				name: "Current Friend",
+			});
+			db.exec(
+				"update profile_snapshots set observed_at = '2026-01-01T00:00:00.000Z', last_seen_at = '2026-01-01T00:00:00.000Z'",
+			);
+			await importBackup({ repoPath, db });
+			const staleHandle = expect.stringMatching(/^birdclaw_stale_/u);
+			expect(
+				db.prepare("select id, handle from profiles order by id").all(),
+			).toEqual([
+				{
+					id: "profile_user_4242",
+					handle: snapshot === "newer snapshot" ? "friend" : staleHandle,
+				},
+				{
+					id: "profile_user_77",
+					handle: snapshot === "newer snapshot" ? staleHandle : "friend",
+				},
+			]);
+		},
+	);
+
+	it.each(["existing canonical profile", "new canonical profile"])(
+		"preserves accepted recency across older imports with a blocked handle for %s",
+		async (destination) => {
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			insertTestProfile(sourceDb, {
+				id: "profile_friend",
+				handle: "friend",
+				displayName: "New Friend",
+				bio: "New bio",
+				followersCount: 500,
+				rawJson: '{"id":"4242","username":"friend"}',
+			});
+			const snapshotProfile = sourceDb.prepare(`
+			insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count, affiliations_json, raw_json)
+			select id, ?, ?, ?, 'test', handle, display_name, bio, followers_count, following_count, '[]', raw_json from profiles where id = 'profile_friend'
+		`);
+			snapshotProfile.run(
+				"new_friend",
+				"2027-01-01T00:00:00.000Z",
+				"2027-01-01T00:00:00.000Z",
+			);
+			const newerRepo = makeTempDir("birdclaw-newer-blocked-handle-store-");
+			await exportBackup({ repoPath: newerRepo, db: sourceDb });
+			sourceDb.exec(
+				"update profiles set display_name = 'Old Friend', bio = 'Old bio', followers_count = 100 where id = 'profile_friend'",
+			);
+			snapshotProfile.run(
+				"old_friend",
+				"2025-01-01T00:00:00.000Z",
+				"2025-01-01T00:00:00.000Z",
+			);
+			const olderRepo = makeTempDir("birdclaw-older-blocked-handle-store-");
+			await exportBackup({ repoPath: olderRepo, db: sourceDb });
+			switchHome("birdclaw-blocked-handle-recency-destination-");
+			const db = getNativeDb({ seedDemoData: false });
+			if (destination === "existing canonical profile")
+				upsertProfileFromXUser(db, {
+					id: "4242",
+					username: "current_friend",
+					name: "Initial Friend",
+					description: "Initial bio",
+					public_metrics: { followers_count: 1000 },
+				});
+			upsertProfileFromXUser(db, {
+				id: "77",
+				username: "friend",
+				name: "Handle Owner",
+			});
+			db.exec(`
+			update profile_snapshots set observed_at = '2026-01-01T00:00:00.000Z', last_seen_at = '2026-01-01T00:00:00.000Z' where profile_id = 'profile_user_4242';
+			update profile_snapshots set observed_at = '2028-01-01T00:00:00.000Z', last_seen_at = '2028-01-01T00:00:00.000Z' where profile_id = 'profile_user_77';
+		`);
+			await importBackup({ repoPath: newerRepo, db });
+			await importBackup({ repoPath: olderRepo, db });
+			const staleHandle = expect.stringMatching(/^birdclaw_stale_/u);
+			expect(
+				db
+					.prepare(
+						"select handle, display_name, bio, followers_count from profiles where id = 'profile_user_4242'",
+					)
+					.get(),
+			).toEqual({
+				handle:
+					destination === "existing canonical profile"
+						? "current_friend"
+						: staleHandle,
+				display_name: "New Friend",
+				bio: "New bio",
+				followers_count: 500,
+			});
+			expect(
+				db
+					.prepare("select handle from profiles where id = 'profile_user_77'")
+					.get(),
+			).toEqual({ handle: "friend" });
+			expect(
+				(await exportBackup({ repoPath: newerRepo, db })).validation.ok,
+			).toBe(true);
+		},
+	);
+
+	it("uses historical snapshot recency when a legacy import creates its canonical profile", async () => {
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		insertTestProfile(sourceDb, {
+			id: "profile_friend",
+			handle: "friend",
+			bio: "Old bio",
+			followersCount: 500,
+			rawJson: '{"id":"4242","username":"friend"}',
+			createdAt: "2020-01-01T00:00:00.000Z",
+		});
+		const snapshotProfile = sourceDb.prepare(`
+			insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count, affiliations_json, raw_json)
+			select id, ?, ?, ?, 'test', handle, display_name, bio, followers_count, following_count, '[]', raw_json from profiles where id = 'profile_friend'
+		`);
+		snapshotProfile.run(
+			"old_friend",
+			"2024-01-01T00:00:00.000Z",
+			"2024-01-01T00:00:00.000Z",
+		);
+		const olderRepo = makeTempDir("birdclaw-historical-older-store-");
+		await exportBackup({ repoPath: olderRepo, db: sourceDb });
+		sourceDb.exec(
+			"update profiles set bio = 'New bio', followers_count = 100 where id = 'profile_friend'",
+		);
+		snapshotProfile.run(
+			"new_friend",
+			"2025-01-01T00:00:00.000Z",
+			"2025-01-01T00:00:00.000Z",
+		);
+		const newerRepo = makeTempDir("birdclaw-historical-newer-store-");
+		await exportBackup({ repoPath: newerRepo, db: sourceDb });
+		sourceDb.exec(
+			"update profiles set bio = 'Newest bio', followers_count = 50 where id = 'profile_friend'",
+		);
+		snapshotProfile.run(
+			"newest_friend",
+			"2025-06-01T00:00:00.000Z",
+			"2025-06-01T00:00:00.000Z",
+		);
+		const newestRepo = makeTempDir("birdclaw-historical-newest-store-");
+		await exportBackup({ repoPath: newestRepo, db: sourceDb });
+		switchHome("birdclaw-historical-recency-destination-");
+		const db = getNativeDb({ seedDemoData: false });
+		await importBackup({ repoPath: olderRepo, db });
+		await importBackup({ repoPath: newerRepo, db });
+		await importBackup({ repoPath: olderRepo, db });
+		await importBackup({ repoPath: newestRepo, db });
+		expect(
+			db.prepare("select id, handle, bio, followers_count from profiles").all(),
+		).toEqual([
+			{
+				id: "profile_user_4242",
+				handle: "friend",
+				bio: "Newest bio",
+				followers_count: 50,
+			},
+		]);
+	});
+
+	it("adopts a proven legacy selected-account backup after importing all references", async () => {
+		switchHome("birdclaw-backup-legacy-account-source-");
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		clearData();
+		insertTestAccount(sourceDb, {
+			id: "acct_primary",
+			handle: "@selected_owner",
+			externalUserId: "25401953",
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestProfile(sourceDb, {
+			id: "profile_me",
+			handle: "selected_owner",
+			displayName: "Legacy Selected Owner",
+			bio: "Legacy bio at @legacyco",
+			followersCount: 20_000,
+			followingCount: 500,
+			publicMetricsJson: '{"followers_count":20000,"following_count":500}',
+			rawJson: '{"id":"profile_me","username":"selected_owner"}',
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestProfile(sourceDb, {
+			id: "profile_user_25401953",
+			handle: "birdclaw_stub_25401953",
+			displayName: "Numeric Stub",
+			bio: "",
+			followersCount: 0,
+			followingCount: 0,
+			publicMetricsJson: "{}",
+			rawJson: '{"id":"25401953"}',
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestProfile(sourceDb, {
+			id: "profile_org_legacy",
+			handle: "legacyco",
+			displayName: "Legacy Co",
+		});
+		sourceDb.exec(`
+			insert into profile_snapshots (
+				profile_id, snapshot_hash, observed_at, last_seen_at, source,
+				handle, display_name, bio, followers_count, following_count,
+				affiliations_json, raw_json
+			) values
+				('profile_me', 'legacy-selected-state',
+				 '2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z',
+				 'backup-test', 'selected_owner', 'Legacy Selected Owner',
+				 'Legacy bio at @legacyco', 20000, 500,
+				 '[{"organizationHandle":"legacyco"}]', '{"id":"profile_me"}'),
+				('profile_user_25401953', 'legacy-numeric-stub',
+				 '2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z',
+				 'backup-test', 'birdclaw_stub_25401953', 'Numeric Stub', '',
+				 0, 0, '[]', '{"id":"25401953"}');
+
+			insert into profile_bio_entities (
+				profile_id, kind, value, source, is_active, first_seen_at,
+				last_seen_at, raw_json
+			) values (
+				'profile_me', 'handle', '@legacyco', 'backup-test', 1,
+				'2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z', '{}'
+			);
+
+			insert into profile_affiliations (
+				subject_profile_id, organization_profile_id, organization_name,
+				organization_handle, label, source, is_active, first_seen_at,
+				last_seen_at, raw_json, updated_at
+			) values (
+				'profile_me', 'profile_org_legacy', 'Legacy Co', 'legacyco',
+				'Legacy affiliation', 'backup-test', 1,
+				'2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z',
+				'{}', '2026-08-18T06:18:12.256Z'
+			);
+
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, like_count,
+				media_count, entities_json, media_json
+			) values (
+				'legacy-selected-tweet', 'profile_me', 'legacy reference',
+				'2026-08-18T06:18:12.256Z', 0, 0, 0, '{}', '[]'
+			);
+
+			insert into dm_conversations (
+				id, account_id, participant_profile_id, title, inbox_kind,
+				last_message_at, unread_count, needs_reply
+			) values (
+				'legacy-selected-dm', 'acct_primary', 'profile_me', 'Selected owner',
+				'accepted', '2026-08-18T06:18:12.256Z', 0, 0
+			);
+			insert into dm_messages (
+				id, conversation_id, sender_profile_id, text, created_at, direction,
+				is_replied, media_count
+			) values (
+				'legacy-selected-message', 'legacy-selected-dm', 'profile_me',
+				'legacy dm reference', '2026-08-18T06:18:12.256Z', 'outbound', 1, 0
+			);
+
+			insert into follow_snapshots (
+				id, account_id, direction, source, status, page_count, result_count,
+				started_at, completed_at, raw_meta_json
+			) values (
+				'legacy-follow-snapshot', 'acct_primary', 'following', 'backup-test',
+				'complete', 1, 1, '2026-08-18T06:18:12.256Z',
+				'2026-08-18T06:18:12.256Z', '{}'
+			);
+			insert into follow_snapshot_members (
+				snapshot_id, profile_id, external_user_id, position
+			) values ('legacy-follow-snapshot', 'profile_me', '25401953', 0);
+			insert into follow_edges (
+				account_id, direction, profile_id, external_user_id, source, current,
+				first_seen_at, last_seen_at, ended_at, updated_at
+			) values (
+				'acct_primary', 'following', 'profile_me', '25401953', 'backup-test',
+				1, '2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z', null,
+				'2026-08-18T06:18:12.256Z'
+			);
+			insert into follow_events (
+				id, account_id, direction, profile_id, external_user_id, kind,
+				event_at, snapshot_id
+			) values (
+				'legacy-follow-event', 'acct_primary', 'following', 'profile_me',
+				'25401953', 'started', '2026-08-18T06:18:12.256Z',
+				'legacy-follow-snapshot'
+			);
+
+			insert into x_lists (
+				account_id, list_id, name, owner_profile_id, owner_external_user_id,
+				is_private, source, membership_status, lists_synced_at,
+				member_page_count, member_result_count, rate_limit_json, raw_json,
+				updated_at
+			) values (
+				'acct_primary', 'legacy-list', 'Legacy list', 'profile_me', '25401953',
+				0, 'backup-test', 'complete', '2026-08-18T06:18:12.256Z', 1, 1,
+				'{}', '{}', '2026-08-18T06:18:12.256Z'
+			);
+			insert into x_list_members (
+				account_id, list_id, profile_id, external_user_id, source, current,
+				first_seen_at, last_seen_at, raw_json, updated_at
+			) values (
+				'acct_primary', 'legacy-list', 'profile_me', '25401953', 'backup-test',
+				1, '2026-08-18T06:18:12.256Z', '2026-08-18T06:18:12.256Z', '{}',
+				'2026-08-18T06:18:12.256Z'
+			);
+			insert into blocks (account_id, profile_id, source, created_at)
+			values ('acct_primary', 'profile_me', 'backup-test', '2026-08-18T06:18:12.256Z');
+			insert into mutes (account_id, profile_id, source, created_at)
+			values ('acct_primary', 'profile_me', 'backup-test', '2026-08-18T06:18:12.256Z');
+		`);
+		const repoPath = makeTempDir("birdclaw-legacy-account-store-");
+		const prior = await exportBackup({ repoPath, db: sourceDb });
+		expect(prior.validation.ok).toBe(true);
+
+		switchHome("birdclaw-backup-legacy-account-destination-");
+		const destinationDb = getNativeDb({ seedDemoData: false });
+		clearData();
+		insertTestAccount(destinationDb, {
+			id: "acct_primary",
+			handle: "@selected_owner",
+			externalUserId: "25401953",
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		insertTestProfile(destinationDb, {
+			id: "profile_user_25401953",
+			handle: "selected_owner",
+			displayName: "Current Selected Owner",
+			bio: "Current live bio",
+			followersCount: 15_000,
+			followingCount: 400,
+			publicMetricsJson: '{"followers_count":15000,"following_count":400}',
+			avatarUrl: "https://images.example/current.jpg",
+			rawJson: '{"id":"25401953","username":"selected_owner"}',
+			createdAt: "2009-03-19T22:54:05.000Z",
+		});
+		destinationDb
+			.prepare(
+				`insert into profile_snapshots (
+				profile_id, snapshot_hash, observed_at, last_seen_at, source,
+				handle, display_name, bio, followers_count, following_count,
+				affiliations_json, raw_json
+			) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			)
+			.run(
+				"profile_user_25401953",
+				"current-selected-state",
+				"2026-08-18T23:04:16.635Z",
+				"2026-08-18T23:04:16.635Z",
+				"live-test",
+				"selected_owner",
+				"Current Selected Owner",
+				"Current live bio",
+				15_000,
+				400,
+				"[]",
+				'{"id":"25401953"}',
+			);
+		syncIdentitySearchIndexForProfileIds(destinationDb, [
+			"profile_user_25401953",
+		]);
+
+		const imported = await importBackup({ repoPath, db: destinationDb });
+		const reexported = await exportBackup({ repoPath, db: destinationDb });
+
+		expect(imported.ok).toBe(true);
+		expect(imported.mode).toBe("merge");
+		expect(reexported.validation.ok).toBe(true);
+		expect(
+			destinationDb
+				.prepare(
+					"select id, handle, display_name, bio, followers_count, following_count, avatar_url from profiles where id in ('profile_me', 'profile_user_25401953') order by id",
+				)
+				.all(),
+		).toEqual([
+			{
+				id: "profile_user_25401953",
+				handle: "selected_owner",
+				display_name: "Current Selected Owner",
+				bio: "Current live bio",
+				followers_count: 15_000,
+				following_count: 400,
+				avatar_url: "https://images.example/current.jpg",
+			},
+		]);
+		for (const [table, column] of [
+			["tweets", "author_profile_id"],
+			["dm_conversations", "participant_profile_id"],
+			["dm_messages", "sender_profile_id"],
+			["profile_snapshots", "profile_id"],
+			["profile_bio_entities", "profile_id"],
+			["profile_affiliations", "subject_profile_id"],
+			["follow_snapshot_members", "profile_id"],
+			["follow_edges", "profile_id"],
+			["follow_events", "profile_id"],
+			["x_lists", "owner_profile_id"],
+			["x_list_members", "profile_id"],
+			["blocks", "profile_id"],
+			["mutes", "profile_id"],
+			["identity_search_index", "profile_id"],
+		] as const) {
+			expect(
+				destinationDb
+					.prepare(
+						`select count(*) as count from ${table} where ${column} = 'profile_me'`,
+					)
+					.get(),
+			).toEqual({ count: 0 });
+		}
+		expect(
+			destinationDb
+				.prepare(
+					"select author_profile_id from tweets where id = 'legacy-selected-tweet'",
+				)
+				.get(),
+		).toEqual({ author_profile_id: "profile_user_25401953" });
+		expect(
+			destinationDb
+				.prepare(
+					"select participant_profile_id from dm_conversations where id = 'legacy-selected-dm'",
+				)
+				.get(),
+		).toEqual({ participant_profile_id: "profile_user_25401953" });
+		expect(
+			destinationDb
+				.prepare(
+					"select profile_id, external_user_id from follow_edges where account_id = 'acct_primary' and direction = 'following'",
+				)
+				.get(),
+		).toEqual({
+			profile_id: "profile_user_25401953",
+			external_user_id: "25401953",
+		});
+		expect(
+			destinationDb
+				.prepare(
+					"select owner_profile_id, owner_external_user_id from x_lists where list_id = 'legacy-list'",
+				)
+				.get(),
+		).toEqual({
+			owner_profile_id: "profile_user_25401953",
+			owner_external_user_id: "25401953",
+		});
+		expect(
+			destinationDb
+				.prepare(
+					"select handle, bio, last_seen_at from profile_snapshots where profile_id = 'profile_user_25401953' and handle = 'selected_owner' and last_seen_at in ('2026-08-18T06:18:12.256Z', '2026-08-18T23:04:16.635Z') order by last_seen_at",
+				)
+				.all(),
+		).toEqual([
+			{
+				handle: "selected_owner",
+				bio: "Legacy bio at @legacyco",
+				last_seen_at: "2026-08-18T06:18:12.256Z",
+			},
+			{
+				handle: "selected_owner",
+				bio: "Current live bio",
+				last_seen_at: "2026-08-18T23:04:16.635Z",
+			},
+		]);
+		expect(
+			destinationDb
+				.prepare(
+					"select organization_handle from profile_affiliations where subject_profile_id = 'profile_user_25401953'",
+				)
+				.get(),
+		).toEqual({ organization_handle: "legacyco" });
+		expect(
+			destinationDb
+				.prepare(
+					"select value from identity_search_index where profile_id = 'profile_user_25401953' and value = 'selected_owner'",
+				)
+				.get(),
+		).toEqual({ value: "selected_owner" });
+		expect(
+			destinationDb
+				.prepare(
+					"select count(*) as count from identity_search_index where value like 'birdclaw_stale_%'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+	}, 20000);
+
+	it.each([
+		{
+			name: "contradictory raw identity",
+			accountHandle: "@selected_owner",
+			rawJson: '{"id":"999999","username":"selected_owner"}',
+		},
+		{
+			name: "selected account handle mismatch",
+			accountHandle: "@different_owner",
+			rawJson: "{}",
+		},
+	])(
+		"keeps unproven legacy profile_me separate for $name",
+		async ({ accountHandle, rawJson }) => {
+			switchHome("birdclaw-backup-unproven-legacy-source-");
+			const sourceDb = getNativeDb({ seedDemoData: false });
+			clearData();
+			insertTestAccount(sourceDb, {
+				id: "acct_primary",
+				handle: accountHandle,
+				externalUserId: "25401953",
+			});
+			insertTestProfile(sourceDb, {
+				id: "profile_me",
+				handle: "selected_owner",
+				displayName: "Unproven Legacy",
+				rawJson,
+			});
+			const repoPath = makeTempDir("birdclaw-unproven-legacy-store-");
+			await exportBackup({ repoPath, db: sourceDb });
+
+			switchHome("birdclaw-backup-unproven-legacy-destination-");
+			const destinationDb = getNativeDb({ seedDemoData: false });
+			clearData();
+			insertTestAccount(destinationDb, {
+				id: "acct_primary",
+				handle: "@selected_owner",
+				externalUserId: "25401953",
+			});
+			insertTestProfile(destinationDb, {
+				id: "profile_user_25401953",
+				handle: "selected_owner",
+				displayName: "Current Numeric Owner",
+				rawJson: '{"id":"25401953"}',
+			});
+
+			const imported = await importBackup({ repoPath, db: destinationDb });
+
+			expect(imported.ok).toBe(true);
+			expect(
+				destinationDb
+					.prepare(
+						"select id, handle from profiles where id in ('profile_me', 'profile_user_25401953') order by id",
+					)
+					.all(),
+			).toEqual([
+				expect.objectContaining({
+					id: "profile_me",
+					handle: expect.stringMatching(/^birdclaw_stale_/u),
+				}),
+				{
+					id: "profile_user_25401953",
+					handle: "selected_owner",
+				},
+			]);
+		},
+		20000,
+	);
+
+	it("keeps newer numeric profile identities when syncing a prior handle generation", async () => {
+		switchHome("birdclaw-backup-profile-handoff-");
+		const db = getNativeDb({ seedDemoData: false });
+		clearData();
+		insertTestAccount(db, {
+			id: "acct_primary",
+			handle: "@owner",
+			externalUserId: "9000",
+		});
+		const repoPath = makeTempDir("birdclaw-profile-handoff-store-");
+		const remotePath = path.join(
+			makeTempDir("birdclaw-profile-handoff-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			vi.setSystemTime(new Date("2026-08-18T10:00:00.000Z"));
+			upsertProfileFromXUser(db, {
+				id: "1001",
+				username: "alpha",
+				name: "Alpha",
+				description: "Founder at @oldco",
+				affiliation: {
+					organizationIds: ["profile_org_1"],
+					label: "Old Org",
+					organizationHandle: "oldorg",
+				},
+				public_metrics: { followers_count: 10, following_count: 5 },
+			});
+			upsertProfileFromXUser(db, {
+				id: "1002",
+				username: "beta",
+				name: "Beta",
+				description: "Original beta",
+				public_metrics: { followers_count: 20, following_count: 6 },
+			});
+			insertTestTweet(db, {
+				id: "tweet_profile_handoff",
+				authorProfileId: "profile_user_1001",
+				text: "Numeric identity stays put",
+			});
+			const prior = await exportBackup({ repoPath, db });
+
+			vi.setSystemTime(new Date("2026-08-18T11:00:00.000Z"));
+			db.transaction(() => {
+				upsertProfileFromXUser(db, {
+					id: "1001",
+					username: "beta",
+					name: "Alpha Current",
+					description: "Founder at @newco",
+					affiliation: {
+						organizationIds: ["profile_org_1"],
+						label: "Current Org",
+						organizationHandle: "currentorg",
+					},
+					public_metrics: { followers_count: 11, following_count: 5 },
+				});
+				upsertProfileFromXUser(db, {
+					id: "1002",
+					username: "alpha",
+					name: "Beta Current",
+					description: "Current alpha owner",
+					public_metrics: { followers_count: 21, following_count: 6 },
+				});
+			})();
+
+			const synced = await syncBackup({ repoPath, remote: remotePath, db });
+			const reexported = await exportBackup({ repoPath, db });
+
+			expect(synced.imported).toBe(true);
+			expect(synced.exportResult.validation.ok).toBe(true);
+			expect(reexported.validation.ok).toBe(true);
+			expect(reexported.manifest.backupHash).toBe(
+				synced.exportResult.manifest.backupHash,
+			);
+			expect(reexported.manifest.backupHash).not.toBe(
+				prior.manifest.backupHash,
+			);
+			expect(
+				db
+					.prepare(
+						"select id, handle, display_name, bio, raw_json from profiles where id in (?, ?) order by id",
+					)
+					.all("profile_user_1001", "profile_user_1002"),
+			).toEqual([
+				expect.objectContaining({
+					id: "profile_user_1001",
+					handle: "beta",
+					display_name: "Alpha Current",
+					bio: "Founder at @newco",
+					raw_json: expect.stringContaining('"id":"1001"'),
+				}),
+				expect.objectContaining({
+					id: "profile_user_1002",
+					handle: "alpha",
+					display_name: "Beta Current",
+					bio: "Current alpha owner",
+					raw_json: expect.stringContaining('"id":"1002"'),
+				}),
+			]);
+			expect(
+				db
+					.prepare(
+						"select author_profile_id from tweets where id = 'tweet_profile_handoff'",
+					)
+					.get(),
+			).toEqual({ author_profile_id: "profile_user_1001" });
+			expect(
+				db
+					.prepare(
+						"select handle from profile_snapshots where profile_id = ? and handle in ('alpha', 'beta') order by handle",
+					)
+					.all("profile_user_1001"),
+			).toEqual([{ handle: "alpha" }, { handle: "beta" }]);
+			expect(
+				db
+					.prepare(
+						"select value, is_active from profile_bio_entities where profile_id = ? and value in ('@newco', '@oldco') order by value",
+					)
+					.all("profile_user_1001"),
+			).toEqual([
+				{ value: "@newco", is_active: 1 },
+				{ value: "@oldco", is_active: 0 },
+			]);
+			expect(
+				db
+					.prepare(
+						"select organization_name, organization_handle, is_active from profile_affiliations where subject_profile_id = ? and organization_profile_id = ?",
+					)
+					.get("profile_user_1001", "profile_org_1"),
+			).toEqual({
+				organization_name: "Current Org",
+				organization_handle: "currentorg",
+				is_active: 1,
+			});
+			const exportedProfiles = readFileSync(
+				path.join(repoPath, "data/profiles.jsonl"),
+				"utf8",
+			);
+			expect(exportedProfiles).toContain(
+				'"handle":"beta","id":"profile_user_1001"',
+			);
+			expect(exportedProfiles).toContain(
+				'"handle":"alpha","id":"profile_user_1002"',
+			);
+		} finally {
+			vi.useRealTimers();
+		}
+	}, 20000);
+
+	it("adopts a newer backup profile generation into an older live database", async () => {
+		switchHome("birdclaw-backup-newer-profile-source-");
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		clearData();
+		insertTestAccount(sourceDb, {
+			id: "acct_primary",
+			handle: "@owner",
+			externalUserId: "9000",
+		});
+		const repoPath = makeTempDir("birdclaw-newer-profile-store-");
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			vi.setSystemTime(new Date("2026-08-18T10:00:00.000Z"));
+			upsertProfileFromXUser(sourceDb, {
+				id: "2001",
+				username: "north",
+				name: "North",
+				description: "Founder at @oldco",
+				public_metrics: { followers_count: 10, following_count: 5 },
+			});
+			upsertProfileFromXUser(sourceDb, {
+				id: "2002",
+				username: "south",
+				name: "South",
+				description: "Original south",
+				public_metrics: { followers_count: 20, following_count: 6 },
+			});
+			vi.setSystemTime(new Date("2026-08-18T11:00:00.000Z"));
+			sourceDb.transaction(() => {
+				upsertProfileFromXUser(sourceDb, {
+					id: "2001",
+					username: "south",
+					name: "North Current",
+					description: "Founder at @newco",
+					public_metrics: { followers_count: 11, following_count: 5 },
+				});
+				upsertProfileFromXUser(sourceDb, {
+					id: "2002",
+					username: "north",
+					name: "South Current",
+					description: "Current north owner",
+					public_metrics: { followers_count: 21, following_count: 6 },
+				});
+			})();
+			const newer = await exportBackup({ repoPath, db: sourceDb });
+
+			switchHome("birdclaw-backup-older-profile-destination-");
+			const destinationDb = getNativeDb({ seedDemoData: false });
+			clearData();
+			insertTestAccount(destinationDb, {
+				id: "acct_primary",
+				handle: "@owner",
+				externalUserId: "9000",
+			});
+			vi.setSystemTime(new Date("2026-08-18T10:00:00.000Z"));
+			upsertProfileFromXUser(destinationDb, {
+				id: "2001",
+				username: "north",
+				name: "North",
+				description: "Founder at @oldco",
+				public_metrics: { followers_count: 10, following_count: 5 },
+			});
+			upsertProfileFromXUser(destinationDb, {
+				id: "2002",
+				username: "south",
+				name: "South",
+				description: "Original south",
+				public_metrics: { followers_count: 20, following_count: 6 },
+			});
+			insertTestTweet(destinationDb, {
+				id: "tweet_older_profile_reference",
+				authorProfileId: "profile_user_2002",
+				text: "Keep this destination-only reference",
+			});
+
+			const imported = await importBackup({
+				repoPath,
+				db: destinationDb,
+			});
+			const reexported = await exportBackup({ repoPath, db: destinationDb });
+
+			expect(imported.ok).toBe(true);
+			expect(imported.mode).toBe("merge");
+			expect(newer.validation.ok).toBe(true);
+			expect(reexported.validation.ok).toBe(true);
+			expect(
+				destinationDb
+					.prepare(
+						"select id, handle, display_name, bio, followers_count, raw_json from profiles where id in (?, ?) order by id",
+					)
+					.all("profile_user_2001", "profile_user_2002"),
+			).toEqual([
+				expect.objectContaining({
+					id: "profile_user_2001",
+					handle: "south",
+					display_name: "North Current",
+					bio: "Founder at @newco",
+					followers_count: 11,
+					raw_json: expect.stringContaining('"id":"2001"'),
+				}),
+				expect.objectContaining({
+					id: "profile_user_2002",
+					handle: "north",
+					display_name: "South Current",
+					bio: "Current north owner",
+					followers_count: 21,
+					raw_json: expect.stringContaining('"id":"2002"'),
+				}),
+			]);
+			expect(
+				destinationDb
+					.prepare(
+						"select author_profile_id from tweets where id = 'tweet_older_profile_reference'",
+					)
+					.get(),
+			).toEqual({ author_profile_id: "profile_user_2002" });
+			expect(
+				destinationDb
+					.prepare(
+						"select handle from profile_snapshots where profile_id = ? and handle in ('north', 'south') order by handle",
+					)
+					.all("profile_user_2001"),
+			).toEqual([{ handle: "north" }, { handle: "south" }]);
+			expect(
+				destinationDb
+					.prepare(
+						"select value, is_active from profile_bio_entities where profile_id = ? and value in ('@newco', '@oldco') order by value",
+					)
+					.all("profile_user_2001"),
+			).toEqual([
+				{ value: "@newco", is_active: 1 },
+				{ value: "@oldco", is_active: 0 },
+			]);
+		} finally {
+			vi.useRealTimers();
+		}
+	}, 20000);
+
+	it("round-trips tweet tombstones, subordinate deletions, and edit revisions", async () => {
+		switchHome("birdclaw-backup-tombstone-src-");
+		seedBackupFixture();
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		sourceDb.exec(`
+			insert into tweets (
+				id, author_profile_id, text, created_at, is_replied, reply_to_id,
+				like_count, media_count, entities_json, media_json, quoted_tweet_id,
+				superseded_at, superseded_by_id
+			) values (
+				'tweet_2025_v1', 'profile_me', 'before edit',
+				'2025-01-02T07:00:00.000Z', 0, null, 0, 0, '{}', '[]', null,
+				'2025-01-02T08:00:00.000Z', 'tweet_2025'
+			), (
+				'tweet_2025_v2', 'profile_me', 'middle edit',
+				'2025-01-02T07:30:00.000Z', 0, null, 0, 0, '{}', '[]', null,
+				'2025-01-02T08:00:00.000Z', 'tweet_2025'
+			);
+			update tweets
+			set deleted_at = '2026-07-18T12:00:00.000Z',
+				deletion_source = 'twitter_archive',
+				deletion_reason = 'explicit_deleted_tweet_record',
+				media_json = '[{"media_key":"media-1","type":"photo"}]'
+			where id = 'tweet_2025';
+			insert into tweet_revisions (
+				root_tweet_id, revision_id, revision_index, payload_json, source, observed_at
+			) values
+				('tweet_2025_v1', 'tweet_2025_v1', 0, null, 'xurl', '2025-01-02T07:00:00.000Z'),
+				('tweet_2025_v1', 'tweet_2025_v2', 1, '{"text":"middle"}', 'xurl', '2025-01-02T07:30:00.000Z'),
+				('tweet_2025_v1', 'tweet_2025', 2, '{"text":"after"}', 'xurl', '2025-01-02T08:00:00.000Z');
+			insert into tweet_revisions (
+				root_tweet_id, revision_id, revision_index, payload_json, source, observed_at
+			) values
+				('partial_root', 'partial_root', 0, null, 'xurl', '2025-01-02T07:00:00.000Z'),
+				('partial_root', 'partial_left', 1, null, 'xurl', '2025-01-02T08:00:00.000Z'),
+				('partial_root', 'partial_right', 1, null, 'xurl', '2025-01-02T08:00:00.000Z');
+			insert into tweet_revision_edges (
+				older_revision_id, newer_revision_id, source, observed_at
+			) values
+				('tweet_2025_v1', 'tweet_2025_v2', 'xurl', '2025-01-02T07:30:00.000Z'),
+				('tweet_2025_v2', 'tweet_2025', 'xurl', '2025-01-02T08:00:00.000Z'),
+				('partial_root', 'partial_left', 'xurl', '2025-01-02T08:00:00.000Z'),
+				('partial_root', 'partial_right', 'xurl', '2025-01-02T08:00:00.000Z');
+			insert into tweet_subordinate_tombstones (
+				tweet_id, kind, subordinate_id, deleted_at, deletion_source, deletion_reason
+			) values
+				('tweet_2025', 'media', 'media-1', '2026-07-18T12:00:00.000Z', 'twitter_archive', 'parent_tweet_deleted'),
+				('tweet_2025', 'quote', 'tweet_quote', '2026-07-18T12:00:00.000Z', 'twitter_archive', 'parent_tweet_deleted');
+		`);
+		const repoPath = makeTempDir("birdclaw-tombstone-store-");
+		await exportBackup({ repoPath });
+
+		switchHome("birdclaw-backup-tombstone-dst-");
+		const db = getNativeDb({ seedDemoData: false });
+		insertTestTweet(db, {
+			id: "tweet_2025",
+			authorProfileId: "profile_me",
+			text: "later local copy",
+		});
+		db.exec(`
+			update tweets
+			set deleted_at = '2026-07-18T12:00:00.000Z',
+				deletion_source = null,
+				deletion_reason = null
+			where id = 'tweet_2025';
+			insert into tweet_subordinate_tombstones (
+				tweet_id, kind, subordinate_id, deleted_at, deletion_source, deletion_reason
+			) values
+			(
+				'tweet_2025', 'media', 'media-1', '2027-01-01T00:00:00.000Z',
+				'local_later', 'later_local_event'
+			),
+			(
+				'tweet_2025', 'quote', 'tweet_quote', '2026-07-18T12:00:00.000Z',
+				null, 'parent_tweet_deleted'
+			);
+			insert into tweet_revisions (
+				root_tweet_id, revision_id, revision_index, payload_json, source, observed_at
+			) values
+				('tweet_2025_v2', 'tweet_2025_v2', 0, null, 'xurl', '2025-01-02T07:30:00.000Z'),
+				('tweet_2025_v2', 'tweet_2025', 1, null, 'xurl', '2025-01-02T08:00:00.000Z');
+			insert into tweet_revision_edges (
+				older_revision_id, newer_revision_id, source, observed_at
+			) values
+				('tweet_2025_v2', 'tweet_2025', 'xurl', '2025-01-02T08:00:00.000Z');
+		`);
+		const result = await importBackup({ repoPath });
+
+		expect(result.mode).toBe("merge");
+		expect(
+			db
+				.prepare(
+					"select superseded_at, superseded_by_id from tweets where id = 'tweet_2025_v1'",
+				)
+				.get(),
+		).toEqual({
+			superseded_at: "2025-01-02T08:00:00.000Z",
+			superseded_by_id: "tweet_2025",
+		});
+		expect(
+			db
+				.prepare(
+					"select deleted_at, deletion_source, deletion_reason from tweets where id = 'tweet_2025'",
+				)
+				.get(),
+		).toEqual({
+			deleted_at: "2026-07-18T12:00:00.000Z",
+			deletion_source: "twitter_archive",
+			deletion_reason: "explicit_deleted_tweet_record",
+		});
+		expect(
+			db
+				.prepare(
+					"select kind, subordinate_id, deleted_at, deletion_source, deletion_reason from tweet_subordinate_tombstones where tweet_id = 'tweet_2025' order by kind, subordinate_id",
+				)
+				.all(),
+		).toEqual([
+			{
+				kind: "media",
+				subordinate_id: "media-1",
+				deleted_at: "2026-07-18T12:00:00.000Z",
+				deletion_source: "twitter_archive",
+				deletion_reason: "parent_tweet_deleted",
+			},
+			{
+				kind: "quote",
+				subordinate_id: "tweet_quote",
+				deleted_at: "2026-07-18T12:00:00.000Z",
+				deletion_source: "twitter_archive",
+				deletion_reason: "parent_tweet_deleted",
+			},
+		]);
+		expect(
+			db
+				.prepare(
+					"select revision_id, revision_index, payload_json is not null as hydrated from tweet_revisions where root_tweet_id = 'tweet_2025_v1' order by revision_index",
+				)
+				.all(),
+		).toEqual([
+			{ revision_id: "tweet_2025_v1", revision_index: 0, hydrated: 0 },
+			{ revision_id: "tweet_2025_v2", revision_index: 1, hydrated: 1 },
+			{ revision_id: "tweet_2025", revision_index: 2, hydrated: 1 },
+		]);
+		expect(
+			db
+				.prepare(
+					"select revision_id, revision_index from tweet_revisions where root_tweet_id = 'partial_root' order by revision_index, revision_id",
+				)
+				.all(),
+		).toEqual([
+			{ revision_id: "partial_root", revision_index: 0 },
+			{ revision_id: "partial_left", revision_index: 1 },
+			{ revision_id: "partial_right", revision_index: 1 },
+		]);
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweet_id = 'tweet_2025'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets_fts where tweet_id = 'tweet_2025_v1'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+	}, 20000);
+
 	it("syncs through git by pulling, merging, exporting, committing, and pushing", async () => {
 		const remotePath = path.join(makeTempDir("birdclaw-remote-"), "remote.git");
 		execFileSync("git", ["init", "--bare", remotePath]);
 
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-sync-src-");
+		switchHome("birdclaw-sync-src-");
 		seedBackupFixture();
 		const repoPath = makeTempDir("birdclaw-sync-work-");
 
@@ -648,10 +2593,13 @@ describe("text backup", () => {
 		expect(first.imported).toBe(false);
 		expect(first.exportResult.git?.committed).toBe(true);
 		expect(first.exportResult.git?.pushed).toBe(true);
+		expect(
+			(await __test__.pendingPushReceiptPaths(repoPath)).some((receiptPath) =>
+				existsSync(receiptPath),
+			),
+		).toBe(false);
 
-		resetDatabaseForTests();
-		resetBirdclawPathsForTests();
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-sync-dst-");
+		switchHome("birdclaw-sync-dst-");
 		const secondRepoPath = makeTempDir("birdclaw-sync-other-");
 		const second = await syncBackup({
 			repoPath: secondRepoPath,
@@ -674,7 +2622,7 @@ describe("text backup", () => {
 			collections_likes: 2,
 			dm_conversations: 1,
 			dm_messages: 2,
-			url_expansions: 1,
+			url_expansions: 2,
 			link_occurrences: 1,
 			blocks: 1,
 			mutes: 1,
@@ -700,10 +2648,2010 @@ describe("text backup", () => {
 				{ encoding: "utf8" },
 			).trim(),
 		).toBe("1");
+		expect(
+			execFileSync(
+				"git",
+				[
+					"-C",
+					secondRepoPath,
+					"show-ref",
+					"--verify",
+					"refs/remotes/origin/main",
+				],
+				{ encoding: "utf8" },
+			).trim(),
+		).toContain("refs/remotes/origin/main");
+	}, 20000);
+
+	it("adopts a validated non-Git export when syncing to an empty remote", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-adopt-export-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-adopt-export-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-adopt-export-repo-");
+		const exported = await exportBackup({ repoPath });
+		expect(exported.validation.ok).toBe(true);
+		expect(existsSync(path.join(repoPath, ".git"))).toBe(false);
+
+		const synced = await syncBackup({ repoPath, remote: remotePath });
+		const head = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+			encoding: "utf8",
+		}).trim();
+		expect(synced.exportResult.validation.ok).toBe(true);
+		expect(synced.imported).toBe(true);
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toBe("");
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(head);
+	}, 30000);
+
+	it("retries non-Git promotion after staged validation fails", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-adopt-retry-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-adopt-retry-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-adopt-retry-repo-");
+		await exportBackup({ repoPath });
+		const before = snapshotTree(repoPath);
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update profiles set bio = 'retry generation' where id = 'profile_friend'",
+			)
+			.run();
+		__test__.setBeforeStagedValidation(() => {
+			throw new Error("synthetic promoted validation failure");
+		});
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"synthetic promoted validation failure",
+		);
+		expect(existsSync(path.join(repoPath, ".git"))).toBe(false);
+		expect(snapshotTree(repoPath)).toEqual(before);
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		expect(
+			execFileSync(
+				"git",
+				[
+					"--git-dir",
+					remotePath,
+					"for-each-ref",
+					"--format=%(objectname)",
+					"refs/heads/main",
+				],
+				{ encoding: "utf8" },
+			),
+		).toBe("");
+
+		__test__.setBeforeStagedValidation(undefined);
+		await expect(
+			syncBackup({ repoPath, remote: remotePath }),
+		).resolves.toMatchObject({
+			ok: true,
+		});
+		expect(existsSync(path.join(repoPath, ".git"))).toBe(true);
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		);
+	}, 30000);
+
+	it("retains promoted Git when its initial push has a retry receipt", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-adopt-push-retry-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-adopt-push-retry-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-adopt-push-retry-repo-");
+		await exportBackup({ repoPath });
+		const hookPath = path.join(remotePath, "hooks", "pre-receive");
+		writeFileSync(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"Command failed",
+		);
+		expect(existsSync(path.join(repoPath, ".git"))).toBe(true);
+		expect(await validateBackup(repoPath)).toMatchObject({ ok: true });
+		expect(await __test__.pendingPushReceiptPaths(repoPath)).toHaveLength(1);
+		rmSync(hookPath);
+		let staged = false;
+		__test__.setBeforeStagedValidation(() => {
+			staged = true;
+		});
+
+		await expect(
+			syncBackup({ repoPath, remote: remotePath }),
+		).resolves.toMatchObject({
+			pushOnly: true,
+		});
+		expect(staged).toBe(false);
+		expect(await __test__.pendingPushReceiptPaths(repoPath)).toHaveLength(0);
+	}, 30000);
+
+	it("rejects unexpected non-Git backup content before adoption", async () => {
+		switchHome("birdclaw-adopt-invalid-home-");
+		seedBackupFixture();
+		for (const variant of ["root", "data"] as const) {
+			const repoPath = makeTempDir(`birdclaw-adopt-${variant}-repo-`);
+			await exportBackup({ repoPath });
+			if (variant === "root") {
+				writeFileSync(path.join(repoPath, "private.txt"), "unexpected\n");
+			} else {
+				writeFileSync(path.join(repoPath, "data", "unmanifested.json"), "{}\n");
+			}
+			const remotePath = path.join(
+				makeTempDir(`birdclaw-adopt-${variant}-remote-`),
+				"remote.git",
+			);
+			execFileSync("git", ["init", "--bare", remotePath]);
+
+			await expect(
+				syncBackup({ repoPath, remote: remotePath }),
+			).rejects.toThrow(
+				variant === "root"
+					? "Unexpected non-Git backup root entry"
+					: "Unexpected backup data file",
+			);
+			expect(existsSync(path.join(repoPath, ".git"))).toBe(false);
+			expect(
+				execFileSync(
+					"git",
+					[
+						"--git-dir",
+						remotePath,
+						"for-each-ref",
+						"--format=%(objectname)",
+						"refs/heads/main",
+					],
+					{ encoding: "utf8" },
+				),
+			).toBe("");
+		}
+	}, 30000);
+
+	it("rejects an independent process while it holds the repository lock", async () => {
+		switchHome("birdclaw-backup-lock-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-lock-repo-");
+		const lockPath = __test__.backupLockPath(
+			await __test__.canonicalizeBackupRepoPath(repoPath),
+		);
+		const child = spawn(
+			process.execPath,
+			[
+				"-e",
+				`const fs = require('node:fs'); const lock = process.argv[1];
+				 const fd = fs.openSync(lock, 'wx');
+				 fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + '\\n');
+				 fs.closeSync(fd); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);`,
+				lockPath,
+			],
+			{ stdio: ["ignore", "pipe", "pipe"] },
+		);
+		await new Promise<void>((resolve, reject) => {
+			child.once("error", reject);
+			child.stdout.once("data", () => resolve());
+		});
+
+		try {
+			await expect(exportBackup({ repoPath })).rejects.toThrow(
+				"locked by another process",
+			);
+			expect(existsSync(path.join(repoPath, "manifest.json"))).toBe(false);
+		} finally {
+			child.kill("SIGTERM");
+			rmSync(lockPath, { force: true });
+		}
+	}, 20000);
+
+	it("uses one canonical lock identity through symlinked parent aliases", async () => {
+		switchHome("birdclaw-backup-alias-home-");
+		seedBackupFixture();
+		const realParent = makeTempDir("birdclaw-backup-alias-parent-");
+		const aliasParent = path.join(
+			path.dirname(realParent),
+			`${path.basename(realParent)}-alias`,
+		);
+		symlinkSync(realParent, aliasParent, "dir");
+		const realRepoPath = path.join(realParent, "repo");
+		const aliasRepoPath = path.join(aliasParent, "repo");
+		const canonicalPath =
+			await __test__.canonicalizeBackupRepoPath(realRepoPath);
+		const release = await acquireScheduledJobLock(
+			__test__.backupLockPath(canonicalPath),
+			60_000,
+		);
+
+		try {
+			for (const operation of [
+				() => exportBackup({ repoPath: aliasRepoPath }),
+				() => importBackup({ repoPath: aliasRepoPath }),
+				() =>
+					Effect.runPromise(
+						updateBackupFromGitEffect({ repoPath: aliasRepoPath }),
+					),
+				() => syncBackup({ repoPath: aliasRepoPath }),
+			]) {
+				await expect(operation()).rejects.toThrow("locked by another process");
+			}
+		} finally {
+			await release?.();
+			rmSync(aliasParent, { force: true });
+		}
+	}, 20000);
+
+	it("fails closed on dirty, index-locked, and manifest-mismatched checkouts", async () => {
+		switchHome("birdclaw-backup-preflight-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-preflight-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const before = snapshotTree(repoPath);
+		let databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+		writeFileSync(path.join(repoPath, "dirty.txt"), "dirty\n");
+
+		await expect(exportBackup({ repoPath })).rejects.toThrow(
+			"Backup checkout is dirty",
+		);
+		rmSync(path.join(repoPath, "dirty.txt"));
+		expect(snapshotTree(repoPath)).toEqual(before);
+
+		const rawIndexLockPath = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "--git-path", "index.lock"],
+			{ encoding: "utf8" },
+		).trim();
+		const indexLockPath = path.isAbsolute(rawIndexLockPath)
+			? rawIndexLockPath
+			: path.resolve(repoPath, rawIndexLockPath);
+		writeFileSync(indexLockPath, "locked\n");
+		await expect(exportBackup({ repoPath })).rejects.toThrow(
+			"Backup Git index is locked",
+		);
+		rmSync(indexLockPath);
+
+		appendFileSync(path.join(repoPath, "data/profiles.jsonl"), "{}\n");
+		execFileSync("git", ["-C", repoPath, "add", "data/profiles.jsonl"]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"-c",
+			"commit.gpgsign=false",
+			"commit",
+			"-m",
+			"test: corrupt manifest generation",
+		]);
+		await expect(exportBackup({ repoPath })).rejects.toThrow(
+			"Current backup manifest is invalid",
+		);
+		switchHome("birdclaw-backup-preflight-import-dst-");
+		const destination = getNativeDb({ seedDemoData: false });
+		const beforeAccounts = destination
+			.prepare("select count(*) as count from accounts")
+			.get();
+		await expect(importBackup({ repoPath })).rejects.toThrow(
+			"Current backup manifest is invalid",
+		);
+		expect(
+			destination.prepare("select count(*) as count from accounts").get(),
+		).toEqual(beforeAccounts);
+		expect(databaseOpens).toBe(0);
+	}, 20000);
+
+	it("automatic dirty-check failures do not open or create a database", async () => {
+		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+		process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
+		try {
+			switchHome("birdclaw-backup-auto-preflight-source-");
+			seedBackupFixture();
+			const repoPath = makeTempDir("birdclaw-backup-auto-preflight-repo-");
+			await exportBackup({ repoPath, commit: true });
+			writeFileSync(path.join(repoPath, "dirty.txt"), "dirty\n");
+
+			const cleanHome = switchHome("birdclaw-backup-auto-preflight-home-");
+			writeBackupConfig(cleanHome, {
+				repoPath,
+				autoSync: true,
+				staleAfterSeconds: 0,
+			});
+			let databaseOpens = 0;
+			__test__.setBeforeDatabaseOpen(() => {
+				databaseOpens += 1;
+			});
+
+			await expect(maybeAutoSyncBackup()).resolves.toMatchObject({ ok: false });
+			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
+				ok: false,
+			});
+			expect(databaseOpens).toBe(0);
+			expect(existsSync(path.join(cleanHome, "birdclaw.sqlite"))).toBe(false);
+		} finally {
+			if (previousAutoSyncEnv === undefined) {
+				delete process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+			} else {
+				process.env.BIRDCLAW_BACKUP_AUTO_SYNC = previousAutoSyncEnv;
+			}
+		}
+	}, 20000);
+
+	it("reads auto-update freshness without opening or migrating the database", async () => {
+		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+		process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
+		try {
+			const home = switchHome("birdclaw-backup-fresh-readonly-home-");
+			seedBackupFixture();
+			const repoPath = makeTempDir("birdclaw-backup-fresh-readonly-repo-");
+			await exportBackup({ repoPath, commit: true });
+			writeBackupConfig(home, {
+				repoPath,
+				autoSync: true,
+				staleAfterSeconds: 900,
+			});
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					`insert into sync_cache (cache_key, value_json, updated_at)
+					 values ('backup:auto-sync', ?, ?)
+					 on conflict(cache_key) do update set
+					 value_json = excluded.value_json, updated_at = excluded.updated_at`,
+				)
+				.run(
+					JSON.stringify({ checkedAt: new Date().toISOString(), ok: true }),
+					new Date().toISOString(),
+				);
+			writeFileSync(
+				path.join(repoPath, "dirty.txt"),
+				"must remain untouched\n",
+			);
+			let databaseOpens = 0;
+			__test__.setBeforeDatabaseOpen(() => {
+				databaseOpens += 1;
+			});
+
+			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
+				ok: true,
+				skipped: true,
+				reason: "backup auto-sync is fresh",
+			});
+			expect(databaseOpens).toBe(0);
+			expect(readFileSync(path.join(repoPath, "dirty.txt"), "utf8")).toBe(
+				"must remain untouched\n",
+			);
+		} finally {
+			if (previousAutoSyncEnv === undefined) {
+				delete process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+			} else {
+				process.env.BIRDCLAW_BACKUP_AUTO_SYNC = previousAutoSyncEnv;
+			}
+		}
+	}, 20000);
+
+	it("exports all tables from one SQLite read transaction", async () => {
+		switchHome("birdclaw-backup-snapshot-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-snapshot-repo-");
+		const contender = new NativeSqliteDatabase(getBirdclawPaths().dbPath);
+		let mutated = false;
+		const reader = new NativeSqliteDatabase(getBirdclawPaths().dbPath, {
+			onStatement(sql) {
+				if (mutated || !/from\s+accounts/i.test(sql)) return;
+				mutated = true;
+				contender
+					.prepare(
+						`insert into tweets (id, author_profile_id, text, created_at)
+					 values ('tweet_between_reads', 'profile_me', 'between reads',
+					 '2026-08-09T00:00:00.000Z')`,
+					)
+					.run();
+			},
+		});
+
+		try {
+			const result = await exportBackup({ repoPath, db: reader });
+			expect(mutated).toBe(true);
+			expect(result.manifest.counts.tweets).toBe(3);
+			expect(
+				contender.prepare("select count(*) as count from tweets").get(),
+			).toEqual({ count: 4 });
+			for (const file of result.manifest.files.filter((entry) =>
+				entry.path.startsWith("data/tweets/"),
+			)) {
+				expect(
+					readFileSync(path.join(repoPath, file.path), "utf8"),
+				).not.toContain("tweet_between_reads");
+			}
+		} finally {
+			reader.close();
+			contender.close();
+		}
+	}, 20000);
+
+	it("leaves the live generation byte-identical when staged validation fails", async () => {
+		switchHome("birdclaw-backup-stage-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-stage-repo-");
+		await exportBackup({ repoPath });
+		const before = snapshotTree(repoPath);
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update profiles set bio = 'new generation' where id = 'profile_friend'",
+			)
+			.run();
+		__test__.setBeforeStagedValidation((stagingPath) => {
+			appendFileSync(path.join(stagingPath, "data/profiles.jsonl"), "{}\n");
+		});
+
+		await expect(exportBackup({ repoPath })).rejects.toThrow(
+			"Backup validation failed",
+		);
+		expect(snapshotTree(repoPath)).toEqual(before);
+	}, 20000);
+
+	it("recovers one complete generation at every publication rename boundary", async () => {
+		switchHome("birdclaw-backup-journal-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-journal-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const before = snapshotTree(repoPath);
+		const cases = [
+			"data",
+			"README.md",
+			".gitattributes",
+			"manifest.json",
+		].flatMap((relativePath) =>
+			(["rollback", "install"] as const).map((phase) => ({
+				relativePath,
+				phase,
+			})),
+		);
+		for (const { relativePath, phase } of cases) {
+			let observedStagePath: string | undefined;
+			let observedStageDevice: number | undefined;
+			__test__.setBeforeStagedValidation((stagingPath) => {
+				observedStagePath = stagingPath;
+				observedStageDevice = statSync(stagingPath).dev;
+			});
+			__test__.setAfterPublicationRename((renamedPath, renamedPhase) => {
+				if (renamedPath === relativePath && renamedPhase === phase) {
+					throw new Error(
+						`synthetic publication failure ${relativePath}:${phase}`,
+					);
+				}
+			});
+			await expect(exportBackup({ repoPath })).rejects.toThrow(
+				`synthetic publication failure ${relativePath}:${phase}`,
+			);
+			expect(snapshotTree(repoPath)).toEqual(before);
+			expect(
+				execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+					encoding: "utf8",
+				}),
+			).toBe("");
+			expect(observedStagePath).toBeTruthy();
+			expect(observedStageDevice).toBe(statSync(repoPath).dev);
+			expect(observedStagePath).toContain(`${path.sep}.git${path.sep}`);
+			__test__.setBeforeStagedValidation(undefined);
+			__test__.setAfterPublicationRename(undefined);
+		}
+	}, 120000);
+
+	it("falls back when the preferred transaction root is not writable", async () => {
+		switchHome("birdclaw-backup-root-fallback-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-root-fallback-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const roots = await __test__.transactionRootPaths(repoPath);
+		const preferredRoot = roots[0]!;
+		const fallbackRoot = roots.find((root) => root !== preferredRoot)!;
+		mkdirSync(preferredRoot, { recursive: true, mode: 0o700 });
+		const sentinel = path.join(preferredRoot, "sentinel.txt");
+		writeFileSync(sentinel, "preferred untouched\n");
+		chmodSync(preferredRoot, 0o500);
+		let stagingPath = "";
+		__test__.setBeforeStagedValidation((value) => {
+			stagingPath = value;
+		});
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update profiles set bio = 'fallback root' where id = 'profile_friend'",
+			)
+			.run();
+
+		try {
+			await expect(
+				exportBackup({ repoPath, commit: true }),
+			).resolves.toMatchObject({
+				ok: true,
+			});
+			expect(stagingPath.startsWith(`${fallbackRoot}${path.sep}`)).toBe(true);
+			expect(readFileSync(sentinel, "utf8")).toBe("preferred untouched\n");
+			expect(readdirSync(preferredRoot)).toEqual(["sentinel.txt"]);
+		} finally {
+			chmodSync(preferredRoot, 0o700);
+		}
+	}, 30000);
+
+	it("recovers an interrupted publication journal on the next process", async () => {
+		const home = switchHome("birdclaw-backup-restart-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-restart-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const before = snapshotTree(repoPath);
+		const scriptPath = path.join(
+			makeTempDir("birdclaw-backup-restart-script-"),
+			"crash.mjs",
+		);
+		const backupModuleUrl = new URL("./backup.ts", import.meta.url).href;
+		writeFileSync(
+			scriptPath,
+			`process.env.BIRDCLAW_HOME = process.argv[2];
+			 const { __test__, exportBackup } = await import(${JSON.stringify(backupModuleUrl)});
+			 __test__.setAfterPublicationRename((relativePath, phase) => {
+			   if (relativePath === "data" && phase === "rollback") process.exit(86);
+			 });
+			 await exportBackup({ repoPath: process.argv[3] });`,
+			"utf8",
+		);
+		const child = spawn(
+			path.resolve("scripts/bun-canary.sh"),
+			[scriptPath, home, repoPath],
+			{ cwd: path.resolve("."), stdio: "pipe" },
+		);
+		const exitCode = await new Promise<number | null>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		expect(exitCode).toBe(86);
+
+		await importBackup({
+			repoPath,
+			db: getNativeDb({ seedDemoData: false }),
+		});
+		expect(snapshotTree(repoPath)).toEqual(before);
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toBe("");
+	}, 30000);
+
+	it("refuses recovery after the repository directory is recreated", async () => {
+		const home = switchHome("birdclaw-backup-recreated-repo-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-recreated-repo-");
+		await exportBackup({ repoPath });
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				"update profiles set bio = 'replacement crash' where id = 'profile_friend'",
+			)
+			.run();
+		const transactionRoots = await __test__.transactionRootPaths(repoPath);
+		const scriptPath = path.join(
+			makeTempDir("birdclaw-backup-recreated-script-"),
+			"crash.mjs",
+		);
+		const backupModuleUrl = new URL("./backup.ts", import.meta.url).href;
+		writeFileSync(
+			scriptPath,
+			`process.env.BIRDCLAW_HOME = process.argv[2];
+			 const { __test__, exportBackup } = await import(${JSON.stringify(backupModuleUrl)});
+			 __test__.setAfterPublication(() => process.exit(90));
+			 await exportBackup({ repoPath: process.argv[3] });`,
+			"utf8",
+		);
+		const child = spawn(
+			path.resolve("scripts/bun-canary.sh"),
+			[scriptPath, home, repoPath],
+			{ cwd: path.resolve("."), stdio: "pipe" },
+		);
+		const exitCode = await new Promise<number | null>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		expect(exitCode).toBe(90);
+		expect(
+			transactionRoots.some((root) =>
+				existsSync(path.join(root, "journal.json")),
+			),
+		).toBe(true);
+
+		rmSync(repoPath, { recursive: true });
+		mkdirSync(path.join(repoPath, "data"), { recursive: true });
+		const sentinel = path.join(repoPath, "data", "sentinel.txt");
+		writeFileSync(sentinel, "new repository sentinel\n");
+		writeFileSync(
+			path.join(repoPath, "manifest.json"),
+			"new repository manifest\n",
+		);
+		try {
+			await expect(exportBackup({ repoPath })).rejects.toThrow(
+				"repository identity changed",
+			);
+			expect(readFileSync(sentinel, "utf8")).toBe("new repository sentinel\n");
+			expect(readFileSync(path.join(repoPath, "manifest.json"), "utf8")).toBe(
+				"new repository manifest\n",
+			);
+			expect(
+				transactionRoots.some((root) =>
+					existsSync(path.join(root, "journal.json")),
+				),
+			).toBe(true);
+		} finally {
+			for (const root of transactionRoots) {
+				rmSync(root, { recursive: true, force: true });
+			}
+		}
+	}, 30000);
+
+	it("rejects journal stage and rollback escapes without touching victims", async () => {
+		switchHome("birdclaw-journal-escape-home-");
+		seedBackupFixture();
+		for (const field of ["stagePath", "rollbackPath"] as const) {
+			const repoPath = makeTempDir(`birdclaw-journal-${field}-repo-`);
+			await exportBackup({ repoPath, commit: true });
+			const fixture = await makeRecoveryJournalFixture(repoPath);
+			const victim = makeTempDir(`birdclaw-journal-${field}-victim-`);
+			const sentinel = path.join(victim, "sentinel.txt");
+			writeFileSync(sentinel, "untouched\n");
+			writeFileSync(
+				fixture.journalPath,
+				JSON.stringify({ ...fixture.journal, [field]: victim }),
+			);
+
+			await expect(
+				importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+			).rejects.toThrow("Backup transaction");
+			expect(readFileSync(sentinel, "utf8")).toBe("untouched\n");
+			expect(existsSync(victim)).toBe(true);
+		}
+	}, 30000);
+
+	it("falls back from a symlinked preferred transaction root without touching its target", async () => {
+		switchHome("birdclaw-journal-root-symlink-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-journal-root-symlink-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const transactionRoot = (await __test__.transactionRootPaths(repoPath))[0]!;
+		const victim = makeTempDir("birdclaw-journal-root-symlink-victim-");
+		const sentinel = path.join(victim, "stage-keep");
+		mkdirSync(sentinel);
+		writeFileSync(path.join(sentinel, "sentinel.txt"), "untouched\n");
+		symlinkSync(victim, transactionRoot, "dir");
+
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).resolves.toMatchObject({ ok: true });
+		expect(readFileSync(path.join(sentinel, "sentinel.txt"), "utf8")).toBe(
+			"untouched\n",
+		);
+	}, 30000);
+
+	it("rejects a forged recovery index path before copying or removing files", async () => {
+		switchHome("birdclaw-journal-index-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-journal-index-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const fixture = await makeRecoveryJournalFixture(repoPath);
+		const victim = path.join(
+			makeTempDir("birdclaw-journal-index-victim-"),
+			"victim-index",
+		);
+		writeFileSync(victim, "untouched index\n");
+		writeFileSync(
+			fixture.journalPath,
+			JSON.stringify({ ...fixture.journal, gitIndexPath: victim }),
+		);
+
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).rejects.toThrow("Git index path is invalid");
+		expect(readFileSync(victim, "utf8")).toBe("untouched index\n");
+		expect(existsSync(fixture.journalPath)).toBe(true);
+	}, 30000);
+
+	it("does not mistake an unrelated HEAD advance for the published backup", async () => {
+		const home = switchHome("birdclaw-backup-unrelated-head-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-unrelated-head-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const managedSnapshot = () =>
+			new Map(
+				[...snapshotTree(repoPath)].filter(
+					([relativePath]) =>
+						relativePath === ".gitattributes" ||
+						relativePath === "README.md" ||
+						relativePath === "manifest.json" ||
+						relativePath.startsWith(`data${path.sep}`),
+				),
+			);
+		const before = managedSnapshot();
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_uncommitted_publication', 'profile_me', 'new generation',
+				 '2026-08-09T00:20:00.000Z')`,
+			)
+			.run();
+		const scriptPath = path.join(
+			makeTempDir("birdclaw-backup-unrelated-head-script-"),
+			"crash.mjs",
+		);
+		const backupModuleUrl = new URL("./backup.ts", import.meta.url).href;
+		writeFileSync(
+			scriptPath,
+			`process.env.BIRDCLAW_HOME = process.argv[2];
+			 const { __test__, exportBackup } = await import(${JSON.stringify(backupModuleUrl)});
+			 __test__.setAfterPublication(() => process.exit(88));
+			 await exportBackup({ repoPath: process.argv[3], commit: true });`,
+			"utf8",
+		);
+		const child = spawn(
+			path.resolve("scripts/bun-canary.sh"),
+			[scriptPath, home, repoPath],
+			{ cwd: path.resolve("."), stdio: "pipe" },
+		);
+		const exitCode = await new Promise<number | null>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		expect(exitCode).toBe(88);
+		expect(managedSnapshot()).not.toEqual(before);
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toContain("manifest.json");
+
+		const unrelatedPath = path.join(repoPath, "unrelated-note.txt");
+		writeFileSync(unrelatedPath, "unrelated HEAD advance\n");
+		execFileSync("git", ["-C", repoPath, "add", "unrelated-note.txt"]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"commit",
+			"-m",
+			"test: unrelated commit during backup recovery",
+		]);
+		const advancedHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{ encoding: "utf8" },
+		).trim();
+
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).resolves.toMatchObject({ ok: true });
+		expect(managedSnapshot()).toEqual(before);
+		expect(readFileSync(unrelatedPath, "utf8")).toBe(
+			"unrelated HEAD advance\n",
+		);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(advancedHead);
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toBe("");
+		const transactionRoots = await __test__.transactionRootPaths(repoPath);
+		expect(
+			transactionRoots.some((root) =>
+				existsSync(path.join(root, "journal.json")),
+			),
+		).toBe(false);
+	}, 30000);
+
+	it("preserves unrelated staged index state while rolling back publication", async () => {
+		const home = switchHome("birdclaw-backup-staged-recovery-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-staged-recovery-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const unrelatedPath = path.join(repoPath, "unrelated-note.txt");
+		writeFileSync(unrelatedPath, "base\n");
+		execFileSync("git", ["-C", repoPath, "add", "unrelated-note.txt"]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"commit",
+			"-m",
+			"test: add unrelated tracked file",
+		]);
+		const managedSnapshot = () =>
+			new Map(
+				[...snapshotTree(repoPath)].filter(
+					([relativePath]) =>
+						relativePath === ".gitattributes" ||
+						relativePath === "README.md" ||
+						relativePath === "manifest.json" ||
+						relativePath.startsWith(`data${path.sep}`),
+				),
+			);
+		const before = managedSnapshot();
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_staged_recovery', 'profile_me', 'new generation',
+				 '2026-08-09T00:25:00.000Z')`,
+			)
+			.run();
+		const scriptPath = path.join(
+			makeTempDir("birdclaw-backup-staged-recovery-script-"),
+			"crash.mjs",
+		);
+		const backupModuleUrl = new URL("./backup.ts", import.meta.url).href;
+		writeFileSync(
+			scriptPath,
+			`process.env.BIRDCLAW_HOME = process.argv[2];
+			 const { __test__, exportBackup } = await import(${JSON.stringify(backupModuleUrl)});
+			 __test__.setAfterPublication(() => process.exit(89));
+			 await exportBackup({ repoPath: process.argv[3], commit: true });`,
+			"utf8",
+		);
+		const child = spawn(
+			path.resolve("scripts/bun-canary.sh"),
+			[scriptPath, home, repoPath],
+			{ cwd: path.resolve("."), stdio: "pipe" },
+		);
+		const exitCode = await new Promise<number | null>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		expect(exitCode).toBe(89);
+
+		writeFileSync(unrelatedPath, "staged change\n");
+		execFileSync("git", ["-C", repoPath, "add", "unrelated-note.txt"]);
+		const stagedBlob = execFileSync(
+			"git",
+			["-C", repoPath, "show", ":unrelated-note.txt"],
+			{ encoding: "utf8" },
+		);
+		writeFileSync(unrelatedPath, "unstaged change\n");
+
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).rejects.toThrow("Backup checkout is dirty");
+		expect(managedSnapshot()).toEqual(before);
+		expect(
+			execFileSync("git", ["-C", repoPath, "show", ":unrelated-note.txt"], {
+				encoding: "utf8",
+			}),
+		).toBe(stagedBlob);
+		expect(readFileSync(unrelatedPath, "utf8")).toBe("unstaged change\n");
+		expect(
+			execFileSync("git", ["-C", repoPath, "diff", "--cached", "--name-only"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe("unrelated-note.txt");
+		expect(
+			execFileSync("git", ["-C", repoPath, "diff", "--name-only"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe("unrelated-note.txt");
+		const transactionRoots = await __test__.transactionRootPaths(repoPath);
+		expect(
+			transactionRoots.some((root) =>
+				existsSync(path.join(root, "journal.json")),
+			),
+		).toBe(false);
+	}, 30000);
+
+	it("finds a pre-Git crash journal after external Git initialization", async () => {
+		const home = switchHome("birdclaw-backup-pre-git-restart-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-pre-git-restart-repo-");
+		const [preGitTransactionRoot] =
+			await __test__.transactionRootPaths(repoPath);
+		await exportBackup({ repoPath });
+		const before = snapshotTree(repoPath);
+		const scriptPath = path.join(
+			makeTempDir("birdclaw-backup-pre-git-script-"),
+			"crash.mjs",
+		);
+		const backupModuleUrl = new URL("./backup.ts", import.meta.url).href;
+		writeFileSync(
+			scriptPath,
+			`process.env.BIRDCLAW_HOME = process.argv[2];
+			 const { __test__, exportBackup } = await import(${JSON.stringify(backupModuleUrl)});
+			 __test__.setAfterPublicationRename((relativePath, phase) => {
+			   if (relativePath === "data" && phase === "rollback") process.exit(87);
+			 });
+			 await exportBackup({ repoPath: process.argv[3] });`,
+			"utf8",
+		);
+		const child = spawn(
+			path.resolve("scripts/bun-canary.sh"),
+			[scriptPath, home, repoPath],
+			{ cwd: path.resolve("."), stdio: "pipe" },
+		);
+		const exitCode = await new Promise<number | null>((resolve, reject) => {
+			child.once("error", reject);
+			child.once("exit", resolve);
+		});
+		expect(exitCode).toBe(87);
+		execFileSync("git", ["-C", repoPath, "init"]);
+
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).rejects.toThrow("Backup checkout is dirty");
+		expect(snapshotTree(repoPath)).toEqual(before);
+		expect(preGitTransactionRoot && existsSync(preGitTransactionRoot)).toBe(
+			false,
+		);
+		execFileSync("git", ["-C", repoPath, "add", "."]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"-c",
+			"user.name=Backup Test",
+			"-c",
+			"user.email=test@example.invalid",
+			"commit",
+			"-m",
+			"test: adopt recovered backup",
+		]);
+		await expect(
+			importBackup({ repoPath, db: getNativeDb({ seedDemoData: false }) }),
+		).resolves.toMatchObject({ ok: true });
+	}, 30000);
+
+	it("does not report failure when committed-journal cleanup is deferred", async () => {
+		switchHome("birdclaw-backup-cleanup-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-cleanup-repo-");
+		__test__.setBeforeCommittedCleanup(() => {
+			throw new Error("synthetic cleanup failure");
+		});
+
+		const result = await exportBackup({ repoPath, commit: true });
+		expect(result.git?.committed).toBe(true);
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toBe("");
+		const [transactionRoot] = await __test__.transactionRootPaths(repoPath);
+		const journalPath = path.join(transactionRoot!, "journal.json");
+		expect(existsSync(journalPath)).toBe(true);
+
+		__test__.setBeforeCommittedCleanup(undefined);
+		await importBackup({
+			repoPath,
+			db: getNativeDb({ seedDemoData: false }),
+		});
+		expect(existsSync(journalPath)).toBe(false);
+	}, 20000);
+
+	it("recovers when rollback cleanup stops after deleting the journal", async () => {
+		switchHome("birdclaw-backup-rollback-cleanup-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-backup-rollback-cleanup-repo-");
+		await exportBackup({ repoPath, commit: true });
+		const before = snapshotTree(repoPath);
+		__test__.setAfterPublicationRename((relativePath, phase) => {
+			if (relativePath === "data" && phase === "install") {
+				throw new Error("synthetic publication interruption");
+			}
+		});
+		__test__.setAfterRecoveryCleanupBoundary((boundary) => {
+			if (boundary === "journal") {
+				throw new Error("synthetic post-journal cleanup interruption");
+			}
+		});
+
+		await expect(exportBackup({ repoPath })).rejects.toThrow(
+			"recovery material remains",
+		);
+		expect(snapshotTree(repoPath)).toEqual(before);
+		const transactionRoot = (await __test__.transactionRootPaths(repoPath))[0]!;
+		expect(existsSync(path.join(transactionRoot, "journal.json"))).toBe(false);
+		expect(existsSync(transactionRoot)).toBe(true);
+
+		__test__.setAfterPublicationRename(undefined);
+		__test__.setAfterRecoveryCleanupBoundary(undefined);
+		await expect(exportBackup({ repoPath })).resolves.toMatchObject({
+			ok: true,
+		});
+		expect(existsSync(transactionRoot)).toBe(false);
+		expect(snapshotTree(repoPath)).toEqual(before);
+	}, 20000);
+
+	it("exports current database changes when a local commit has no push receipt", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-no-receipt-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-no-receipt-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-no-receipt-repo-");
+		await syncBackup({ repoPath, remote: remotePath });
+		const db = getNativeDb({ seedDemoData: false });
+		db.prepare(
+			`insert into tweets (id, author_profile_id, text, created_at)
+			 values ('tweet_local_commit', 'profile_me', 'local commit',
+			 '2026-08-09T00:30:00.000Z')`,
+		).run();
+		const localExport = await exportBackup({ repoPath, commit: true });
+		const unpushedHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{ encoding: "utf8" },
+		).trim();
+		expect(localExport.git).toMatchObject({ committed: true, pushed: false });
+		expect(
+			(await __test__.pendingPushReceiptPaths(repoPath)).some((receiptPath) =>
+				existsSync(receiptPath),
+			),
+		).toBe(false);
+		db.prepare(
+			`insert into tweets (id, author_profile_id, text, created_at)
+			 values ('tweet_after_local_commit', 'profile_me', 'current database',
+			 '2026-08-09T00:45:00.000Z')`,
+		).run();
+		let databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+
+		const synced = await syncBackup({ repoPath, remote: remotePath });
+		const syncedHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{ encoding: "utf8" },
+		).trim();
+		expect(synced.pushOnly).not.toBe(true);
+		expect(databaseOpens).toBeGreaterThan(0);
+		expect(syncedHead).not.toBe(unpushedHead);
+		expect(
+			readFileSync(path.join(repoPath, "data", "tweets", "2026.jsonl"), "utf8"),
+		).toContain("tweet_after_local_commit");
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(syncedHead);
+	}, 30000);
+
+	it("retries a receipt-owned first push when origin main remains absent", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-empty-push-retry-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		const hookPath = path.join(remotePath, "hooks", "pre-receive");
+		writeFileSync(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+		switchHome("birdclaw-empty-push-retry-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-empty-push-retry-repo-");
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"Command failed",
+		);
+		const receiptPath = (await __test__.pendingPushReceiptPaths(repoPath)).find(
+			(candidate) => existsSync(candidate),
+		);
+		expect(receiptPath).toBeDefined();
+		const receipt = JSON.parse(readFileSync(receiptPath!, "utf8")) as {
+			commit: string;
+			remoteBranch: { kind: string };
+		};
+		const aheadHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{ encoding: "utf8" },
+		).trim();
+		expect(receipt).toMatchObject({
+			commit: aheadHead,
+			remoteBranch: { kind: "absent" },
+		});
+		expect(
+			execFileSync(
+				"git",
+				[
+					"--git-dir",
+					remotePath,
+					"for-each-ref",
+					"--format=%(objectname)",
+					"refs/heads/main",
+				],
+				{ encoding: "utf8" },
+			),
+		).toBe("");
+		const aheadManifest = readFileSync(
+			path.join(repoPath, "manifest.json"),
+			"utf8",
+		);
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_not_in_empty_retry', 'profile_me', 'must not export',
+				 '2026-08-09T00:50:00.000Z')`,
+			)
+			.run();
+		rmSync(hookPath);
+		let databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+
+		const retried = await syncBackup({ repoPath, remote: remotePath });
+		expect(retried.pushOnly).toBe(true);
+		expect(retried.imported).toBe(false);
+		expect(databaseOpens).toBe(0);
+		expect(readFileSync(path.join(repoPath, "manifest.json"), "utf8")).toBe(
+			aheadManifest,
+		);
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(aheadHead);
+		expect(existsSync(receiptPath!)).toBe(false);
+	}, 30000);
+
+	it("retries only the push after a committed generation failed to push", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-push-retry-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-push-retry-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-push-retry-repo-");
+		await syncBackup({ repoPath, remote: remotePath });
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_committed_generation', 'profile_me', 'committed generation',
+				 '2026-08-09T01:00:00.000Z')`,
+			)
+			.run();
+		const hookPath = path.join(remotePath, "hooks", "pre-receive");
+		writeFileSync(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"Command failed",
+		);
+		const receiptPath = (await __test__.pendingPushReceiptPaths(repoPath)).find(
+			(candidate) => existsSync(candidate),
+		);
+		expect(receiptPath).toBeDefined();
+		const receipt = JSON.parse(readFileSync(receiptPath!, "utf8")) as {
+			commit: string;
+			remote: string;
+			remoteRef: string;
+			remoteBranch: { kind: string; commit?: string };
+		};
+		const observedRemoteHead = execFileSync(
+			"git",
+			["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+			{ encoding: "utf8" },
+		).trim();
+		const aheadHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{
+				encoding: "utf8",
+			},
+		).trim();
+		expect(receipt).toMatchObject({
+			commit: aheadHead,
+			remote: "origin",
+			remoteRef: "refs/heads/main",
+			remoteBranch: { kind: "commit", commit: observedRemoteHead },
+		});
+		const aheadManifest = readFileSync(
+			path.join(repoPath, "manifest.json"),
+			"utf8",
+		);
+		const aheadTree = snapshotTree(repoPath);
+		const receiptBytes = readFileSync(receiptPath!);
+		expect(
+			execFileSync("git", ["-C", repoPath, "status", "--porcelain"], {
+				encoding: "utf8",
+			}),
+		).toBe("");
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_must_not_export', 'profile_me', 'must not be exported',
+				 '2026-08-09T02:00:00.000Z')`,
+			)
+			.run();
+		let retryDatabaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			retryDatabaseOpens += 1;
+		});
+		let staged = false;
+		__test__.setBeforeStagedValidation(() => {
+			staged = true;
+		});
+		await expect(
+			exportBackup({ repoPath, commit: true, push: false }),
+		).rejects.toThrow("pending push receipt");
+		expect(retryDatabaseOpens).toBe(0);
+		expect(staged).toBe(false);
+		expect(snapshotTree(repoPath)).toEqual(aheadTree);
+		expect(readFileSync(receiptPath!)).toEqual(receiptBytes);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(aheadHead);
+
+		rmSync(hookPath);
+
+		const retried = await syncBackup({ repoPath, remote: remotePath });
+		expect(retried.imported).toBe(false);
+		expect(retried.exportResult.git).toMatchObject({
+			committed: false,
+			pushed: true,
+		});
+		expect(staged).toBe(false);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(aheadHead);
+		expect(retryDatabaseOpens).toBe(0);
+		expect(readFileSync(path.join(repoPath, "manifest.json"), "utf8")).toBe(
+			aheadManifest,
+		);
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(aheadHead);
+		expect(existsSync(receiptPath!)).toBe(false);
+	}, 30000);
+
+	it("matches pending-push remote identity across credential rotation", async () => {
+		const repoPath = makeTempDir("birdclaw-remote-identity-repo-");
+		const oldCredential = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://oldtoken@example.com:443/team/archive.git?access_token=old",
+		);
+		const newCredential = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://newtoken:newpassword@example.com/team/archive.git?access_token=new",
+		);
+		const otherHost = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://newtoken@other.example.com/team/archive.git",
+		);
+		const otherPath = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://newtoken@example.com/team/other.git",
+		);
+		const tenantA = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://example.com/team/archive.git?tenant=a&token=one",
+		);
+		const tenantB = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://example.com/team/archive.git?token=two&tenant=b",
+		);
+		const tokenRotation = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"https://example.com/team/archive.git?tenant=a&token=rotated",
+		);
+		const sshAlice = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"ssh://alice@example.com:22/team/archive.git",
+		);
+		const sshBob = await __test__.canonicalBackupRemoteIdentity(
+			repoPath,
+			"ssh://bob@example.com/team/archive.git",
+		);
+
+		expect(newCredential).toBe(oldCredential);
+		expect(otherHost).not.toBe(oldCredential);
+		expect(otherPath).not.toBe(oldCredential);
+		expect(tokenRotation).toBe(tenantA);
+		expect(tenantB).not.toBe(tenantA);
+		expect(sshBob).not.toBe(sshAlice);
+		expect(oldCredential).toMatch(/^[0-9a-f]{64}$/u);
+	});
+
+	it("ignores symlinked receipt roots and files while using a safe fallback", async () => {
+		const createPendingPush = async (label: string) => {
+			const remotePath = path.join(
+				makeTempDir(`birdclaw-receipt-symlink-${label}-remote-`),
+				"remote.git",
+			);
+			execFileSync("git", ["init", "--bare", remotePath]);
+			switchHome(`birdclaw-receipt-symlink-${label}-home-`);
+			seedBackupFixture();
+			const repoPath = makeTempDir(`birdclaw-receipt-symlink-${label}-repo-`);
+			await syncBackup({ repoPath, remote: remotePath });
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					`insert into tweets (id, author_profile_id, text, created_at)
+					 values (?, 'profile_me', 'pending receipt', '2026-08-09T05:00:00.000Z')`,
+				)
+				.run(`tweet_receipt_${label}`);
+			const hookPath = path.join(remotePath, "hooks", "pre-receive");
+			writeFileSync(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+			await expect(
+				syncBackup({ repoPath, remote: remotePath }),
+			).rejects.toThrow("Command failed");
+			rmSync(hookPath);
+			const receiptPath = (
+				await __test__.pendingPushReceiptPaths(repoPath)
+			)[0]!;
+			return {
+				repoPath,
+				remotePath,
+				receiptPath,
+				receiptBytes: readFileSync(receiptPath),
+				roots: await __test__.transactionRootPaths(repoPath),
+			};
+		};
+
+		const rootCase = await createPendingPush("root");
+		const preferredRoot = path.dirname(rootCase.receiptPath);
+		const fallbackRoot = rootCase.roots.find(
+			(root) => root !== preferredRoot && !existsSync(root),
+		)!;
+		renameSync(preferredRoot, fallbackRoot);
+		const rootVictim = makeTempDir("birdclaw-receipt-root-victim-");
+		const rootVictimReceipt = path.join(rootVictim, "pending-push.json");
+		writeFileSync(rootVictimReceipt, rootCase.receiptBytes);
+		symlinkSync(rootVictim, preferredRoot, "dir");
+		await expect(
+			syncBackup({ repoPath: rootCase.repoPath, remote: rootCase.remotePath }),
+		).resolves.toMatchObject({ pushOnly: true });
+		expect(readFileSync(rootVictimReceipt)).toEqual(rootCase.receiptBytes);
+		expect(existsSync(path.join(fallbackRoot, "pending-push.json"))).toBe(
+			false,
+		);
+
+		const fileCase = await createPendingPush("file");
+		const filePreferredRoot = path.dirname(fileCase.receiptPath);
+		const fileFallbackRoot = fileCase.roots.find(
+			(root) => root !== filePreferredRoot && !existsSync(root),
+		)!;
+		mkdirSync(fileFallbackRoot, { recursive: true, mode: 0o700 });
+		writeFileSync(
+			path.join(fileFallbackRoot, "pending-push.json"),
+			fileCase.receiptBytes,
+			{ mode: 0o600 },
+		);
+		rmSync(fileCase.receiptPath);
+		const fileVictim = path.join(
+			makeTempDir("birdclaw-receipt-file-victim-"),
+			"victim-receipt.json",
+		);
+		writeFileSync(fileVictim, fileCase.receiptBytes);
+		symlinkSync(fileVictim, fileCase.receiptPath);
+		await expect(
+			syncBackup({ repoPath: fileCase.repoPath, remote: fileCase.remotePath }),
+		).resolves.toMatchObject({ pushOnly: true });
+		expect(readFileSync(fileVictim)).toEqual(fileCase.receiptBytes);
+		expect(existsSync(path.join(fileFallbackRoot, "pending-push.json"))).toBe(
+			false,
+		);
+	}, 60000);
+
+	it("refuses push-only recovery for mismatched receipts and divergence", async () => {
+		const createFailedPushState = async (label: string) => {
+			const remotePath = path.join(
+				makeTempDir(`birdclaw-receipt-${label}-remote-`),
+				"remote.git",
+			);
+			execFileSync("git", ["init", "--bare", remotePath]);
+			switchHome(`birdclaw-receipt-${label}-home-`);
+			seedBackupFixture();
+			const repoPath = makeTempDir(`birdclaw-receipt-${label}-repo-`);
+			await syncBackup({ repoPath, remote: remotePath });
+			getNativeDb({ seedDemoData: false })
+				.prepare(
+					`insert into tweets (id, author_profile_id, text, created_at)
+					 values (?, 'profile_me', ?, '2026-08-09T04:00:00.000Z')`,
+				)
+				.run(`tweet_${label}`, label);
+			const hookPath = path.join(remotePath, "hooks", "pre-receive");
+			writeFileSync(hookPath, "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+			try {
+				await expect(
+					syncBackup({ repoPath, remote: remotePath }),
+				).rejects.toThrow("Command failed");
+			} finally {
+				rmSync(hookPath, { force: true });
+			}
+			const receiptPath = (
+				await __test__.pendingPushReceiptPaths(repoPath)
+			).find((candidate) => existsSync(candidate));
+			expect(receiptPath).toBeDefined();
+			return { remotePath, repoPath, receiptPath: receiptPath! };
+		};
+
+		const mismatchedCommit = await createFailedPushState("commit_mismatch");
+		writeFileSync(
+			path.join(mismatchedCommit.repoPath, "local-note.txt"),
+			"new local head\n",
+		);
+		execFileSync("git", [
+			"-C",
+			mismatchedCommit.repoPath,
+			"add",
+			"local-note.txt",
+		]);
+		execFileSync("git", [
+			"-C",
+			mismatchedCommit.repoPath,
+			"commit",
+			"-m",
+			"test: change head after failed push",
+		]);
+		let databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+		await expect(
+			syncBackup({ repoPath: mismatchedCommit.repoPath }),
+		).rejects.toThrow("receipt does not match local HEAD");
+		expect(databaseOpens).toBe(0);
+		expect(existsSync(mismatchedCommit.receiptPath)).toBe(true);
+
+		__test__.setBeforeDatabaseOpen(undefined);
+		const mismatchedRemote = await createFailedPushState("remote_mismatch");
+		const otherRemotePath = path.join(
+			makeTempDir("birdclaw-receipt-other-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", otherRemotePath]);
+		execFileSync("git", [
+			"-C",
+			mismatchedRemote.repoPath,
+			"remote",
+			"set-url",
+			"origin",
+			otherRemotePath,
+		]);
+		databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+		await expect(
+			syncBackup({ repoPath: mismatchedRemote.repoPath }),
+		).rejects.toThrow("receipt does not match origin/main");
+		expect(databaseOpens).toBe(0);
+		expect(existsSync(mismatchedRemote.receiptPath)).toBe(true);
+
+		__test__.setBeforeDatabaseOpen(undefined);
+		const diverged = await createFailedPushState("diverged");
+		const otherPath = makeTempDir("birdclaw-receipt-diverged-other-");
+		rmSync(otherPath, { recursive: true, force: true });
+		execFileSync("git", [
+			"clone",
+			"-b",
+			"main",
+			diverged.remotePath,
+			otherPath,
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.email",
+			"test@example.invalid",
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.name",
+			"Backup Test",
+		]);
+		writeFileSync(path.join(otherPath, "remote-note.txt"), "remote side\n");
+		execFileSync("git", ["-C", otherPath, "add", "remote-note.txt"]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"commit",
+			"-m",
+			"test: diverge after failed push",
+		]);
+		execFileSync("git", ["-C", otherPath, "push", "origin", "HEAD:main"]);
+		databaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			databaseOpens += 1;
+		});
+		await expect(syncBackup({ repoPath: diverged.repoPath })).rejects.toThrow(
+			"histories have diverged",
+		);
+		expect(databaseOpens).toBe(0);
+		expect(existsSync(diverged.receiptPath)).toBe(true);
+	}, 90000);
+
+	it("fails closed when local and remote backup histories diverge", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-diverged-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-diverged-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-diverged-repo-");
+		await syncBackup({ repoPath, remote: remotePath });
+		writeFileSync(path.join(repoPath, "local-note.txt"), "local\n");
+		execFileSync("git", ["-C", repoPath, "add", "local-note.txt"]);
+		execFileSync("git", ["-C", repoPath, "commit", "-m", "test: local side"]);
+
+		const otherPath = makeTempDir("birdclaw-diverged-other-");
+		rmSync(otherPath, { recursive: true, force: true });
+		execFileSync("git", ["clone", "-b", "main", remotePath, otherPath]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.email",
+			"test@example.invalid",
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.name",
+			"Backup Test",
+		]);
+		writeFileSync(path.join(otherPath, "remote-note.txt"), "remote\n");
+		execFileSync("git", ["-C", otherPath, "add", "remote-note.txt"]);
+		execFileSync("git", ["-C", otherPath, "commit", "-m", "test: remote side"]);
+		execFileSync("git", ["-C", otherPath, "push", "origin", "HEAD:main"]);
+		let divergedDatabaseOpens = 0;
+		__test__.setBeforeDatabaseOpen(() => {
+			divergedDatabaseOpens += 1;
+		});
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"histories have diverged",
+		);
+		expect(divergedDatabaseOpens).toBe(0);
+	}, 30000);
+
+	it("validates a fetched fast-forward before changing the live checkout", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-corrupt-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-corrupt-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-corrupt-repo-");
+		await syncBackup({ repoPath, remote: remotePath });
+		const originalHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{
+				encoding: "utf8",
+			},
+		).trim();
+		const originalTree = snapshotTree(repoPath);
+
+		const otherPath = makeTempDir("birdclaw-corrupt-other-");
+		rmSync(otherPath, { recursive: true, force: true });
+		execFileSync("git", ["clone", "-b", "main", remotePath, otherPath]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.email",
+			"test@example.invalid",
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.name",
+			"Backup Test",
+		]);
+		appendFileSync(path.join(otherPath, "data", "profiles.jsonl"), "{}\n");
+		execFileSync("git", ["-C", otherPath, "add", "data/profiles.jsonl"]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"commit",
+			"-m",
+			"test: corrupt remote backup",
+		]);
+		execFileSync("git", ["-C", otherPath, "push", "origin", "HEAD:main"]);
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"Fetched backup commit is invalid",
+		);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(originalHead);
+		expect(snapshotTree(repoPath)).toEqual(originalTree);
+
+		execFileSync("git", [
+			"--git-dir",
+			remotePath,
+			"update-ref",
+			"refs/heads/main",
+			originalHead,
+		]);
+		await expect(
+			syncBackup({ repoPath, remote: remotePath }),
+		).resolves.toMatchObject({
+			ok: true,
+			pulled: false,
+		});
+	}, 30000);
+
+	it("validates a fresh main-default remote before creating the checkout", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-fresh-corrupt-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-fresh-corrupt-source-home-");
+		seedBackupFixture();
+		const sourcePath = makeTempDir("birdclaw-fresh-corrupt-source-");
+		await syncBackup({ repoPath: sourcePath, remote: remotePath });
+		const validHead = execFileSync(
+			"git",
+			["--git-dir", remotePath, "rev-parse", "refs/heads/main"],
+			{ encoding: "utf8" },
+		).trim();
+
+		const otherPath = makeTempDir("birdclaw-fresh-corrupt-other-");
+		rmSync(otherPath, { recursive: true, force: true });
+		execFileSync("git", ["clone", "-b", "main", remotePath, otherPath]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.email",
+			"test@example.invalid",
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.name",
+			"Backup Test",
+		]);
+		rmSync(path.join(otherPath, "README.md"));
+		mkdirSync(path.join(otherPath, "README.md"));
+		writeFileSync(path.join(otherPath, "README.md", "note"), "invalid\n");
+		execFileSync("git", ["-C", otherPath, "add", "-A"]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"commit",
+			"-m",
+			"test: corrupt fresh remote backup",
+		]);
+		execFileSync("git", ["-C", otherPath, "push", "origin", "HEAD:main"]);
+		execFileSync("git", [
+			"--git-dir",
+			remotePath,
+			"symbolic-ref",
+			"HEAD",
+			"refs/heads/main",
+		]);
+
+		const freshPath = makeTempDir("birdclaw-fresh-corrupt-checkout-");
+		rmSync(freshPath, { recursive: true, force: true });
+		switchHome("birdclaw-fresh-corrupt-destination-home-");
+		await expect(
+			syncBackup({ repoPath: freshPath, remote: remotePath }),
+		).rejects.toThrow("Fetched backup commit contains an invalid managed path");
+		expect(existsSync(path.join(freshPath, ".git"))).toBe(true);
+		expect(() =>
+			execFileSync("git", ["-C", freshPath, "rev-parse", "--verify", "HEAD"]),
+		).toThrow("Command failed");
+		expect(existsSync(path.join(freshPath, "manifest.json"))).toBe(false);
+		expect(existsSync(path.join(freshPath, "data"))).toBe(false);
+
+		execFileSync("git", [
+			"--git-dir",
+			remotePath,
+			"update-ref",
+			"refs/heads/main",
+			validHead,
+		]);
+		await expect(
+			syncBackup({ repoPath: freshPath, remote: remotePath }),
+		).resolves.toMatchObject({ ok: true });
+		expect(
+			execFileSync("git", ["-C", freshPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(validHead);
+	}, 30000);
+
+	it("streams fetched backup shards larger than the former restoration ceiling", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-large-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-large-source-home-");
+		seedBackupFixture();
+		const sourceDb = getNativeDb({ seedDemoData: false });
+		sourceDb
+			.prepare("update profiles set raw_json = ? where id = 'profile_friend'")
+			.run(
+				JSON.stringify({
+					id: "friend",
+					padding: "x".repeat(50 * 1024 * 1024),
+				}),
+			);
+		const sourcePath = makeTempDir("birdclaw-large-source-");
+		execFileSync("git", ["-C", sourcePath, "init"]);
+		execFileSync("git", [
+			"-C",
+			sourcePath,
+			"remote",
+			"add",
+			"origin",
+			remotePath,
+		]);
+		await exportBackup({
+			repoPath: sourcePath,
+			db: sourceDb,
+			commit: true,
+			push: true,
+			maxShardBytes: 64 * 1024 * 1024,
+		});
+		expect(
+			statSync(path.join(sourcePath, "data", "profiles.jsonl")).size,
+		).toBeGreaterThan(49 * 1024 * 1024);
+
+		switchHome("birdclaw-large-destination-home-");
+		const destinationPath = makeTempDir("birdclaw-large-destination-");
+		const result = await Effect.runPromise(
+			updateBackupFromGitEffect({
+				repoPath: destinationPath,
+				remote: remotePath,
+			}),
+		);
+		expect(result.imported).toBe(true);
+		expect(result.importResult?.validation?.ok).toBe(true);
+	}, 120000);
+
+	it("rejects NUL-safe fetched inventory with a newline managed path", async () => {
+		const remotePath = path.join(
+			makeTempDir("birdclaw-newline-remote-"),
+			"remote.git",
+		);
+		execFileSync("git", ["init", "--bare", remotePath]);
+		switchHome("birdclaw-newline-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-newline-repo-");
+		await syncBackup({ repoPath, remote: remotePath });
+		const originalHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{
+				encoding: "utf8",
+			},
+		).trim();
+		const originalTree = snapshotTree(repoPath);
+		const otherPath = makeTempDir("birdclaw-newline-other-");
+		rmSync(otherPath, { recursive: true, force: true });
+		execFileSync("git", ["clone", "-b", "main", remotePath, otherPath]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.email",
+			"test@example.invalid",
+		]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"config",
+			"user.name",
+			"Backup Test",
+		]);
+		const maliciousPath = path.join(
+			otherPath,
+			"data",
+			"malicious\nentry.jsonl",
+		);
+		writeFileSync(maliciousPath, "{}\n");
+		execFileSync("git", ["-C", otherPath, "add", "--", maliciousPath]);
+		execFileSync("git", [
+			"-C",
+			otherPath,
+			"commit",
+			"-m",
+			"test: malicious managed path",
+		]);
+		execFileSync("git", ["-C", otherPath, "push", "origin", "HEAD:main"]);
+
+		await expect(syncBackup({ repoPath, remote: remotePath })).rejects.toThrow(
+			"unsafe managed path",
+		);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(originalHead);
+		expect(snapshotTree(repoPath)).toEqual(originalTree);
+	}, 30000);
+
+	it("pushes backup commits to origin main despite upstream misdirection", async () => {
+		const originPath = path.join(makeTempDir("birdclaw-origin-"), "origin.git");
+		const upstreamPath = path.join(
+			makeTempDir("birdclaw-upstream-"),
+			"upstream.git",
+		);
+		execFileSync("git", ["init", "--bare", originPath]);
+		execFileSync("git", ["init", "--bare", upstreamPath]);
+		switchHome("birdclaw-push-origin-home-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-push-origin-repo-");
+		await syncBackup({ repoPath, remote: originPath });
+		const firstHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{
+				encoding: "utf8",
+			},
+		).trim();
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"remote",
+			"add",
+			"upstream",
+			upstreamPath,
+		]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"config",
+			"branch.main.remote",
+			"upstream",
+		]);
+		execFileSync("git", [
+			"-C",
+			repoPath,
+			"config",
+			"remote.pushDefault",
+			"upstream",
+		]);
+		getNativeDb({ seedDemoData: false })
+			.prepare(
+				`insert into tweets (id, author_profile_id, text, created_at)
+				 values ('tweet_origin_only', 'profile_me', 'origin only',
+				 '2026-08-09T03:00:00.000Z')`,
+			)
+			.run();
+
+		await syncBackup({ repoPath, remote: originPath });
+		const secondHead = execFileSync(
+			"git",
+			["-C", repoPath, "rev-parse", "HEAD"],
+			{
+				encoding: "utf8",
+			},
+		).trim();
+		expect(secondHead).not.toBe(firstHead);
+		expect(
+			execFileSync(
+				"git",
+				["--git-dir", originPath, "rev-parse", "refs/heads/main"],
+				{ encoding: "utf8" },
+			).trim(),
+		).toBe(secondHead);
+		expect(() =>
+			execFileSync("git", [
+				"--git-dir",
+				upstreamPath,
+				"rev-parse",
+				"refs/heads/main",
+			]),
+		).toThrow("Command failed");
+	}, 30000);
+
+	it("isolates backup commits from an enclosing Git worktree", async () => {
+		const parentPath = makeTempDir("birdclaw-parent-worktree-");
+		execFileSync("git", ["-C", parentPath, "init"]);
+		const repoPath = path.join(parentPath, "backup");
+		mkdirSync(repoPath);
+		writeFileSync(
+			path.join(repoPath, ".gitattributes"),
+			"*.md text eol=lf\ndata/**/*.jsonl text eol=crlf\n",
+		);
+		switchHome("birdclaw-nested-backup-");
+		seedBackupFixture();
+
+		const result = await exportBackup({ repoPath, commit: true });
+
+		expect(result.git?.committed).toBe(true);
+		expect(
+			execFileSync("git", ["-C", repoPath, "rev-parse", "--show-toplevel"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(realpathSync(repoPath));
+		expect(
+			execFileSync(
+				"git",
+				["-C", parentPath, "diff", "--cached", "--name-only"],
+				{
+					encoding: "utf8",
+				},
+			),
+		).toBe("");
+		expect(readFileSync(path.join(repoPath, ".gitattributes"), "utf8")).toBe(
+			[
+				"*.md text eol=lf",
+				"data/**/*.jsonl text eol=crlf",
+				"",
+				"# BEGIN birdclaw backup attributes",
+				"# Backup hashes use the raw LF-delimited bytes written by Birdclaw.",
+				"data/**/*.jsonl text eol=lf",
+				"manifest.json text eol=lf",
+				"# END birdclaw backup attributes",
+				"",
+			].join("\n"),
+		);
+		expect(
+			execFileSync("git", ["-C", repoPath, "ls-files", ".gitattributes"], {
+				encoding: "utf8",
+			}).trim(),
+		).toBe(".gitattributes");
+		expect(
+			execFileSync(
+				"git",
+				[
+					"-C",
+					repoPath,
+					"check-attr",
+					"eol",
+					"--",
+					"data/tweets/2026.jsonl",
+					"manifest.json",
+				],
+				{ encoding: "utf8" },
+			),
+		).toBe("data/tweets/2026.jsonl: eol: lf\nmanifest.json: eol: lf\n");
 	}, 20000);
 
 	it("does not inherit commit signing for generated backup commits", async () => {
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-sync-signing-src-");
+		switchHome("birdclaw-sync-signing-src-");
 		seedBackupFixture();
 		const repoPath = makeTempDir("birdclaw-sync-signing-work-");
 		execFileSync("git", ["init", repoPath]);
@@ -732,7 +4680,7 @@ describe("text backup", () => {
 		expect(missingManifest.ok).toBe(false);
 		expect(missingManifest.errors[0]).toContain("manifest.json");
 
-		process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-corrupt-src-");
+		switchHome("birdclaw-corrupt-src-");
 		seedBackupFixture();
 		const repoPath = makeTempDir("birdclaw-corrupt-store-");
 		await exportBackup({ repoPath });
@@ -757,14 +4705,48 @@ describe("text backup", () => {
 		expect(validation.errors.join("\n")).toContain("manifest counts");
 	}, 20000);
 
-	it("auto-updates from the configured backup repo only when stale", async () => {
+	it("reports unowned data paths as validation errors", async () => {
+		switchHome("birdclaw-unowned-src-");
+		seedBackupFixture();
+		const repoPath = makeTempDir("birdclaw-unowned-store-");
+		await exportBackup({ repoPath });
+
+		const manifestPath = path.join(repoPath, "manifest.json");
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
+			files: Array<{
+				path: string;
+				rows: number;
+				sha256: string;
+				bytes: number;
+			}>;
+		};
+		const relativePath = "data/unowned.jsonl";
+		const content = "{}\n";
+		writeFileSync(path.join(repoPath, relativePath), content);
+		manifest.files.push({
+			path: relativePath,
+			rows: 1,
+			sha256: "unimportant",
+			bytes: Buffer.byteLength(content),
+		});
+		writeFileSync(manifestPath, JSON.stringify(manifest));
+
+		const validation = await validateBackup(repoPath);
+
+		expect(validation.ok).toBe(false);
+		expect(validation.errors).toContain(
+			"No backup codec owns path: data/unowned.jsonl",
+		);
+	}, 20000);
+
+	it("imports a changed automatic backup once and skips an unchanged manifest", async () => {
 		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
 		process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
 		const remotePath = path.join(makeTempDir("birdclaw-remote-"), "remote.git");
 		execFileSync("git", ["init", "--bare", remotePath]);
 
 		try {
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-src-");
+			switchHome("birdclaw-auto-src-");
 			seedBackupFixture();
 			await syncBackup({
 				repoPath: makeTempDir("birdclaw-auto-push-"),
@@ -772,18 +4754,16 @@ describe("text backup", () => {
 				message: "archive: auto sync seed",
 			});
 
-			resetDatabaseForTests();
-			resetBirdclawPathsForTests();
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-dst-");
+			switchHome("birdclaw-auto-dst-");
 			const repoPath = makeTempDir("birdclaw-auto-work-");
 			writeFileSync(
-				path.join(process.env.BIRDCLAW_HOME, "config.json"),
+				path.join(testHome().root, "config.json"),
 				JSON.stringify({
 					backup: {
 						repoPath,
 						remote: remotePath,
 						autoSync: true,
-						staleAfterSeconds: 900,
+						staleAfterSeconds: 0,
 					},
 				}),
 			);
@@ -795,6 +4775,7 @@ describe("text backup", () => {
 				enabled: true,
 				skipped: false,
 				imported: true,
+				backupHash: expect.any(String),
 			});
 			expect(
 				getNativeDb()
@@ -810,7 +4791,9 @@ describe("text backup", () => {
 				ok: true,
 				enabled: true,
 				skipped: true,
-				reason: "backup auto-sync is fresh",
+				reason: "backup auto-sync manifest is unchanged",
+				imported: false,
+				backupHash: first.backupHash,
 			});
 		} finally {
 			if (previousAutoSyncEnv === undefined) {
@@ -820,6 +4803,36 @@ describe("text backup", () => {
 			}
 		}
 	}, 20000);
+
+	it("requests web backup updates without blocking or rejecting the caller", async () => {
+		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		vi.useFakeTimers();
+		try {
+			process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
+			switchHome("birdclaw-auto-background-");
+			writeFileSync(path.join(testHome().root, "config.json"), "{bad");
+			resetBirdclawPathsForTests();
+
+			expect(requestBackupAutoUpdate()).toBeUndefined();
+			expect(requestBackupAutoUpdate()).toBeUndefined();
+			expect(errorSpy).not.toHaveBeenCalled();
+			await vi.advanceTimersByTimeAsync(5_000);
+			await Promise.resolve();
+			expect(errorSpy).toHaveBeenCalledTimes(1);
+			expect(errorSpy).toHaveBeenCalledWith(
+				expect.stringContaining("birdclaw backup auto-sync failed"),
+			);
+		} finally {
+			vi.useRealTimers();
+			errorSpy.mockRestore();
+			if (previousAutoSyncEnv === undefined) {
+				delete process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
+			} else {
+				process.env.BIRDCLAW_BACKUP_AUTO_SYNC = previousAutoSyncEnv;
+			}
+		}
+	});
 
 	it("skips automatic backup work when disabled or unconfigured", async () => {
 		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
@@ -837,9 +4850,7 @@ describe("text backup", () => {
 			});
 
 			process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-unconfigured-");
-			resetDatabaseForTests();
-			resetBirdclawPathsForTests();
+			switchHome("birdclaw-auto-unconfigured-");
 
 			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
 				ok: true,
@@ -866,8 +4877,8 @@ describe("text backup", () => {
 		const previousAutoSyncEnv = process.env.BIRDCLAW_BACKUP_AUTO_SYNC;
 		process.env.BIRDCLAW_BACKUP_AUTO_SYNC = "1";
 		try {
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-off-");
-			writeBackupConfig(process.env.BIRDCLAW_HOME, {
+			switchHome("birdclaw-auto-off-");
+			writeBackupConfig(testHome().root, {
 				repoPath: makeTempDir("birdclaw-auto-off-repo-"),
 				autoSync: false,
 			});
@@ -878,9 +4889,8 @@ describe("text backup", () => {
 				skipped: true,
 			});
 
-			resetDatabaseForTests();
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-empty-config-");
-			writeBackupConfig(process.env.BIRDCLAW_HOME, {});
+			switchHome("birdclaw-auto-empty-config-");
+			writeBackupConfig(testHome().root, {});
 
 			await expect(maybeAutoSyncBackup()).resolves.toMatchObject({
 				ok: true,
@@ -888,12 +4898,8 @@ describe("text backup", () => {
 				skipped: true,
 			});
 
-			resetDatabaseForTests();
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-bad-config-");
-			writeFileSync(
-				path.join(process.env.BIRDCLAW_HOME, "config.json"),
-				"{bad",
-			);
+			switchHome("birdclaw-auto-bad-config-");
+			writeFileSync(path.join(testHome().root, "config.json"), "{bad");
 			resetBirdclawPathsForTests();
 
 			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
@@ -907,10 +4913,9 @@ describe("text backup", () => {
 				skipped: false,
 			});
 
-			resetDatabaseForTests();
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-repo-only-");
+			switchHome("birdclaw-auto-repo-only-");
 			const repoOnlyPath = makeTempDir("birdclaw-auto-repo-only-work-");
-			writeBackupConfig(process.env.BIRDCLAW_HOME, {
+			writeBackupConfig(testHome().root, {
 				repoPath: repoOnlyPath,
 				staleAfterSeconds: -1,
 			});
@@ -951,11 +4956,10 @@ describe("text backup", () => {
 				skipped: false,
 			});
 
-			resetDatabaseForTests();
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-fail-update-");
-			const fileRepoPath = path.join(process.env.BIRDCLAW_HOME, "not-a-dir");
+			switchHome("birdclaw-auto-fail-update-");
+			const fileRepoPath = path.join(testHome().root, "not-a-dir");
 			writeFileSync(fileRepoPath, "");
-			writeBackupConfig(process.env.BIRDCLAW_HOME, { repoPath: fileRepoPath });
+			writeBackupConfig(testHome().root, { repoPath: fileRepoPath });
 
 			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
 				ok: false,
@@ -985,11 +4989,11 @@ describe("text backup", () => {
 		execFileSync("git", ["init", "--bare", remotePath]);
 
 		try {
-			process.env.BIRDCLAW_HOME = makeTempDir("birdclaw-auto-write-");
+			switchHome("birdclaw-auto-write-");
 			seedBackupFixture();
 			const repoPath = makeTempDir("birdclaw-auto-write-work-");
 			writeFileSync(
-				path.join(process.env.BIRDCLAW_HOME, "config.json"),
+				path.join(testHome().root, "config.json"),
 				JSON.stringify({
 					backup: {
 						repoPath,
@@ -1019,6 +5023,27 @@ describe("text backup", () => {
 					},
 				).trim(),
 			).toBe("1");
+			expect(result).not.toHaveProperty("backupHash");
+			await expect(maybeAutoUpdateBackup()).resolves.toMatchObject({
+				ok: true,
+				skipped: true,
+				reason: "backup auto-sync is fresh",
+			});
+			getNativeDb().exec(`
+        insert into profiles (id, handle, display_name, bio, followers_count, avatar_hue, created_at)
+        values ('profile_fresh_sync', 'fresh_sync', 'Fresh Sync', '', 0, 0, '2026-09-12T00:00:00Z')
+      `);
+			await expect(maybeAutoSyncBackup()).resolves.toMatchObject({
+				ok: true,
+				skipped: false,
+			});
+			expect(
+				execFileSync(
+					"git",
+					["--git-dir", remotePath, "rev-list", "--count", "refs/heads/main"],
+					{ encoding: "utf8" },
+				).trim(),
+			).toBe("2");
 		} finally {
 			if (previousAutoSyncEnv === undefined) {
 				delete process.env.BIRDCLAW_BACKUP_AUTO_SYNC;

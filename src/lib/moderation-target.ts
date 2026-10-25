@@ -1,46 +1,21 @@
 import type { Database } from "./sqlite";
 import { Effect } from "effect";
-import { lookupProfileViaBird } from "./bird-actions";
+import { lookupProfileViaBirdEffect } from "./bird-actions";
 import { getNativeDb } from "./db";
-import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { databaseWriteEffect } from "./database-writer";
+import { runEffectPromise, trySync } from "./effect-runtime";
+import { normalizeProfileHandle, profileFromDbRow } from "./profile-row";
 import type { ProfileRecord, XurlMentionUser } from "./types";
 import { getExternalUserId, upsertProfileFromXUser } from "./x-profile";
 import {
-	lookupAuthenticatedUser,
-	lookupUsersByHandles,
-	lookupUsersByIds,
+	lookupAuthenticatedUserEffect,
+	lookupUsersByHandlesEffect,
+	lookupUsersByIdsEffect,
 } from "./xurl";
 
 export interface ResolvedModerationProfile {
 	profile: ProfileRecord;
 	externalUserId: string | null;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
-export function toProfile(row: Record<string, unknown>): ProfileRecord {
-	const followingCount = Number(row.following_count ?? 0);
-	return {
-		id: String(row.id),
-		handle: String(row.handle),
-		displayName: String(row.display_name),
-		bio: String(row.bio),
-		followersCount: Number(row.followers_count),
-		...(Number.isFinite(followingCount) ? { followingCount } : {}),
-		avatarHue: Number(row.avatar_hue),
-		avatarUrl:
-			typeof row.avatar_url === "string" ? String(row.avatar_url) : undefined,
-		createdAt: String(row.created_at),
-	};
 }
 
 export function normalizeProfileQuery(value: string) {
@@ -72,7 +47,7 @@ export function getAccountHandle(db: Database, accountId: string) {
 	const row = db
 		.prepare("select handle from accounts where id = ?")
 		.get(accountId) as { handle: string } | undefined;
-	return row?.handle.replace(/^@/, "") ?? "";
+	return normalizeProfileHandle(row?.handle);
 }
 
 export function resolveLocalProfile(
@@ -96,7 +71,7 @@ export function resolveLocalProfile(
 		return null;
 	}
 
-	const profile = toProfile(row);
+	const profile = profileFromDbRow(row);
 	return {
 		profile,
 		externalUserId: getExternalUserId(profile.id),
@@ -105,9 +80,10 @@ export function resolveLocalProfile(
 
 export function resolveProfileEffect(
 	query: string,
+	providedDb?: Database,
 ): Effect.Effect<ResolvedModerationProfile, unknown> {
 	return Effect.gen(function* () {
-		const db = yield* trySync(() => getNativeDb());
+		const db = providedDb ?? (yield* trySync(() => getNativeDb()));
 		const normalizedQuery = normalizeProfileQuery(query);
 		if (!normalizedQuery) {
 			return yield* Effect.fail(new Error("Missing profile handle or id"));
@@ -135,8 +111,8 @@ export function resolveProfileEffect(
 		let user: XurlMentionUser | undefined;
 		let lastError: unknown;
 
-		const birdResult = yield* tryPromise(() =>
-			lookupProfileViaBird(local?.profile.handle ?? normalizedQuery),
+		const birdResult = yield* lookupProfileViaBirdEffect(
+			local?.profile.handle ?? normalizedQuery,
 		).pipe(
 			Effect.map((value) => ({ ok: true as const, value })),
 			Effect.catchAll((error) => Effect.succeed({ ok: false as const, error })),
@@ -148,10 +124,12 @@ export function resolveProfileEffect(
 		}
 
 		if (!user) {
-			const xurlResult = yield* tryPromise(() =>
+			const xurlResult = yield* (
 				/^\d+$/.test(normalizedQuery)
-					? lookupUsersByIds([normalizedQuery])
-					: lookupUsersByHandles([local?.profile.handle ?? normalizedQuery]),
+					? lookupUsersByIdsEffect([normalizedQuery])
+					: lookupUsersByHandlesEffect([
+							local?.profile.handle ?? normalizedQuery,
+						])
 			).pipe(
 				Effect.map((value) => ({ ok: true as const, value })),
 				Effect.catchAll((error) =>
@@ -180,7 +158,10 @@ export function resolveProfileEffect(
 		}
 
 		if (local) {
-			return yield* trySync(() => upsertProfileFromXUser(db, user));
+			return yield* databaseWriteEffect(
+				(writeDb) => upsertProfileFromXUser(writeDb, user),
+				db,
+			);
 		}
 
 		const username = String(user.username ?? "").replace(/^@/, "");
@@ -189,11 +170,17 @@ export function resolveProfileEffect(
 				resolveLocalProfile(db, username),
 			);
 			if (localByHandle) {
-				return yield* trySync(() => upsertProfileFromXUser(db, user));
+				return yield* databaseWriteEffect(
+					(writeDb) => upsertProfileFromXUser(writeDb, user),
+					db,
+				);
 			}
 		}
 
-		return yield* trySync(() => upsertProfileFromXUser(db, user));
+		return yield* databaseWriteEffect(
+			(writeDb) => upsertProfileFromXUser(writeDb, user),
+			db,
+		);
 	});
 }
 
@@ -205,7 +192,7 @@ export function resolveProfile(
 
 export function getAuthenticatedUserIdEffect() {
 	return Effect.gen(function* () {
-		const me = yield* tryPromise(() => lookupAuthenticatedUser());
+		const me = yield* lookupAuthenticatedUserEffect();
 		const id = me?.id;
 		return typeof id === "string" && id.length > 0 ? id : null;
 	}).pipe(Effect.catchAll(() => Effect.succeed(null)));

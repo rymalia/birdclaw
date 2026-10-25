@@ -1,12 +1,8 @@
 // @vitest-environment node
-import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { promisify } from "node:util";
+import { existsSync, readFileSync } from "node:fs";
 import { configDefaults, coverageConfigDefaults } from "vitest/config";
 import { describe, expect, it } from "vitest";
 import vitestConfig from "../vitest.config";
-
-const execFileAsync = promisify(execFile);
 
 const packageJson = JSON.parse(
 	readFileSync(new URL("../package.json", import.meta.url), "utf8"),
@@ -15,6 +11,12 @@ const packageJson = JSON.parse(
 	bin: Record<string, string>;
 	scripts: Record<string, string>;
 	files: string[];
+	dependencies: Record<string, string>;
+	devDependencies: Record<string, string>;
+	engines: Record<string, string>;
+	overrides: Record<string, string>;
+	trustedDependencies: string[];
+	packageManager: string;
 };
 
 function resolvedVitestConfig() {
@@ -22,18 +24,16 @@ function resolvedVitestConfig() {
 }
 
 describe("package configuration", () => {
-	it("runs the published bin wrapper without tsx CLI startup", async () => {
-		const { stdout } = await execFileAsync(
-			process.execPath,
-			["bin/birdclaw.mjs", "--version"],
-			{
-				cwd: new URL("..", import.meta.url),
-				env: process.env,
-			},
+	it("launches the compiled CLI without source or tsx", () => {
+		const launcher = readFileSync(
+			new URL("../bin/birdclaw.mjs", import.meta.url),
+			"utf8",
 		);
-
-		expect(stdout.trim()).toBe(packageJson.version);
-	}, 15_000);
+		expect(launcher).toContain("../dist/cli/birdclaw.js");
+		expect(launcher).not.toContain("tsx");
+		expect(launcher).not.toContain("src/cli");
+		expect(packageJson.dependencies).not.toHaveProperty("tsx");
+	});
 
 	it("keeps published bin files in lint and format script coverage", () => {
 		const binTargets = Object.values(packageJson.bin);
@@ -46,10 +46,36 @@ describe("package configuration", () => {
 		}
 	});
 
-	it("uses the Node vitest wrapper directly for portable test scripts", () => {
-		expect(packageJson.scripts.test).toBe("node ./scripts/run-vitest.mjs run");
-		expect(packageJson.scripts.coverage).toBe(
-			"node ./scripts/run-vitest.mjs run --coverage",
+	it("uses Bun by default while retaining explicit Node compatibility", () => {
+		expect(packageJson.scripts.test).toBe(
+			"bun --no-env-file ./scripts/run-vitest.mjs run",
+		);
+		expect(packageJson.scripts["test:node"]).toBe(
+			"node ./scripts/run-vitest.mjs run",
+		);
+		expect(packageJson.scripts.coverage).toContain("bun --no-env-file");
+		expect(packageJson.scripts["coverage:node"]).toContain(
+			"BIRDCLAW_COVERAGE_PROVIDER=v8 node",
+		);
+		expect(packageJson.packageManager).toMatch(
+			/^bun@1\.4\.0-canary\.1\+[0-9a-f]{9}$/,
+		);
+		expect(packageJson.engines).toMatchObject({
+			bun: "1.4.0",
+			node: ">=26.5.1 <27",
+		});
+		expect(packageJson.overrides).toEqual({
+			"@hono/node-server": "2.1.5",
+			hono: "4.13.13",
+			nanoid: "6.0.2",
+		});
+		expect(packageJson.trustedDependencies).toEqual([
+			"esbuild",
+			"lightningcss",
+		]);
+		expect(existsSync(new URL("../bun.lock", import.meta.url))).toBe(true);
+		expect(existsSync(new URL("../pnpm-lock.yaml", import.meta.url))).toBe(
+			false,
 		);
 	});
 
@@ -58,21 +84,20 @@ describe("package configuration", () => {
 		expect(packageJson.scripts.dev).toContain("--host 127.0.0.1");
 	});
 
-	it("publishes script helpers referenced by package scripts", () => {
-		const isPublished = (filePath: string) =>
-			packageJson.files.some(
-				(entry) =>
-					!entry.startsWith("!") &&
-					(entry === filePath ||
-						(entry.endsWith("/") && filePath.startsWith(entry))),
-			);
-
-		for (const script of Object.values(packageJson.scripts)) {
-			for (const match of script.matchAll(/(?:^|\s)(\.\/scripts\/\S+)/g)) {
-				const scriptPath = match[1]?.replace(/^\.\//, "");
-				expect(scriptPath && isPublished(scriptPath)).toBe(true);
-			}
-		}
+	it("publishes only compiled runtime trees", () => {
+		expect(packageJson.files).toEqual(
+			expect.arrayContaining([
+				"bin/",
+				"dist/cli/",
+				"dist/client/",
+				"dist/server/",
+			]),
+		);
+		expect(packageJson.files).not.toContain("src/");
+		expect(packageJson.files).not.toContain("scripts/");
+		expect(packageJson.devDependencies).not.toHaveProperty("tsx");
+		expect(packageJson.devDependencies).toHaveProperty("vite");
+		expect(packageJson.dependencies).not.toHaveProperty("vite");
 	});
 
 	it("preserves Vitest default excludes while adding project excludes", () => {
@@ -86,6 +111,22 @@ describe("package configuration", () => {
 			"src/routeTree.gen.ts",
 			"src/styles.css",
 			"src/lib/types.ts",
+			"src/routes/network-map.tsx",
+			"src/routes/api/data-sources.tsx",
+			"src/routes/api/network-map.tsx",
 		]);
+		const usesV8Coverage = process.env.BIRDCLAW_COVERAGE_PROVIDER === "v8";
+		expect(config.test?.coverage?.provider).toBe(
+			usesV8Coverage ? "v8" : "istanbul",
+		);
+		expect(config.test?.coverage?.thresholds?.branches).toBe(
+			usesV8Coverage ? 80 : 79,
+		);
+		expect(config.test?.server?.deps?.inline).toEqual(
+			"bun" in process.versions ? ["zod"] : [],
+		);
+		expect(config.test?.testTimeout).toBe(
+			process.env.BIRDCLAW_COVERAGE_RUN === "1" ? 30_000 : 10_000,
+		);
 	});
 });

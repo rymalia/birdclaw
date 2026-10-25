@@ -6,7 +6,10 @@ const routerState = vi.hoisted(() => ({ path: "/inbox" }));
 const appNavProps: Array<{ compact?: boolean }> = vi.hoisted(() => []);
 
 vi.mock("@tanstack/react-router", () => ({
-	createRootRoute: (options: Record<string, unknown>) => ({ options }),
+	createRootRoute: (options: Record<string, unknown>) => ({
+		options,
+		useLoaderData: () => null,
+	}),
 	HeadContent: () => null,
 	Scripts: () => <div data-testid="scripts" />,
 	useRouterState: ({
@@ -14,25 +17,6 @@ vi.mock("@tanstack/react-router", () => ({
 	}: {
 		select: (state: { location: { pathname: string } }) => string;
 	}) => select({ location: { pathname: routerState.path } }),
-}));
-
-vi.mock("@tanstack/react-devtools", () => ({
-	TanStackDevtools: ({
-		plugins,
-	}: {
-		plugins: Array<{ name: string; render: ReactNode }>;
-	}) => (
-		<div data-testid="devtools">
-			{plugins[0]?.name}
-			{plugins[0]?.render}
-		</div>
-	),
-}));
-
-vi.mock("@tanstack/react-router-devtools", () => ({
-	TanStackRouterDevtoolsPanel: () => (
-		<div data-testid="router-devtools-panel">router panel</div>
-	),
 }));
 
 vi.mock("#/components/AppNav", () => ({
@@ -79,8 +63,7 @@ describe("root route", () => {
 		expect(markup).toContain("max-w-[1280px]");
 		expect(markup).toContain("child content");
 		expect(markup).toContain('data-testid="scripts"');
-		expect(markup).toContain("Tanstack Router");
-		expect(markup).toContain("router panel");
+		expect(markup).not.toContain("Tanstack Router");
 		expect(appNavProps).toEqual([{ compact: false }]);
 	});
 
@@ -99,6 +82,30 @@ describe("root route", () => {
 		const markup = renderToStaticMarkup(
 			<Shell>
 				<main>messages</main>
+			</Shell>,
+		);
+
+		expect(markup).toContain("max-w-[1280px]");
+		expect(markup).not.toContain("max-w-[680px]");
+		expect(markup).toContain("birdclaw nav compact");
+		expect(appNavProps).toEqual([{ compact: true }]);
+	});
+
+	it("uses the wide shell for the network map workspace", () => {
+		routerState.path = "/network-map";
+		appNavProps.length = 0;
+		const routeOptions = Route.options as unknown as {
+			shellComponent: ({ children }: { children: ReactNode }) => ReactNode;
+		};
+		const Shell = routeOptions.shellComponent as ({
+			children,
+		}: {
+			children: ReactNode;
+		}) => ReactNode;
+
+		const markup = renderToStaticMarkup(
+			<Shell>
+				<main>map</main>
 			</Shell>,
 		);
 

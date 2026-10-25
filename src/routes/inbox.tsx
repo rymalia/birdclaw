@@ -1,15 +1,25 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
+import {
+	keepPreviousData,
+	useMutation,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { useSelectedAccountId } from "#/components/account-selection";
+import { useMemo, useState } from "react";
+import { useQueryAccount } from "#/components/account-selection";
 import { InboxCard } from "#/components/InboxCard";
-import { postAction } from "#/lib/api-client";
-import type {
-	InboxItem,
-	InboxKind,
-	InboxResponse,
-	QueryEnvelope,
-} from "#/lib/types";
+import { inboxResponseSchema } from "#/lib/api-contracts";
+import { fetchJson, fetchQueryEnvelope, postAction } from "#/lib/api-client";
+import { queryKeys } from "#/lib/query-client";
+import { useDeploymentMode } from "#/lib/deployment-mode";
+import {
+	type InboxRouteSearch,
+	type RouteSearchChange,
+	validateInboxSearch,
+} from "#/lib/route-search";
+import type { InboxItem, InboxKind } from "#/lib/types";
 import {
 	cx,
 	emptyStateClass,
@@ -31,6 +41,7 @@ import {
 
 export const Route = createFileRoute("/inbox")({
 	component: InboxRoute,
+	validateSearch: validateInboxSearch,
 });
 
 const TABS: Array<{ value: InboxKind; label: string }> = [
@@ -40,45 +51,90 @@ const TABS: Array<{ value: InboxKind; label: string }> = [
 ];
 
 function InboxRoute() {
-	const [meta, setMeta] = useState<QueryEnvelope | null>(null);
-	const [items, setItems] = useState<InboxItem[]>([]);
-	const [kind, setKind] = useState<InboxKind>("mixed");
-	const [minScore, setMinScore] = useState("40");
-	const [hideLowSignal, setHideLowSignal] = useState(true);
-	const [refreshTick, setRefreshTick] = useState(0);
-	const [isScoring, setIsScoring] = useState(false);
+	const search = Route.useSearch();
+	const navigate = Route.useNavigate();
+	return (
+		<InboxRouteView
+			searchState={search}
+			onSearchChange={(next, options) =>
+				void navigate({ search: next, replace: options?.replace })
+			}
+		/>
+	);
+}
+
+export function InboxRouteView({
+	searchState: controlledSearch,
+	onSearchChange,
+}: {
+	searchState?: InboxRouteSearch;
+	onSearchChange?: RouteSearchChange<InboxRouteSearch>;
+} = {}) {
+	const queryClient = useQueryClient();
+	const { readOnly } = useDeploymentMode();
+	const { searchState, updateSearch, textInput } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateInboxSearch,
+	);
+	const { kind, minScore, hideLowSignal } = searchState;
 	const [activeReplyId, setActiveReplyId] = useState<string | null>(null);
 	const [replyDraft, setReplyDraft] = useState("");
 	const [isSendingReply, setIsSendingReply] = useState(false);
 	const [replyError, setReplyError] = useState<string | null>(null);
-	const [stats, setStats] = useState<InboxResponse["stats"] | null>(null);
-	const selectedAccountId = useSelectedAccountId(meta?.accounts);
+	const statusQuery = useQuery({
+		queryKey: queryKeys.status,
+		queryFn: ({ signal }) => fetchQueryEnvelope({ signal }),
+	});
+	const meta = statusQuery.data ?? null;
+	const { selectedAccountId, accountSelectionSettled } =
+		useQueryAccount(statusQuery);
+	const inboxQueryKey = [
+		...queryKeys.inbox,
+		{
+			hideLowSignal,
+			kind,
+			minScore,
+			selectedAccountId: selectedAccountId ?? null,
+		},
+	] as const;
+	const inboxQuery = useQuery({
+		queryKey: inboxQueryKey,
+		enabled: accountSelectionSettled,
+		queryFn: async ({ signal }) => {
+			const url = new URL("/api/inbox", window.location.origin);
+			url.searchParams.set("kind", kind);
+			url.searchParams.set("minScore", minScore);
+			if (selectedAccountId) {
+				url.searchParams.set("account", selectedAccountId);
+			}
+			if (hideLowSignal) {
+				url.searchParams.set("hideLowSignal", "1");
+			}
 
-	useEffect(() => {
-		fetch("/api/status")
-			.then((response) => response.json())
-			.then((data: QueryEnvelope) => setMeta(data));
-	}, []);
-
-	useEffect(() => {
-		const url = new URL("/api/inbox", window.location.origin);
-		url.searchParams.set("kind", kind);
-		url.searchParams.set("minScore", minScore);
-		url.searchParams.set("refresh", String(refreshTick));
-		if (selectedAccountId) {
-			url.searchParams.set("account", selectedAccountId);
-		}
-		if (hideLowSignal) {
-			url.searchParams.set("hideLowSignal", "1");
-		}
-
-		fetch(url)
-			.then((response) => response.json())
-			.then((data: InboxResponse) => {
-				setItems(data.items);
-				setStats(data.stats);
-			});
-	}, [hideLowSignal, kind, minScore, refreshTick, selectedAccountId]);
+			return fetchJson(
+				url,
+				{ signal },
+				inboxResponseSchema,
+				"Inbox request failed",
+			);
+		},
+		placeholderData: keepPreviousData,
+		staleTime: 5 * 60_000,
+	});
+	const items = inboxQuery.data?.items ?? [];
+	const stats = inboxQuery.data?.stats ?? null;
+	const scoreMutation = useMutation({
+		mutationFn: () =>
+			postAction({
+				kind: "scoreInbox",
+				scoreKind: kind,
+				account: selectedAccountId,
+				limit: 8,
+			}),
+		onSuccess: () =>
+			queryClient.invalidateQueries({ queryKey: queryKeys.inbox }),
+	});
 
 	const subtitle = useMemo(() => {
 		if (!meta || !stats) return "Ranking unreplied mentions and DMs...";
@@ -86,22 +142,7 @@ function InboxRoute() {
 	}, [meta, stats]);
 
 	async function scoreNow() {
-		setIsScoring(true);
-		try {
-			await fetch("/api/action", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					kind: "scoreInbox",
-					scoreKind: kind,
-					account: selectedAccountId,
-					limit: 8,
-				}),
-			});
-			setRefreshTick((value) => value + 1);
-		} finally {
-			setIsScoring(false);
-		}
+		await scoreMutation.mutateAsync();
 	}
 
 	async function sendReply(item: InboxItem) {
@@ -125,7 +166,7 @@ function InboxRoute() {
 			);
 			setReplyDraft("");
 			setActiveReplyId(null);
-			setRefreshTick((value) => value + 1);
+			await queryClient.invalidateQueries({ queryKey: queryKeys.inbox });
 		} catch (error) {
 			setReplyError(error instanceof Error ? error.message : "Reply failed");
 		} finally {
@@ -143,25 +184,30 @@ function InboxRoute() {
 					</div>
 					<button
 						className={primaryButtonClass}
-						disabled={isScoring}
+						disabled={scoreMutation.isPending}
+						hidden={readOnly}
 						onClick={() => void scoreNow()}
 						type="button"
 					>
 						<Sparkles className="size-4" strokeWidth={2.2} />
-						{isScoring ? "Scoring..." : "Score with OpenAI"}
+						{scoreMutation.isPending ? "Scoring..." : "Score with OpenAI"}
 					</button>
 				</div>
 				<div className="flex flex-wrap items-center gap-2 px-4 pb-3">
 					<input
 						className={cx(textFieldClass, textFieldShortClass)}
 						inputMode="numeric"
-						onChange={(event) => setMinScore(event.target.value)}
+						{...textInput("minScore")}
 						placeholder="Min AI score"
-						value={minScore}
 					/>
 					<button
 						className={secondaryButtonClass}
-						onClick={() => setHideLowSignal((value) => !value)}
+						onClick={() =>
+							updateSearch({
+								...searchState,
+								hideLowSignal: !hideLowSignal,
+							})
+						}
 						type="button"
 						aria-pressed={hideLowSignal}
 					>
@@ -177,7 +223,9 @@ function InboxRoute() {
 								type="button"
 								aria-pressed={active}
 								className={cx(tabButtonClass, active && tabButtonActiveClass)}
-								onClick={() => setKind(tab.value)}
+								onClick={() =>
+									updateSearch({ ...searchState, kind: tab.value })
+								}
 							>
 								<span className="relative inline-flex flex-col items-center justify-center py-1">
 									{tab.value}

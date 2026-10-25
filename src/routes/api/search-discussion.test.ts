@@ -2,14 +2,13 @@
 import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getRouteHandler } from "#/test/route-handlers";
+import { useTestHome } from "#/test/test-home";
 
 const maybeAutoUpdateBackupMock = vi.fn();
 const streamSearchDiscussionMock = vi.fn();
 
 vi.mock("#/lib/backup", () => ({
-	maybeAutoUpdateBackup: () => maybeAutoUpdateBackupMock(),
-	maybeAutoUpdateBackupEffect: () =>
-		Effect.promise(() => Promise.resolve(maybeAutoUpdateBackupMock())),
+	requestBackupAutoUpdate: () => maybeAutoUpdateBackupMock(),
 }));
 vi.mock("#/lib/search-discussion", () => ({
 	streamSearchDiscussionEffect: (...args: unknown[]) =>
@@ -21,7 +20,9 @@ import { Route } from "./search-discussion";
 const GET = getRouteHandler(Route, "GET");
 
 describe("api search discussion route", () => {
+	useTestHome();
 	beforeEach(() => {
+		delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 		maybeAutoUpdateBackupMock.mockReset();
 		streamSearchDiscussionMock.mockReset();
 		maybeAutoUpdateBackupMock.mockResolvedValue({ skipped: true });
@@ -44,7 +45,16 @@ describe("api search discussion route", () => {
 							query: "ChatGPT",
 							source: "search",
 							includeDms: true,
-							counts: { search: 3, home: 0, mentions: 0, authored: 0 },
+							counts: {
+								search: 3,
+								home: 0,
+								mentions: 0,
+								authored: 0,
+								likes: 0,
+								bookmarks: 0,
+								dms: 0,
+							},
+							tweets: [],
 						},
 						discussion: { title: "Search" },
 					},
@@ -52,6 +62,29 @@ describe("api search discussion route", () => {
 			},
 		);
 	});
+
+	it.each([
+		[undefined, undefined, "xurl"],
+		["bird", undefined, "auto"],
+		["xurl", undefined, "auto"],
+		["bird", "xurl", "xurl"],
+		[undefined, "auto", "auto"],
+	])(
+		"uses preference %s and explicit mode %s as %s",
+		async (preferred, explicit, expected) => {
+			if (preferred) process.env.BIRDCLAW_PREFERRED_TRANSPORT = preferred;
+			const url = new URL(
+				"http://localhost/api/search-discussion?query=fixture",
+			);
+			if (explicit) url.searchParams.set("mode", explicit);
+			const response = await GET({ request: new Request(url) });
+			await response.text();
+			expect(streamSearchDiscussionMock).toHaveBeenCalledWith(
+				expect.objectContaining({ mode: expected }),
+				expect.any(Object),
+			);
+		},
+	);
 
 	it("streams NDJSON and passes query options to the discussion runner", async () => {
 		const response = await GET({
@@ -63,7 +96,9 @@ describe("api search discussion route", () => {
 		expect(response.headers.get("content-type")).toContain(
 			"application/x-ndjson",
 		);
-		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(response.headers.get("cache-control")).toBe(
+			"no-store, no-transform",
+		);
 		expect(await response.text()).toContain('"type":"done"');
 		expect(maybeAutoUpdateBackupMock).toHaveBeenCalledWith();
 		expect(streamSearchDiscussionMock).toHaveBeenCalledWith(
@@ -103,9 +138,9 @@ describe("api search discussion route", () => {
 			expect.objectContaining({
 				query: "",
 				source: "search",
-				mode: "auto",
+				mode: "xurl",
 				includeDms: false,
-				limit: 5000,
+				limit: 20000,
 				maxPages: undefined,
 				prefetchAvatars: true,
 			}),

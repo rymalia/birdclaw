@@ -1,14 +1,14 @@
 name: Update Homebrew Tap
 
 on:
-  release:
-    types: [published]
-  workflow_dispatch:
+  workflow_call:
     inputs:
       tag:
-        description: "Release tag to publish to the tap (for example, v0.3.0)"
         required: true
         type: string
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: true
 
 permissions:
   contents: read
@@ -37,6 +37,20 @@ jobs:
           printf 'tag=%s\n' "$tag" >> "$GITHUB_OUTPUT"
           printf 'request_id=%s\n' "$request_id" >> "$GITHUB_OUTPUT"
 
+      - name: Wait for npm tarball
+        timeout-minutes: 12
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 10 --max-time 30 \
+            --retry 30 --retry-delay 10 --retry-max-time 600 --retry-all-errors \
+            --output /dev/null \
+            "https://registry.npmjs.org/birdclaw/-/birdclaw-${version}.tgz"
+
       - name: Dispatch tap update
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -64,8 +78,19 @@ jobs:
           for _ in {1..20}; do
             run_id="$(gh run list --repo steipete/homebrew-tap --workflow update-formula.yml --json databaseId,displayTitle --jq '.[] | select(.displayTitle | contains(env.REQUEST_ID)) | .databaseId' | head -n1)"
             if [[ -n "$run_id" ]]; then
-              gh run watch "$run_id" --repo steipete/homebrew-tap --exit-status
-              exit 0
+              for _ in {1..270}; do
+                state="$(gh run view "$run_id" --repo steipete/homebrew-tap --json status,conclusion --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+                if [[ "$state" == completed$'\t'success ]]; then
+                  exit 0
+                fi
+                if [[ "$state" == completed$'\t'* ]]; then
+                  echo "Tap update failed: $state" >&2
+                  exit 1
+                fi
+                sleep 10
+              done
+              echo "Timed out waiting for tap workflow $run_id." >&2
+              exit 1
             fi
             sleep 5
           done

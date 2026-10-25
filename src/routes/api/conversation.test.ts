@@ -1,19 +1,16 @@
 // @vitest-environment node
-import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getRouteHandler } from "#/test/route-handlers";
 
 const getTweetConversationMock = vi.fn();
 const maybeAutoUpdateBackupMock = vi.fn();
 
-vi.mock("#/lib/queries", () => ({
+vi.mock("#/lib/timeline-read-model", () => ({
 	getTweetConversation: (...args: unknown[]) =>
 		getTweetConversationMock(...args),
 }));
 vi.mock("#/lib/backup", () => ({
-	maybeAutoUpdateBackup: () => maybeAutoUpdateBackupMock(),
-	maybeAutoUpdateBackupEffect: () =>
-		Effect.promise(() => Promise.resolve(maybeAutoUpdateBackupMock())),
+	requestBackupAutoUpdate: () => maybeAutoUpdateBackupMock(),
 }));
 
 import { Route } from "./conversation";

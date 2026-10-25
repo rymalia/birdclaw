@@ -1,11 +1,13 @@
 import type { Database } from "./sqlite";
 import { Effect } from "effect";
 import { lookupProfileViaBirdEffect } from "./bird";
-import { runEffectPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
 import { syncIdentitySearchIndexForProfileIds } from "./identity-search-index";
 import { syncProfileBioEntitiesForProfileId } from "./profile-bio-entities";
 import { recordProfileSnapshot } from "./profile-history";
+import { normalizeProfileHandle } from "./profile-row";
 import { upsertProfileFromXUser } from "./x-profile";
+import { lookupUsersByHandlesEffect } from "./xurl";
 
 export interface ProfileAffiliationHydrationResult {
 	checked: number;
@@ -24,22 +26,6 @@ interface SyntheticAffiliationRow {
 	label: string | null;
 	source: string;
 	raw_json: string;
-}
-
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
-function normalizeHandle(value: string | null) {
-	const handle = value?.trim().replace(/^@/, "");
-	return handle && handle.length > 0 ? handle : null;
 }
 
 function replaceSyntheticAffiliation(
@@ -128,6 +114,7 @@ function findLocalOrganizationProfileId(db: Database, handle: string) {
 export function hydrateProfileAffiliationOrganizationsEffect(
 	db: Database,
 	subjectProfileId: string,
+	{ xurlFallback = true }: { xurlFallback?: boolean } = {},
 ): Effect.Effect<ProfileAffiliationHydrationResult, unknown> {
 	return Effect.gen(function* () {
 		const rows = yield* trySync(
@@ -156,7 +143,7 @@ export function hydrateProfileAffiliationOrganizationsEffect(
 		};
 
 		for (const row of rows) {
-			const handle = normalizeHandle(row.organization_handle);
+			const handle = normalizeProfileHandle(row.organization_handle) || null;
 			if (!handle) {
 				result.skipped += 1;
 				continue;
@@ -175,7 +162,16 @@ export function hydrateProfileAffiliationOrganizationsEffect(
 					return true;
 				}
 
-				const user = yield* lookupProfileViaBirdEffect(handle);
+				const birdUser = yield* lookupProfileViaBirdEffect(handle).pipe(
+					Effect.catchAll((error) =>
+						xurlFallback ? Effect.succeed(null) : Effect.fail(error),
+					),
+				);
+				const user =
+					birdUser ??
+					(xurlFallback
+						? (yield* lookupUsersByHandlesEffect([handle]))[0]
+						: null);
 				if (!user) {
 					result.skipped += 1;
 					return true;
@@ -221,8 +217,9 @@ export function hydrateProfileAffiliationOrganizationsEffect(
 export function hydrateProfileAffiliationOrganizations(
 	db: Database,
 	subjectProfileId: string,
+	options: { xurlFallback?: boolean } = {},
 ): Promise<ProfileAffiliationHydrationResult> {
 	return runEffectPromise(
-		hydrateProfileAffiliationOrganizationsEffect(db, subjectProfileId),
+		hydrateProfileAffiliationOrganizationsEffect(db, subjectProfileId, options),
 	);
 }

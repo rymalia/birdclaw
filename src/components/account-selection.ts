@@ -4,6 +4,21 @@ import type { AccountRecord } from "#/lib/types";
 const STORAGE_KEY = "birdclaw:selected-account-id";
 const CHANGE_EVENT = "birdclaw-account-change";
 
+export function useQueryAccount(status: {
+	data?: { accounts: AccountRecord[] };
+	isSuccess: boolean;
+	isError: boolean;
+}) {
+	const selectedAccountId = useSelectedAccountId(status.data?.accounts, {
+		allowStoredBeforeAccounts: true,
+	});
+	return {
+		selectedAccountId,
+		accountSelectionSettled:
+			Boolean(selectedAccountId) || status.isSuccess || status.isError,
+	};
+}
+
 export function defaultAccountId(accounts: AccountRecord[] | undefined) {
 	if (!accounts?.length) return undefined;
 	return accounts.find((account) => account.isDefault)?.id ?? accounts[0]?.id;
@@ -24,7 +39,10 @@ export function setStoredAccountId(accountId: string) {
 	);
 }
 
-export function useSelectedAccountId(accounts: AccountRecord[] | undefined) {
+export function useSelectedAccountId(
+	accounts: AccountRecord[] | undefined,
+	options: { allowStoredBeforeAccounts?: boolean } = {},
+) {
 	const fallbackAccountId = useMemo(
 		() => defaultAccountId(accounts),
 		[accounts],
@@ -57,6 +75,7 @@ export function useSelectedAccountId(accounts: AccountRecord[] | undefined) {
 		}
 	}, [accounts, fallbackAccountId]);
 
+	if (!accounts && options.allowStoredBeforeAccounts) return selectedAccountId;
 	return selectedAccountId &&
 		accounts?.some((account) => account.id === selectedAccountId)
 		? selectedAccountId

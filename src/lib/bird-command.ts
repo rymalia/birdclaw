@@ -1,13 +1,10 @@
-import { execFile } from "node:child_process";
 import type { ExecFileOptions } from "node:child_process";
 import { access } from "node:fs/promises";
 import { constants } from "node:fs";
-import { promisify } from "node:util";
 import { Data, Effect } from "effect";
 import { getBirdCommand } from "./config";
 import { runEffectPromise } from "./effect-runtime";
-
-const execFileAsync = promisify(execFile);
+import { runSubprocessEffect, SubprocessError } from "./subprocess";
 
 export class BirdCommandUnavailableError extends Data.TaggedError(
 	"BirdCommandUnavailableError",
@@ -52,6 +49,13 @@ function execFailureFromCause(command: string, cause: unknown) {
 		return new BirdCommandUnavailableError({
 			message: formatBirdInstallHint(command),
 			command,
+			cause,
+		});
+	}
+	if (cause instanceof SubprocessError && !cause.causeWasError) {
+		return new BirdCommandExecutionError({
+			message: "",
+			useFallbackMessage: true,
 			cause,
 		});
 	}
@@ -109,16 +113,23 @@ export function runBirdCommandEffect(
 		const birdCommand = yield* getBirdCommandEffect();
 		yield* assertBirdCommandAvailableEffect(birdCommand);
 
-		const result = yield* Effect.tryPromise({
-			try: () =>
-				Promise.resolve(
-					options === undefined
-						? execFileAsync(birdCommand, args)
-						: execFileAsync(birdCommand, args, options),
-				),
-			catch: (cause) => execFailureFromCause(birdCommand, cause),
-		});
-		return result as { stdout: string; stderr: string };
+		return yield* runSubprocessEffect({
+			command: birdCommand,
+			args,
+			...(typeof options?.cwd === "string" ? { cwd: options.cwd } : {}),
+			...(options?.env ? { env: options.env } : {}),
+			...(typeof options?.timeout === "number"
+				? { timeoutMs: options.timeout }
+				: {}),
+			...(typeof options?.maxBuffer === "number"
+				? { maxBufferBytes: options.maxBuffer }
+				: {}),
+			...(options?.signal ? { signal: options.signal } : {}),
+			...(options?.killSignal ? { killSignal: options.killSignal } : {}),
+		}).pipe(
+			Effect.map(({ stdout, stderr }) => ({ stdout, stderr })),
+			Effect.mapError((cause) => execFailureFromCause(birdCommand, cause)),
+		);
 	});
 }
 

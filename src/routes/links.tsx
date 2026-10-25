@@ -1,3 +1,4 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
 import {
 	ChevronDown,
@@ -9,7 +10,7 @@ import {
 	Search,
 	Users,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useState } from "react";
 import { AvatarChip } from "#/components/AvatarChip";
 import {
 	FeedEmpty,
@@ -18,17 +19,18 @@ import {
 	LinkSkeletonRows,
 } from "#/components/FeedState";
 import { ProfilePreview } from "#/components/ProfilePreview";
-import { formatCompactNumber, formatShortTimestamp } from "#/lib/present";
+import { SmartTimestamp } from "#/components/SmartTimestamp";
+import { useLinksController } from "#/components/links-controller";
+import { formatCompactNumber } from "#/lib/present";
+import {
+	type LinksRouteSearch,
+	type RouteSearchChange,
+	validateLinksSearch,
+} from "#/lib/route-search";
 import type {
 	LinkInsightItem,
-	LinkInsightKind,
 	LinkInsightMention,
-	LinkInsightRange,
-	LinkInsightResponse,
-	LinkInsightSort,
-	LinkInsightSource,
 	ProfileRecord,
-	TweetMediaItem,
 } from "#/lib/types";
 import {
 	cx,
@@ -47,172 +49,23 @@ import {
 
 export const Route = createFileRoute("/links")({
 	component: LinksRoute,
+	validateSearch: validateLinksSearch,
 });
 
-const INITIAL_VISIBLE_COMMENTS = 3;
-const MORE_COMMENTS_BATCH = 6;
-const LINK_INSIGHTS_LIMIT = 30;
-const LINK_INSIGHTS_COMMENTS_LIMIT = 30;
-const PROFILE_HYDRATION_LIMIT = 30;
-const PROFILE_HYDRATION_DELAY_MS = 1200;
-
-const ranges: Array<{ value: LinkInsightRange; label: string }> = [
-	{ value: "today", label: "Today" },
-	{ value: "week", label: "Week" },
-	{ value: "month", label: "Month" },
-	{ value: "year", label: "Year" },
-	{ value: "all", label: "All" },
-];
-
-function itemTitle(item: LinkInsightItem) {
-	return item.title?.trim() || item.displayUrl;
-}
-
-function itemSubtitle(item: LinkInsightItem) {
-	const description = item.description?.trim();
-	if (description) {
-		return description;
-	}
-	return item.displayUrl.split("?")[0] || item.displayUrl;
-}
-
-function insightCacheKey(
-	kind: LinkInsightKind,
-	range: LinkInsightRange,
-	sort: LinkInsightSort,
-	source: LinkInsightSource,
-	refreshTick: number,
-) {
-	return `${kind}:${range}:${sort}:${source}:${refreshTick}`;
-}
-
-function linkInsightsUrl(
-	kind: LinkInsightKind,
-	range: LinkInsightRange,
-	sort: LinkInsightSort,
-	source: LinkInsightSource,
-	refreshTick: number,
-) {
-	const url = new URL("/api/link-insights", window.location.origin);
-	url.searchParams.set("kind", kind);
-	url.searchParams.set("range", range);
-	url.searchParams.set("sort", sort);
-	url.searchParams.set("source", source);
-	url.searchParams.set("limit", String(LINK_INSIGHTS_LIMIT));
-	url.searchParams.set("commentsLimit", String(LINK_INSIGHTS_COMMENTS_LIMIT));
-	url.searchParams.set("refresh", String(refreshTick));
-	return url;
-}
-
-function mentionHref(mention: LinkInsightMention, item: LinkInsightItem) {
-	return mention.sourceUrl || mention.contentTweetUrl || item.url;
-}
-
-function mentionCopy(mention: LinkInsightMention) {
-	return (
-		mention.commentText ||
-		mention.sharedContentText ||
-		mention.rawText ||
-		"Shared without comment"
-	);
-}
-
-function isSameProfile(
-	left: ProfileRecord | null | undefined,
-	right: ProfileRecord | null | undefined,
-) {
-	return Boolean(left && right && left.id === right.id);
-}
-
-function mediaImage(media: TweetMediaItem[]) {
-	return media.find((item) => item.thumbnailUrl || item.url) ?? null;
-}
-
-function youtubeVideoId(rawUrl: string) {
-	try {
-		const url = new URL(rawUrl);
-		const host = url.hostname.toLowerCase().replace(/^www\./, "");
-		if (host === "youtu.be") {
-			return url.pathname.split("/").filter(Boolean)[0] ?? null;
-		}
-		if (!host.endsWith("youtube.com")) {
-			return null;
-		}
-		if (url.pathname === "/watch") {
-			return url.searchParams.get("v");
-		}
-		const parts = url.pathname.split("/").filter(Boolean);
-		if (parts[0] === "embed" || parts[0] === "shorts" || parts[0] === "live") {
-			return parts[1] ?? null;
-		}
-		return null;
-	} catch {
-		return null;
-	}
-}
-
-function youtubeThumbnailUrl(rawUrl: string) {
-	const id = youtubeVideoId(rawUrl);
-	if (!id || !/^[\w-]{6,}$/.test(id)) {
-		return null;
-	}
-	return `https://i.ytimg.com/vi/${encodeURIComponent(id)}/hqdefault.jpg`;
-}
-
-function commentCount(item: LinkInsightItem) {
-	return (
-		item.commentCount ??
-		item.mentions.filter((mention) => mention.hasComment).length
-	);
-}
-
-function pureShareCount(item: LinkInsightItem) {
-	return (
-		item.pureShareCount ??
-		item.mentions.filter(
-			(mention) => mention.isPureShare || !mention.hasComment,
-		).length
-	);
-}
-
-function isArchivePlaceholderProfile(profile: ProfileRecord) {
-	return (
-		/^id\d+$/i.test(profile.handle) &&
-		profile.displayName === profile.handle &&
-		profile.id === `profile_user_${profile.handle.slice(2)}`
-	);
-}
-
-function profileNeedsHydration(profile: ProfileRecord | null | undefined) {
-	if (!profile?.handle || isArchivePlaceholderProfile(profile)) {
-		return false;
-	}
-	return !profile.avatarUrl || profile.followersCount === 0;
-}
-
-function collectProfilesForHydration(data: LinkInsightResponse | null) {
-	const handles = new Set<string>();
-	for (const item of data?.items ?? []) {
-		for (const profile of [
-			item.topSharer,
-			...item.sharers,
-			...item.mentions.flatMap((mention) => [
-				mention.sharedBy,
-				mention.contentAuthor,
-				mention.participant,
-			]),
-		]) {
-			if (!profile || !profileNeedsHydration(profile)) {
-				continue;
-			}
-			handles.add(profile.handle.replace(/^@/, ""));
-			if (handles.size >= PROFILE_HYDRATION_LIMIT) {
-				return [...handles];
-			}
-		}
-	}
-	return [...handles];
-}
+import {
+	INITIAL_VISIBLE_COMMENTS,
+	MORE_COMMENTS_BATCH,
+	commentCount,
+	isSameProfile,
+	itemSubtitle,
+	itemTitle,
+	mediaImage,
+	mentionCopy,
+	mentionHref,
+	pureShareCount,
+	ranges,
+	youtubeThumbnailUrl,
+} from "#/components/links-model";
 
 function ProfilePill({
 	profile,
@@ -393,7 +246,7 @@ function MentionCard({
 					rel="noreferrer"
 					target="_blank"
 				>
-					{formatShortTimestamp(mention.createdAt)}
+					<SmartTimestamp value={mention.createdAt} />
 				</a>
 			</div>
 			<p className="m-0 whitespace-pre-wrap text-[14px] leading-[1.45] text-[var(--ink)] [overflow-wrap:anywhere]">
@@ -633,7 +486,7 @@ function LinkInsightRow({
 						<span>/</span>
 						<SharerStrip item={item} />
 						<span>/</span>
-						<span>{formatShortTimestamp(item.lastSeenAt)}</span>
+						<SmartTimestamp value={item.lastSeenAt} />
 					</div>
 					<VideoPreview item={item} />
 				</div>
@@ -644,166 +497,47 @@ function LinkInsightRow({
 }
 
 function LinksRoute() {
-	const [kind, setKind] = useState<LinkInsightKind>("links");
-	const [range, setRange] = useState<LinkInsightRange>("week");
-	const [source, setSource] = useState<LinkInsightSource>("all");
-	const [sort, setSort] = useState<LinkInsightSort>("rank");
-	const [search, setSearch] = useState("");
-	const [refreshTick, setRefreshTick] = useState(0);
-	const hydratedHandlesRef = useRef(new Set<string>());
-	const cacheRef = useRef(new Map<string, LinkInsightResponse>());
-	const inFlightRef = useRef(new Set<string>());
-	const mountedRef = useRef(true);
-	const [errorByKey, setErrorByKey] = useState<Record<string, string>>({});
-	const [, bumpCacheVersion] = useState(0);
-	const currentCacheKey = insightCacheKey(
+	const search = Route.useSearch();
+	const navigate = Route.useNavigate();
+	return (
+		<LinksRouteView
+			searchState={search}
+			onSearchChange={(next, options) =>
+				void navigate({ search: next, replace: options?.replace })
+			}
+		/>
+	);
+}
+
+export function LinksRouteView({
+	searchState: controlledSearch,
+	onSearchChange,
+}: {
+	searchState?: LinksRouteSearch;
+	onSearchChange?: RouteSearchChange<LinksRouteSearch>;
+} = {}) {
+	const { searchState, updateSearch } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateLinksSearch,
+	);
+	const {
 		kind,
+		setKind,
 		range,
-		sort,
+		setRange,
 		source,
-		refreshTick,
-	);
-	const data = cacheRef.current.get(currentCacheKey) ?? null;
-	const error = errorByKey[currentCacheKey] ?? null;
-	const loading = !data && !error;
-
-	useEffect(() => {
-		return () => {
-			mountedRef.current = false;
-		};
-	}, []);
-
-	const fetchInsights = useCallback(
-		(fetchKind: LinkInsightKind) => {
-			const key = insightCacheKey(fetchKind, range, sort, source, refreshTick);
-			if (cacheRef.current.has(key) || inFlightRef.current.has(key)) {
-				return;
-			}
-			inFlightRef.current.add(key);
-			setErrorByKey((current) => {
-				const rest = { ...current };
-				delete rest[key];
-				return rest;
-			});
-			fetch(linkInsightsUrl(fetchKind, range, sort, source, refreshTick))
-				.then((response) => response.json())
-				.then((response: LinkInsightResponse) => {
-					cacheRef.current.set(key, response);
-					if (mountedRef.current) {
-						bumpCacheVersion((value) => value + 1);
-					}
-				})
-				.catch((error: unknown) => {
-					if (error instanceof DOMException && error.name === "AbortError") {
-						return;
-					}
-					if (!mountedRef.current) {
-						return;
-					}
-					console.warn("Link insights failed", error);
-					setErrorByKey((current) => ({
-						...current,
-						[key]:
-							error instanceof Error
-								? error.message
-								: "Link insights unavailable",
-					}));
-				})
-				.finally(() => {
-					inFlightRef.current.delete(key);
-				});
-		},
-		[range, refreshTick, sort, source],
-	);
-
-	useEffect(() => {
-		fetchInsights(kind);
-	}, [fetchInsights, kind]);
-
-	useEffect(() => {
-		if (!data) {
-			return;
-		}
-		const prefetchKind = kind === "links" ? "videos" : "links";
-		const timer = window.setTimeout(() => fetchInsights(prefetchKind), 250);
-		return () => window.clearTimeout(timer);
-	}, [data, fetchInsights, kind]);
-
-	useEffect(() => {
-		const handles = collectProfilesForHydration(data).filter(
-			(handle) => !hydratedHandlesRef.current.has(handle.toLowerCase()),
-		);
-		if (handles.length === 0) {
-			return;
-		}
-
-		const controller = new AbortController();
-		const url = new URL("/api/profile-hydrate", window.location.origin);
-		url.searchParams.set("handles", handles.join(","));
-		for (const handle of handles) {
-			hydratedHandlesRef.current.add(handle.toLowerCase());
-		}
-
-		let idleId: number | null = null;
-		const runHydration = () => {
-			fetch(url, { signal: controller.signal })
-				.then((response) => response.json())
-				.then((response: { hydratedProfiles?: number }) => {
-					if ((response.hydratedProfiles ?? 0) > 0) {
-						setRefreshTick((value) => value + 1);
-					}
-				})
-				.catch((error: unknown) => {
-					if (error instanceof DOMException && error.name === "AbortError") {
-						return;
-					}
-					console.warn("Profile hydration failed", error);
-				});
-		};
-		const timer = window.setTimeout(() => {
-			if ("requestIdleCallback" in window) {
-				idleId = window.requestIdleCallback(runHydration, { timeout: 2500 });
-			} else {
-				runHydration();
-			}
-		}, PROFILE_HYDRATION_DELAY_MS);
-
-		return () => {
-			controller.abort();
-			window.clearTimeout(timer);
-			if (idleId !== null && "cancelIdleCallback" in window) {
-				window.cancelIdleCallback(idleId);
-			}
-		};
-	}, [data]);
-
-	const items = useMemo(() => {
-		const query = search.trim().toLowerCase();
-		const filtered = (data?.items ?? []).filter((item) => {
-			if (!query) {
-				return true;
-			}
-			return [
-				item.title,
-				item.description,
-				item.displayUrl,
-				item.host,
-				item.topSharer?.handle,
-				...item.mentions.map((mention) => mention.commentText),
-			]
-				.filter(Boolean)
-				.some((value) => String(value).toLowerCase().includes(query));
-		});
-		return filtered;
-	}, [data?.items, search]);
-
-	const subtitle = useMemo(() => {
-		if (!data) {
-			return "Loading link memory...";
-		}
-		const label = kind === "videos" ? "video URLs" : "URLs";
-		return `${formatCompactNumber(data.stats.occurrences)} ${label} across ${formatCompactNumber(data.stats.groups)} groups`;
-	}, [data, kind]);
+		setSource,
+		sort,
+		setSort,
+		search,
+		setSearch,
+		items,
+		subtitle,
+		loading,
+		error,
+		retry,
+	} = useLinksController(searchState, updateSearch);
 
 	return (
 		<>
@@ -900,7 +634,7 @@ function LinksRoute() {
 						action={
 							<button
 								className="rounded-full bg-[var(--accent)] px-4 py-1.5 text-[14px] font-bold text-white"
-								onClick={() => setRefreshTick((value) => value + 1)}
+								onClick={() => void retry()}
 								type="button"
 							>
 								Retry

@@ -27,46 +27,39 @@ birdclaw [global flags] <subcommand> [args]
 - `-h, --help`
 - `--version`
 - `--json`
-- `--plain`
-- `-q, --quiet`
-- `-v, --verbose`
-- `--no-color`
-- `--no-input`
-- `--config <path>`
-- `--profile <name>`
-- `--db <path>`
+
+Global flags work before or after subcommands, for example `birdclaw --json db stats` and `birdclaw db stats --json`. Nested `--help` output includes the available global flags. Use `--` before positional values that start with a dash; a literal `--json` after that separator is data, not an output flag. Help and version requests always return text.
 
 ## Config precedence
 
-Flags > env > project config > user config
+Command flags > environment overrides > user config
 
 User config:
 
 - `~/.birdclaw/config.json`
 
-Project config:
-
-- `./.birdclawrc.json5`
-
 ## Env vars
 
-- `BIRDCLAW_DB`
-- `BIRDCLAW_PROFILE`
-- `BIRDCLAW_TRANSPORT`
-- `BIRDCLAW_LOG`
-- `NO_COLOR`
+- `BIRDCLAW_HOME`
+- `BIRDCLAW_CONFIG`
+- `BIRDCLAW_ACTIONS_TRANSPORT`
+- `BIRDCLAW_BIRD_COMMAND`
+- `BIRDCLAW_BASH_COMMAND`
+- `BIRDCLAW_MCP_TOKEN`
+- `BIRDCLAW_MCP_PUBLIC_URL`
+- `BIRDCLAW_MCP_ACCOUNT`
 
 ## Command tree
 
 ```text
-birdclaw init
+birdclaw init [--demo]
 birdclaw auth status
 birdclaw auth use <transport>
+birdclaw auth prefer <bird|xurl|auto>
 birdclaw import archive [path]
-birdclaw sync all
-birdclaw sync tweets
+birdclaw import tweet <tweet-id-or-url...> --fxtwitter
 birdclaw sync authored
-birdclaw sync dms
+birdclaw dms sync
 birdclaw sync bookmarks
 birdclaw sync likes
 birdclaw sync timeline
@@ -74,6 +67,12 @@ birdclaw sync mentions
 birdclaw sync mention-threads
 birdclaw sync followers
 birdclaw sync following
+birdclaw sync lists
+birdclaw lists list
+birdclaw lists members [name]
+birdclaw import thread <tweet-id-or-url> --fxtwitter
+birdclaw import conversation <tweet-id-or-url> --fxtwitter
+birdclaw import profile <handle> --fxtwitter
 birdclaw search tweets <query>
 birdclaw search dms <query>
 birdclaw discuss <query>
@@ -109,7 +108,10 @@ birdclaw backup export --repo <path>
 birdclaw backup sync --repo <path> --remote <url>
 birdclaw backup import <path>
 birdclaw backup validate <path>
-birdclaw debug transport
+birdclaw jobs sync-account
+birdclaw jobs sync-bookmarks
+birdclaw jobs install-account-launchd
+birdclaw jobs install-bookmarks-launchd
 ```
 
 ## Subcommand semantics
@@ -121,21 +123,69 @@ birdclaw debug transport
 - uses `gpt-5.5`, medium reasoning, and priority service tier by default
 - requires `OPENAI_API_KEY`
 - excludes DMs unless `--include-dms` is passed
-- supports `--refresh`, `--model`, `--max-tweets`, and `--max-links`
+- supports `--refresh`, `--model`, `--language <locale-id>`, `--max-tweets`, and `--max-links`
+- reads the default report language from `BIRDCLAW_DIGEST_LANGUAGE`
+- reads the home-timeline transport default from `BIRDCLAW_DIGEST_LIVE_MODE` (`auto`, `bird`, or `xurl`); unset or invalid values use auto with a configured transport preference, otherwise `xurl`, and `--live-mode` overrides the environment
 
 ### `digest [period]`
 
 - period: `today`, `24h`, `yesterday`, or `week`
 - accepts explicit `--since <iso>` and `--until <iso>` windows
-- caches the final structured result by local context hash, model, reasoning effort, and service tier
+- caches the final structured result by local context hash, model, reasoning effort, service tier, and canonical report language
+- accepts the same language tag through `GET /api/period-digest?language=zh-CN`
+- accepts a home-timeline transport override through `GET /api/period-digest?liveSyncMode=bird`; mentions and mention threads still use xurl, and the Today web page remains local-only
 - `--json` suppresses token streaming and emits the final envelope
 
 ### `init`
 
 - create app dir
-- create DB
+- create an empty DB
 - write default config if absent
-- optionally detect `xurl` and `bird`
+- `--demo` seeds sample tweets, DMs, profiles, and links without authentication or network access
+- print useful next commands for the selected setup path
+
+Account-capable commands accept `--account <username>` or a stored account ID. Set `accounts.default` in `config.json` for a reversible default; an explicit flag wins.
+
+Numeric flags are checked before account selection or command actions. Counts and limits require non-negative safe integers; command-specific positive minimums and caps still apply. Follower and score thresholds allow finite fractional values, and `--cache-ttl` allows non-negative fractional seconds. Blank values, `NaN`, infinity, negative counts, and fractional limits fail with a JSON error on stderr and exit code `1`.
+
+### `show tweet|thread|dm`
+
+Read records already stored in the selected account. An explicit `--account` overrides the configured default; otherwise the stored default account is used. Missing records and records belonging only to another account return a failure.
+
+```bash
+birdclaw show tweet 1891234567890 --json
+birdclaw show thread 1891234567890 --limit 80 --json
+birdclaw show dm <conversation-id> --account <username> --json
+```
+
+`show tweet` returns one tweet object. `show thread` returns `anchorId`, `items`, and `truncated`; its positive `--limit` defaults to 80, and only cached ancestors and replies are available. `show dm` returns `conversation` and the complete stored `messages` in chronological order. These commands follow the existing opt-in backup auto-update behavior described below.
+
+### `db vacuum`
+
+Reclaim unused SQLite space without changing archive contents. This can take time and requires a writable database; concurrent activity may cause a busy error. `--json` returns `{"ok":true,"operation":"vacuum"}` after completion.
+
+### `import tweet <tweet-id-or-url...>`
+
+- disabled unless `--fxtwitter` is passed on the same invocation
+- sends only requested public tweet IDs to the fixed read-only `https://api.fxtwitter.com` service
+- rejects custom origins, redirects, noncanonical URLs, and batches larger than 20 tweets
+- stores `fxtwitter` source markers in `tweet_sources` and `data/tweet_sources.jsonl` backups
+- discloses requested IDs plus ordinary network metadata such as IP address and request time to the third-party service
+
+See [Public tweet import](public-tweets.md) for the full privacy and capability boundary.
+
+### `import thread|conversation <tweet-id-or-url>`
+
+- disabled unless `--fxtwitter` is passed on the same invocation
+- imports only positively observed public tweets through the fixed FxTwitter origin
+- accepts `--limit <n>` up to 1,000 and always reports the collection as `partial` because the endpoint cannot prove exhaustion
+- preserves the upstream reply count and next cursor as evidence, never as completeness proof
+
+### `import profile <handle>`
+
+- disabled unless `--fxtwitter` is passed on the same invocation
+- imports the named public profile object, not its statuses or another timeline
+- rejects URLs, custom origins, private/account data, and write capabilities before network access
 
 ### `auth status`
 
@@ -145,8 +195,14 @@ birdclaw debug transport
 
 ### `auth use <transport>`
 
-- set preferred transport for profile
-- allowed: `auto`, `xurl`, `bird`, `official`, `xweb`
+- set preferred moderation action transport
+- allowed: `auto`, `xurl`, `bird`
+
+### `auth prefer <bird|xurl|auto>`
+
+- persist `transport.preferred` for auto selection across live operations
+- `bird` or `xurl` tries that transport first; `auto` removes the preference
+- explicit command/feature modes and capability/account restrictions still win
 
 ### `backup export`
 
@@ -175,7 +231,12 @@ birdclaw backup sync --repo ~/Projects/backup-birdclaw --remote https://github.c
 Shard contract:
 
 - tweets: `data/tweets/YYYY.jsonl`
+- tweet provenance: `data/tweet_sources.jsonl`
+- FxTwitter fetch/completeness metadata: `data/fxtwitter/fetches.jsonl`
+- FxTwitter positive item observations: `data/fxtwitter/observations.jsonl`
 - unknown tweet dates: `data/tweets/unknown.jsonl`
+- tweet revisions: `data/tweet_revisions.jsonl`
+- subordinate tweet tombstones: `data/tweet_subordinate_tombstones.jsonl`
 - profiles: `data/profiles.jsonl` includes bio, follower/following counts, profile URL, location, verification type, structured URL entities, and raw profile JSON
 - affiliations: `data/profile_affiliations.jsonl` includes X badge/highlighted-label organization edges
 - identity history: `data/profile_snapshots.jsonl` and `data/profile_bio_entities.jsonl` preserve profile-change states and extracted bio identity hints
@@ -201,8 +262,8 @@ Read commands pull + merge only when the last backup check is stale. Data-changi
 
 ### local `bird` command
 
-Live local likes, bookmarks, DMs, and moderation verification use `bird` on PATH
-by default. Override it with `BIRDCLAW_BIRD_COMMAND` or:
+Bird is an optional legacy transport. Explicit Bird modes and optional fallbacks
+look for `bird` on PATH. Override its location with `BIRDCLAW_BIRD_COMMAND` or:
 
 ```json
 {
@@ -212,11 +273,15 @@ by default. Override it with `BIRDCLAW_BIRD_COMMAND` or:
 }
 ```
 
+On Windows, Birdclaw runs the redirect wrapper through Git Bash. Common Git for
+Windows installations are detected automatically; set `BIRDCLAW_BASH_COMMAND`
+to the full path of `bash.exe` for a portable or non-standard installation.
+
 ### `backup import`
 
 - validates the backup first unless `--no-validate` is passed
 - merge-imports by default so local-only rows are not deleted
-- `--replace` restores exactly from backup and deletes local portable rows first
+- `--restore` restores exactly from backup and deletes local portable rows first (`--replace` remains a deprecated alias)
 - rebuilds tweet and DM FTS from the JSONL text
 
 ```bash
@@ -237,7 +302,9 @@ birdclaw backup validate ~/Projects/birdclaw-store --json
 
 - validate archive
 - analyze contents
-- import selected slices
+- merge selected slices without deleting destination-only rows
+- retain explicit deleted-tweet records as source-attributed tombstones; absence alone is never a deletion
+- use `--restore` for deliberate exact replacement of the imported slices
 - stream bundled media files from `data/tweets_media/`, `data/direct_messages_media/`, `data/community_tweet_media/`, `data/deleted_tweets_media/`, `data/profile_media/`, `data/moments_tweets_media/`, and `data/direct_messages_group_media/` into `~/.birdclaw/media/originals/archive/<kind>/<id>/<filename>`
 - extract `extended_entities.media[].video_info.variants[]` onto each tweet media row for archive video and animated GIFs
 - parse `data/follower.js` and `data/following.js` into the local follow graph
@@ -254,7 +321,7 @@ Flags:
 - valid aliases for `directMessages`: `directmessages`, `direct-messages`, `dms`
 - duplicate names are ignored
 - empty values and unknown names exit as invalid usage
-- selected imports validate that existing `acct_primary` matches the archive account before writing
+- merge imports and selected restores validate that existing `acct_primary` matches the archive account before writing; only a full `--restore` may replace it
 - selected imports preserve compatible existing profile rows unless `profiles` is selected
 
 Examples:
@@ -274,12 +341,13 @@ birdclaw import archive ~/Downloads/twitter-archive.zip --select followers,follo
 - update canonical tables
 - refresh cursors
 - refresh FTS incrementally
-- `sync likes` and `sync bookmarks` use cached live transport; `auto` tries `xurl`, then `bird`; `--early-stop` caps at 10 pages unless paired with `--all` or `--max-pages`
-- `sync authored` uses `xurl`, includes retweets, and resumes from a stored `since_id`
-- `sync timeline` stores the live home timeline through `bird`; it defaults to the chronological Following feed
-- `sync mentions` ingests recent mentions through `xurl` (default) or `bird` and writes `kind='mention'` rows into the canonical store; this is the cron-friendly ingest path that replaces relying on `mentions export --refresh`
-- `sync mention-threads` fetches conversation context for recent mentions through `bird thread` or `xurl`; pass `--mode xurl` when the `bird` CLI is unavailable, otherwise use `--delay-ms` and `--timeout-ms` to stay gentle on live X
-- `sync followers` and `sync following` default to dry-run and require `--yes` for live sync or fresh-cache merge; `auto` prefers `bird`, then falls back to `xurl`
+- `sync likes` and `sync bookmarks` use cached live transport; `auto` honors `transport.preferred` (xurl first when unset); `--early-stop` caps at 10 pages unless paired with `--all` or `--max-pages`
+- `sync authored` supports `auto`, `bird`, and `xurl`, includes retweets, and resumes from a stored `since_id`
+- `sync timeline` stores the live home timeline through `auto` (configured preference first, xurl first when unset); it defaults to the chronological Following feed
+- `sync mentions` ingests recent mentions through `auto`, `xurl`, or `bird` and writes `kind='mention'` rows into the canonical store; this is the cron-friendly ingest path that replaces relying on `mentions export --refresh`
+- `sync mention-threads` fetches conversation context through auto (configured preference first, xurl first when unset); explicit modes remain available, and `--delay-ms`/`--timeout-ms` bound live work
+- `sync followers` and `sync following` default to dry-run and require `--yes` for live sync or fresh-cache merge; `auto` honors `transport.preferred` (Bird first when unset), with fallback
+- `sync lists` is an explicit read-only walk; it defaults to 20 members, one page, and 1,000 ms pacing per List, and stores `complete|inferred|partial|error` membership state
 
 Common flags:
 
@@ -290,6 +358,7 @@ Common flags:
 - `--mode auto|xurl|bird`
 - `--all`
 - `--max-pages <n>`
+- `--pagination-token <token>` (on `sync likes` and `sync bookmarks` in `xurl` mode)
 - `--early-stop` (on `sync likes` and `sync bookmarks`)
 - `--refresh`
 - `--cache-ttl <seconds>`
@@ -300,6 +369,7 @@ Examples:
 birdclaw sync authored --mode xurl --limit 100 --json
 birdclaw sync likes --mode auto --limit 100 --refresh --json
 birdclaw sync likes --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
+birdclaw sync likes --mode xurl --limit 100 --max-pages 70 --pagination-token "$NEXT_TOKEN" --refresh --json
 birdclaw sync bookmarks --mode auto --limit 100 --refresh --json
 birdclaw sync bookmarks --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
 birdclaw sync bookmarks --mode bird --all --max-pages 5 --limit 100 --refresh --json
@@ -307,6 +377,7 @@ birdclaw sync timeline --limit 100 --refresh --json
 birdclaw sync mentions --mode xurl --limit 100 --max-pages 3 --refresh --json
 birdclaw sync mention-threads --mode bird --limit 30 --delay-ms 1500 --timeout-ms 15000 --json
 birdclaw sync mention-threads --mode xurl --limit 30 --json
+birdclaw sync lists --mode auto --max-lists 20 --member-limit 20 --max-member-pages 1 --delay-ms 1000 --json
 ```
 
 Follow graph examples:
@@ -345,9 +416,11 @@ tail -n 20 ~/.birdclaw/audit/account-sync.jsonl | jq .
 
 - writes `~/Library/LaunchAgents/com.steipete.birdclaw.account-sync.plist`
 - runs `jobs sync-account` every 30 minutes by default
+- `--interval-seconds <seconds>` requires a positive safe integer; invalid values exit nonzero before writing a plist
 - uses `launchctl load -w` unless `--no-load` is passed
 - `--steps <steps>` narrows the scheduled surfaces
 - `--env-path <path>` sources account-specific `bird` cookies for launchd
+- `--runtime <absolute-path>` plus repeatable `--runtime-arg <value>` pins a source launcher to an exact runtime; Bun jobs use `--runtime-arg=--no-env-file`
 - `--allow-bird-account` asserts those cookies match `--account` for Bird-backed timeline, mentions, and DM steps
 
 ```bash
@@ -379,9 +452,11 @@ tail -n 20 ~/.birdclaw/audit/bookmarks-sync.jsonl | jq .
 
 - writes `~/Library/LaunchAgents/com.steipete.birdclaw.bookmarks-sync.plist`
 - runs `jobs sync-bookmarks` every 3 hours by default
+- `--interval-seconds <seconds>` requires a positive safe integer; invalid values exit nonzero before writing a plist
 - uses `launchctl load -w` unless `--no-load` is passed
 - writes launchd stdout/stderr to `~/.birdclaw/logs/bookmarks-sync.*.log`
 - `--env-path <path>` sources an export-only shell env file inside the scheduled process, useful when `bird` needs `AUTH_TOKEN`/`CT0` outside an interactive browser session
+- `--runtime <absolute-path>` plus repeatable `--runtime-arg <value>` pins a source launcher to an exact runtime instead of relying on launchd `PATH`
 
 ```bash
 birdclaw --json jobs install-bookmarks-launchd --program /opt/homebrew/bin/birdclaw
@@ -391,20 +466,32 @@ birdclaw --json jobs install-bookmarks-launchd --program /opt/homebrew/bin/birdc
 
 Flags:
 
-- `--author <handle-or-id>`
+- `--resource home|mentions|authored|search` (default `home`; `search` reads retained live keyword matches)
+- `--author <handle>`
+- `--account <accountId>`
+- `--list <name>`
+- `--list-id <id>`
 - `--since <date>`
 - `--until <date>`
 - `--originals-only`
 - `--hide-low-quality`
 - `--liked`
 - `--bookmarked`
+- `--fxtwitter` (explicit public-service opt-in)
+- `--max-pages <n>` (FxTwitter only, maximum 10)
+- `--feed latest|top|media` (FxTwitter only)
 - `--limit <n>`
+
+The query accepts `from:<handle>` as an alias for `--author <handle>`.
 
 Examples:
 
 ```bash
 birdclaw search tweets --liked --limit 20 --json
 birdclaw search tweets --bookmarked --limit 20 --json
+birdclaw search tweets "local-first" --author sam --limit 20 --json
+birdclaw search tweets "sqlite" --list Builders --limit 50 --json
+birdclaw search tweets "local-first" --fxtwitter --limit 50 --max-pages 3 --json
 ```
 
 ### `search dms <query>`
@@ -440,6 +527,16 @@ Fetch live keyword matches through `bird` or `xurl`, store them as local
 `search` tweets, then stream an OpenAI Markdown summary and discussion. DMs stay
 out unless explicitly requested.
 
+Xurl search stores each successful page before requesting the next. If a later
+request fails, earlier pages remain locally searchable, but the command still
+fails without caching a complete search or producing a partial AI summary.
+The error reports how many pages and unique tweets were saved in this run,
+followed by the transport error (for example, exhausted X API credits).
+These counts describe local retention, not billable resources or newly inserted
+tweets. Search the retained data with `search tweets <query> --resource search`; rerunning a live discussion
+starts a new sweep and may bill for the same results again.
+Use `--limit` and `--max-pages` to bound paid API reads; neither is a dollar budget.
+
 Flags:
 
 - `--account <account-id>`
@@ -468,7 +565,9 @@ birdclaw discuss "prototype" --include-dms --limit 500 --max-pages 5 --json
 Find likely people or orgs from local DM and optional tweet evidence.
 Candidates include structured `profileEvidence` entries for profile bio, profile
 URL, bio URLs, location, verified type, first-class affiliations, bio entities,
-profile-history snapshots, DM context, and expanded URLs. `whois` also searches
+profile-history snapshots, DM context, and expanded URLs. Recent profile-history
+reads select only the requested rows per profile; the complete stored history
+remains available to archive exports. `whois` also searches
 significant terms from fuzzy prompts, so `blacksmith guy` can rank a match from
 `@useblacksmith` and `blacksmith.sh` even when the literal phrase was not stored
 in a DM. Query intent changes ranking: `@github` emphasizes handle and
@@ -592,6 +691,7 @@ birdclaw media fetch --no-include-video --parallel 3 --pacing-ms 250 --json
 
 Flags:
 
+- `--account <username>` — account username or stored ID
 - `--limit <n>`
 
 Examples:
@@ -609,7 +709,7 @@ birdclaw profiles replies @jpctan --limit 12 --json
 Flags:
 
 - `--refresh`
-- `--mode bird|xurl|auto`
+- `--mode web|bird|xurl|auto`
 - `--cache-ttl <seconds>`
 - `--participant <handle-or-id>`
 - `--min-followers <n>`
@@ -631,12 +731,12 @@ Flags:
 Flags:
 
 - `--account <account-id>`
-- `--mode bird|xurl|auto`
+- `--mode web|bird|xurl|auto`
 - `--limit <n>`
 - `--refresh`
 - `--cache-ttl <seconds>`
 
-`--mode bird` is the default and the only mode that can sync message requests. `--mode xurl` reads recent OAuth2 `/2/dm_events` as accepted conversations; `--mode auto` tries xurl first for accepted DMs and falls back to bird.
+`--mode auto` is the default. Native `--mode web` uses `AUTH_TOKEN` and `CT0` to read accepted DMs and message requests without a bird executable or browser. Auto selects native web for request/full-default-account inboxes when cookies are available; other reads use xurl with available fallback. `--mode xurl` reads recent OAuth2 `/2/dm_events`, which does not expose request state. `dms accept`, `dms reject`, and `dms block` default to native web; explicit `--mode bird` remains supported.
 
 ### `inbox`
 
@@ -739,23 +839,37 @@ Flags:
 ### `serve`
 
 - starts local app server
-- starts background sync automatically by default
-- stdout prints URL in plain mode
+- starts the built production SSR and static-asset server
+- stdout prints the listening URL
+- `--json` prints one startup object with `ok`, `host`, the actual bound `port`, and `url`; `--port 0` selects an available port
 
 Flags:
 
 - `--host <host>`
 - `--port <port>`
-- `--open`
-- `--no-open`
-- `--sync`
-- `--no-sync`
 
-`birdclaw serve` binds the dev server to `127.0.0.1` and enables local
-loopback web APIs without a token. Remote access through a trusted private proxy
-requires `BIRDCLAW_ALLOW_REMOTE_WEB=1`. To require an app-level token too, set
-`BIRDCLAW_WEB_TOKEN` and send it as `x-birdclaw-token` or a `birdclaw_token`
-cookie.
+`birdclaw serve` binds the production server to `127.0.0.1:3000` by default and
+enables local loopback web APIs without a token. `BIRDCLAW_HOST` and
+`BIRDCLAW_PORT` provide environment defaults. Remote access through a trusted
+private proxy requires `BIRDCLAW_ALLOW_REMOTE_WEB=1`. To require an app-level
+token too, set `BIRDCLAW_WEB_TOKEN` and send it as `x-birdclaw-token` or a
+`birdclaw_token` cookie.
+
+The same process can expose an adapter-owned, read-only Streamable HTTP MCP
+endpoint at the exact path `/mcp`. Configure both `BIRDCLAW_MCP_TOKEN` and
+`BIRDCLAW_MCP_PUBLIC_URL`; the MCP token must be at least 32 bytes and must
+differ from `BIRDCLAW_WEB_TOKEN`. `BIRDCLAW_MCP_ACCOUNT` optionally selects one
+server-side account by id or handle; otherwise tools read the default account.
+
+When MCP is configured, startup validates the configuration, selected account,
+and an existing initialized database at the current schema. It does not create
+or migrate the database for MCP. Run `birdclaw init` or import/migrate with a
+trusted CLI command before starting the server.
+
+HTTP MCP URLs are accepted only for loopback hosts. External MCP URLs must use
+HTTPS on a dedicated hostname. Birdclaw reserves that configured hostname for
+MCP and denies every path except `/mcp`; the proxy and outer authentication
+policy must enforce the same rule. See the [MCP server guide](mcp.md).
 
 ### `graph summary`
 
@@ -815,13 +929,15 @@ stderr:
 
 - default human output
 - `--json` stable machine-readable envelopes
-- `--plain` stable line-oriented text, no color
+- parser and uncaught runtime failures with `--json` emit `{"error":"message"}` on stderr and leave stdout empty; command-specific failure results retain their existing JSON shapes
+
+Successful output shapes are command-specific (objects or arrays). Progress and warnings stay on stderr. `--plain` is not currently implemented; use `--json` for scripting.
 
 ## Exit codes
 
 - `0` success
 - `1` runtime failure
-- `2` invalid usage / validation
+- `2` parser usage errors (unknown command/option, missing arguments/options) and invalid port range; older command-specific validation paths use `1`
 - `3` auth unavailable
 - `4` transport unavailable
 - `5` partial sync failure
@@ -830,15 +946,16 @@ stderr:
 
 ```bash
 birdclaw init
+birdclaw init --demo
 birdclaw auth status
 birdclaw import archive ~/Downloads/twitter-archive.zip --select tweets,directMessages
-birdclaw sync all --transport xurl
+birdclaw jobs sync-account --mode xurl
 birdclaw search tweets "openai" --since 2024-01-01 --limit 20
 birdclaw search tweets --since 2020-01-01 --until 2021-01-01 --originals-only --hide-low-quality --limit 500
 birdclaw search dms "invoice" --participant @someone --min-followers 1000
 birdclaw dms list --unreplied --min-followers 500 --min-influence-score 90 --sort followers
 birdclaw inbox --json
-birdclaw serve --sync
+birdclaw serve
 birdclaw graph events --json
 birdclaw compose reply 1891234567890
 ```

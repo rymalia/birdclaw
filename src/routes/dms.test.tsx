@@ -1,12 +1,13 @@
 import {
+	act,
 	cleanup,
 	fireEvent,
-	render,
 	screen,
 	waitFor,
 } from "@testing-library/react";
-import type { ComponentType } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderWithQueryClient as render } from "#/test/render";
+import { queryKeys } from "#/lib/query-client";
 
 vi.mock("#/components/DmWorkspace", () => ({
 	DmWorkspace: ({
@@ -17,6 +18,10 @@ vi.mock("#/components/DmWorkspace", () => ({
 		onReplyDraftChange,
 		onReplySend,
 		onSelectConversation,
+		hasEarlier,
+		loadingEarlier,
+		onLoadEarlier,
+		earlierError,
 	}: {
 		selectedConversation: { id: string; title: string } | null;
 		selectedMessages: Array<{ id: string; text: string }>;
@@ -25,8 +30,18 @@ vi.mock("#/components/DmWorkspace", () => ({
 		onReplyDraftChange: (value: string) => void;
 		onReplySend: (id: string) => void;
 		onSelectConversation: (id: string) => void;
+		hasEarlier?: boolean;
+		loadingEarlier?: boolean;
+		onLoadEarlier?: () => void;
+		earlierError?: string;
 	}) => (
 		<div>
+			{hasEarlier ? (
+				<button type="button" disabled={loadingEarlier} onClick={onLoadEarlier}>
+					Load earlier messages
+				</button>
+			) : null}
+			{earlierError ? <p role="alert">{earlierError}</p> : null}
 			{conversations.map((conversation) => (
 				<button
 					key={conversation.id}
@@ -56,9 +71,7 @@ vi.mock("#/components/DmWorkspace", () => ({
 	),
 }));
 
-import { Route } from "./dms";
-
-const DmsRoute = Route.options.component as ComponentType;
+import { DmsRouteView as DmsRoute } from "./dms";
 
 describe("dms route", () => {
 	beforeEach(() => {
@@ -155,6 +168,158 @@ describe("dms route", () => {
 		});
 	});
 
+	it("caches threads separately from list sorting and conversation selection", async () => {
+		const conversations = [
+			{
+				id: "dm_a",
+				title: "Demo A",
+				accountId: "acct_demo",
+				accountHandle: "@demo",
+			},
+			{
+				id: "dm_b",
+				title: "Demo B",
+				accountId: "acct_demo",
+				accountHandle: "@demo",
+			},
+		];
+		const queries: string[] = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = new URL(String(input), window.location.origin);
+				if (url.pathname === "/api/status")
+					return Response.json({
+						stats: { home: 0, mentions: 0, dms: 2, needsReply: 0, inbox: 0 },
+						transport: { statusText: "local" },
+						accounts: [],
+						archives: [],
+					});
+				queries.push(
+					url.searchParams.get("view") === "list"
+						? "list"
+						: url.searchParams.get("view") === "conversation"
+							? url.searchParams.get("conversationId")!
+							: "combined",
+				);
+				if (url.searchParams.get("view") === "list")
+					return Response.json({ resource: "dms", items: conversations });
+				const conversation =
+					conversations.find(
+						(item) => item.id === url.searchParams.get("conversationId"),
+					) ?? conversations[0]!;
+				return Response.json({
+					resource: "dms",
+					items: conversations,
+					selectedConversation: {
+						conversation,
+						messages: [
+							{
+								id: `message_${conversation.id}`,
+								text: `Message for ${conversation.title}`,
+							},
+						],
+					},
+				});
+			}),
+		);
+		render(<DmsRoute />);
+		expect(await screen.findByText("Message for Demo A")).toBeInTheDocument();
+		expect(queries).toEqual(["combined"]);
+		fireEvent.click(screen.getByRole("button", { name: "Demo B" }));
+		expect(await screen.findByText("Message for Demo B")).toBeInTheDocument();
+		expect(queries).toEqual(["combined", "dm_b"]);
+		fireEvent.click(screen.getByRole("button", { name: "Demo A" }));
+		expect(await screen.findByText("Message for Demo A")).toBeInTheDocument();
+		expect(queries).toEqual(["combined", "dm_b"]);
+		fireEvent.click(screen.getByRole("button", { name: "Followers" }));
+		await waitFor(() => expect(queries).toEqual(["combined", "dm_b", "list"]));
+		expect(screen.getByText("Message for Demo A")).toBeInTheDocument();
+	});
+
+	it("loads earlier message pages, retains them across list filters, and retries page errors without hiding history", async () => {
+		const conversation = {
+			id: "dm_page",
+			title: "Demo thread",
+			accountId: "acct_demo",
+			accountHandle: "@demo",
+		};
+		let listCalls = 0,
+			olderCalls = 0;
+		const cursors: Array<string | null> = [];
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = new URL(String(input), window.location.origin);
+				if (url.pathname === "/api/status")
+					return Response.json({
+						stats: { home: 0, mentions: 0, dms: 1, needsReply: 0, inbox: 0 },
+						transport: { statusText: "local" },
+						accounts: [],
+						archives: [],
+					});
+				if (url.searchParams.get("view") === "list") {
+					listCalls++;
+					return Response.json({ resource: "dms", items: [conversation] });
+				}
+				expect(url.searchParams.get("messageLimit")).toBe("100");
+				if (url.searchParams.has("before")) {
+					cursors.push(url.searchParams.get("before"));
+					olderCalls++;
+					if (olderCalls === 1)
+						return Response.json(
+							{ error: "Page unavailable" },
+							{ status: 503 },
+						);
+					return Response.json({
+						resource: "dms",
+						items: [],
+						selectedConversation: {
+							conversation,
+							messages: [{ id: "old", text: "older message" }],
+							nextCursor: null,
+						},
+					});
+				}
+				return Response.json({
+					resource: "dms",
+					items: [conversation],
+					selectedConversation: {
+						conversation,
+						messages: [{ id: "new", text: "newer message" }],
+						nextCursor: "older-cursor",
+					},
+				});
+			}),
+		);
+		render(<DmsRoute />);
+		expect(await screen.findByText("newer message")).toBeInTheDocument();
+		fireEvent.click(
+			screen.getByRole("button", { name: "Load earlier messages" }),
+		);
+		expect(await screen.findByRole("alert")).toHaveTextContent(
+			"Could not load earlier messages",
+		);
+		expect(screen.getByText("newer message")).toBeInTheDocument();
+		fireEvent.click(
+			screen.getByRole("button", { name: "Load earlier messages" }),
+		);
+		expect(await screen.findByText("older message")).toBeInTheDocument();
+		expect(
+			screen
+				.getAllByText(/^(older|newer) message$/)
+				.map((node) => node.textContent),
+		).toEqual(["older message", "newer message"]);
+		expect(
+			screen.queryByRole("button", { name: "Load earlier messages" }),
+		).not.toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Followers" }));
+		await waitFor(() => expect(listCalls).toBe(1));
+		expect(olderCalls).toBe(2);
+		expect(cursors).toEqual(["older-cursor", "older-cursor"]);
+		expect(screen.getByText("older message")).toBeInTheDocument();
+	});
+
 	it("lets the dm list switch from newest to follower count sorting", async () => {
 		const queryUrls: URL[] = [];
 		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
@@ -170,7 +335,8 @@ describe("dms route", () => {
 				);
 			}
 			if (url.includes("/api/query")) {
-				queryUrls.push(new URL(url));
+				if (new URL(url).searchParams.get("view") !== "conversation")
+					queryUrls.push(new URL(url));
 				return new Response(
 					JSON.stringify({
 						resource: "dms",
@@ -210,12 +376,16 @@ describe("dms route", () => {
 		await waitFor(() => {
 			expect(queryUrls.at(-1)?.searchParams.get("sort")).toBe("followers");
 		});
+		const callsBeforeCachedReturn = queryUrls.length;
 
 		fireEvent.click(screen.getByRole("button", { name: "Newest" }));
 
 		await waitFor(() => {
-			expect(queryUrls.at(-1)?.searchParams.get("sort")).toBe("recent");
+			expect(
+				screen.getByRole("button", { name: "Newest" }).className,
+			).toContain("bg-[var(--bg-active)]");
 		});
+		expect(queryUrls).toHaveLength(callsBeforeCachedReturn);
 	});
 
 	it("restores dm draft and shows transport errors", async () => {
@@ -316,8 +486,12 @@ describe("dms route", () => {
 				);
 			}
 			if (url.includes("/api/query")) {
-				queryCalls += 1;
-				if (queryCalls === 2) {
+				if (new URL(url).searchParams.get("view") !== "conversation")
+					queryCalls += 1;
+				if (
+					queryCalls === 2 &&
+					new URL(url).searchParams.get("view") !== "conversation"
+				) {
 					await new Promise<void>((resolve) => {
 						releaseRefresh = resolve;
 					});
@@ -328,9 +502,12 @@ describe("dms route", () => {
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
-		render(<DmsRoute />);
+		const { queryClient } = render(<DmsRoute />);
 
 		expect(await screen.findByText("Sam Altman")).toBeInTheDocument();
+		await act(async () => {
+			void queryClient.invalidateQueries({ queryKey: queryKeys.dms });
+		});
 		await waitFor(() => {
 			expect(queryCalls).toBeGreaterThan(1);
 		});
@@ -412,6 +589,65 @@ describe("dms route", () => {
 		expect(await screen.findByText("New thread message")).toBeInTheDocument();
 	});
 
+	it("shows a retryable error when switching conversations fails", async () => {
+		const conversations = [
+			{
+				id: "dm_1",
+				title: "Sam Altman",
+				accountId: "acct_primary",
+				accountHandle: "@steipete",
+			},
+			{
+				id: "dm_2",
+				title: "Ada Lovelace",
+				accountId: "acct_primary",
+				accountHandle: "@steipete",
+			},
+		];
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/status")) {
+				return Response.json({
+					stats: { home: 3, mentions: 1, dms: 4, needsReply: 2, inbox: 3 },
+					transport: { statusText: "local" },
+					accounts: [],
+					archives: [],
+				});
+			}
+			if (url.includes("/api/query")) {
+				const conversationId = new URL(url).searchParams.get("conversationId");
+				if (conversationId === "dm_2") {
+					return Response.json(
+						{ message: "Conversation unavailable" },
+						{ status: 500 },
+					);
+				}
+				return Response.json({
+					resource: "dms",
+					items: conversations,
+					selectedConversation: {
+						conversation: conversations[0],
+						messages: [{ id: "message_dm_1", text: "Old thread message" }],
+					},
+				});
+			}
+			throw new Error(`Unexpected fetch ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		render(<DmsRoute />);
+
+		expect(await screen.findByText("Old thread message")).toBeInTheDocument();
+		fireEvent.click(screen.getByRole("button", { name: "Ada Lovelace" }));
+
+		expect(
+			await screen.findByText("Could not load messages"),
+		).toBeInTheDocument();
+		expect(screen.getByText("Conversation unavailable")).toBeInTheDocument();
+		expect(screen.queryByText("Old thread message")).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+	});
+
 	it("runs a live dm sync and reloads conversations", async () => {
 		const queryUrls: URL[] = [];
 		const syncBodies: unknown[] = [];
@@ -429,7 +665,8 @@ describe("dms route", () => {
 					);
 				}
 				if (url.includes("/api/query")) {
-					queryUrls.push(new URL(url));
+					if (new URL(url).searchParams.get("view") !== "conversation")
+						queryUrls.push(new URL(url));
 					return new Response(
 						JSON.stringify({
 							resource: "dms",
@@ -480,13 +717,25 @@ describe("dms route", () => {
 		render(<DmsRoute />);
 
 		expect(await screen.findByText("Sam Altman")).toBeInTheDocument();
+		expect(queryUrls).toHaveLength(1);
+		const initialQueryCount = queryUrls.length;
 		fireEvent.click(screen.getByRole("button", { name: "Sync DMs" }));
 
 		await waitFor(() => {
 			expect(syncBodies).toEqual([
 				{ kind: "dms", inbox: "all", limit: 50, maxPages: 1 },
 			]);
-			expect(queryUrls.at(-1)?.searchParams.get("refresh")).toBe("1");
+			expect(queryUrls.length).toBeGreaterThan(initialQueryCount);
+			expect(queryUrls.at(-1)?.searchParams.get("view")).toBe("list");
+			expect(
+				fetchMock.mock.calls.some(([input]) => {
+					const url = new URL(String(input), window.location.origin);
+					return (
+						url.searchParams.get("view") === "conversation" &&
+						url.searchParams.get("conversationId") === "dm_1"
+					);
+				}),
+			).toBe(true);
 		});
 	});
 
@@ -507,7 +756,8 @@ describe("dms route", () => {
 					);
 				}
 				if (url.includes("/api/query")) {
-					queryUrls.push(new URL(url));
+					if (new URL(url).searchParams.get("view") !== "conversation")
+						queryUrls.push(new URL(url));
 					return new Response(
 						JSON.stringify({
 							resource: "dms",

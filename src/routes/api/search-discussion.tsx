@@ -1,12 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Effect } from "effect";
-import { maybeAutoUpdateBackupEffect } from "#/lib/backup";
-import { runEffectBackground } from "#/lib/effect-runtime";
+import { defaultLiveSyncMode } from "#/lib/config";
+import { searchDiscussionStreamEventSchema } from "#/lib/client-stream-contracts";
+import { requestBackupAutoUpdate } from "#/lib/backup";
 import {
 	parseBoundedInteger,
 	runRouteEffect,
 	sensitiveRequestErrorResponse,
 } from "#/lib/http-effect";
+import { createEffectNdjsonResponse } from "#/lib/ndjson-stream";
 import {
 	streamSearchDiscussionEffect,
 	type SearchDiscussionOptions,
@@ -15,7 +17,8 @@ import {
 } from "#/lib/search-discussion";
 import type { TweetSearchMode } from "#/lib/tweet-search-live";
 
-const encoder = new TextEncoder();
+const MAX_DISCUSSION_SEARCH_LIMIT = 20_000;
+const MAX_DISCUSSION_SEARCH_PAGES = 200;
 
 function parseBoolean(value: string | null) {
 	return value === "true" || value === "1" || value === "yes";
@@ -45,7 +48,7 @@ function parseMode(value: string | null): TweetSearchMode {
 	) {
 		return value;
 	}
-	return "auto";
+	return defaultLiveSyncMode("xurl");
 }
 
 function parseOptions(url: URL): SearchDiscussionOptions {
@@ -63,16 +66,12 @@ function parseOptions(url: URL): SearchDiscussionOptions {
 		refresh: parseBoolean(url.searchParams.get("refresh")),
 		model: url.searchParams.get("model") === "gpt-5.5" ? "gpt-5.5" : undefined,
 		limit: parseBoundedInteger(url.searchParams.get("limit"), {
-			max: 5_000,
+			max: MAX_DISCUSSION_SEARCH_LIMIT,
 		}),
 		maxPages: parseBoundedInteger(url.searchParams.get("maxPages"), {
-			max: 100,
+			max: MAX_DISCUSSION_SEARCH_PAGES,
 		}),
 	};
-}
-
-function encodeEvent(event: SearchDiscussionStreamEvent) {
-	return encoder.encode(`${JSON.stringify(event)}\n`);
 }
 
 export const Route = createFileRoute("/api/search-discussion")({
@@ -80,80 +79,33 @@ export const Route = createFileRoute("/api/search-discussion")({
 		handlers: {
 			GET: ({ request }) =>
 				runRouteEffect(
-					Effect.gen(function* () {
+					Effect.sync(() => {
 						const denied = sensitiveRequestErrorResponse(request);
 						if (denied) return denied;
 
-						yield* maybeAutoUpdateBackupEffect();
+						requestBackupAutoUpdate();
 						const url = new URL(request.url);
 						const options = parseOptions(url);
-						let abortDiscussion: (() => void) | undefined;
-
-						return new Response(
-							new ReadableStream({
-								cancel() {
-									abortDiscussion?.();
-								},
-								start(controller) {
-									const abortController = new AbortController();
-									let closed = false;
-									const close = () => {
-										closed = true;
-										abortController.abort();
-									};
-									const closeController = () => {
-										request.signal.removeEventListener("abort", onAbort);
-										if (!closed) {
-											closed = true;
-											controller.close();
-										}
-									};
-									const onAbort = () => close();
-									request.signal.addEventListener("abort", onAbort, {
-										once: true,
-									});
-									abortDiscussion = close;
-									const enqueue = (event: SearchDiscussionStreamEvent) => {
-										if (closed) return;
-										try {
-											controller.enqueue(encodeEvent(event));
-										} catch {
-											close();
-										}
-									};
-
-									runEffectBackground(
-										streamSearchDiscussionEffect(
+						return createEffectNdjsonResponse<SearchDiscussionStreamEvent>({
+							request,
+							schema: searchDiscussionStreamEventSchema,
+							run: ({ signal, emit }) =>
+								signal.aborted
+									? Effect.succeed(undefined)
+									: streamSearchDiscussionEffect(
 											{
 												...options,
-												signal: abortController.signal,
+												signal,
 												prefetchAvatars: true,
 											},
-											{ onEvent: enqueue },
+											{ onEvent: emit },
 										),
-										{
-											onSuccess: closeController,
-											onFailure: (error) => {
-												enqueue({
-													type: "error",
-													error:
-														error instanceof Error
-															? error.message
-															: "Discussion failed",
-												});
-												closeController();
-											},
-										},
-									);
-								},
+							errorEvent: (error) => ({
+								type: "error",
+								error:
+									error instanceof Error ? error.message : "Discussion failed",
 							}),
-							{
-								headers: {
-									"cache-control": "no-store",
-									"content-type": "application/x-ndjson; charset=utf-8",
-								},
-							},
-						);
+						});
 					}),
 				),
 		},

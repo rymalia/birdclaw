@@ -7,6 +7,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const execFileAsyncMock = vi.fn();
 
+async function runBirdEffect<A, E>(
+	build: (bird: typeof import("./bird")) => Effect.Effect<A, E>,
+) {
+	return Effect.runPromise(build(await import("./bird")));
+}
+
 vi.mock("node:child_process", () => ({
 	execFile: Object.assign(vi.fn(), {
 		[Symbol.for("nodejs.util.promisify.custom")]: execFileAsyncMock,
@@ -39,7 +45,7 @@ function mockBirdRejectWithStdoutOnce(
 function expectBirdCommandCall(callNumber: number, args: string[]) {
 	const call = execFileAsyncMock.mock.calls[callNumber - 1];
 	expect(call).toBeDefined();
-	expect(call[0]).toBe("/bin/bash");
+	expect(String(call[0])).toMatch(/(?:^\/bin\/bash$|bash\.exe$)/);
 	expect((call[1] as string[])[0]).toBe("-c");
 	expect((call[1] as string[]).slice(4)).toEqual(["/tmp/bird", ...args]);
 	expect(call[2]).toEqual(
@@ -47,7 +53,7 @@ function expectBirdCommandCall(callNumber: number, args: string[]) {
 	);
 }
 
-describe("bird transport wrapper", () => {
+describe("bird transport", () => {
 	afterEach(() => {
 		vi.resetModules();
 		execFileAsyncMock.mockReset();
@@ -74,6 +80,118 @@ describe("bird transport wrapper", () => {
 		rmSync(tempDir, { recursive: true, force: true });
 	});
 
+	it("passes authored search bounds and preserves the Bird continuation cursor", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdStdoutOnce(JSON.stringify({ tweets: [], nextCursor: "bird-next" }));
+		const result = await runBirdEffect((bird) =>
+			bird.listAuthoredTweetsViaBirdEffect({
+				username: "steipete",
+				maxResults: 100,
+				sinceId: "123",
+				untilId: "456",
+				paginationToken: "bird-prev",
+			}),
+		);
+		expect(result.meta?.next_token).toBe("bird-next");
+		expectBirdCommandCall(1, [
+			"search",
+			"from:steipete include:nativeretweets since_id:123 max_id:455",
+			"-n",
+			"100",
+			"--all",
+			"--max-pages",
+			"1",
+			"--cursor",
+			"bird-prev",
+			"--json-full",
+		]);
+	});
+
+	it("uses /bin/bash for the bird stdout redirect wrapper on POSIX systems", async () => {
+		const { __test__ } = await import("./bird");
+
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"linux",
+				{} as NodeJS.ProcessEnv,
+				() => false,
+			),
+		).toBe("/bin/bash");
+	});
+
+	it("uses Git Bash for the bird stdout redirect wrapper on Windows", async () => {
+		const { __test__ } = await import("./bird");
+
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{} as NodeJS.ProcessEnv,
+				(candidate) => candidate === "C:\\Program Files\\Git\\bin\\bash.exe",
+			),
+		).toBe("C:\\Program Files\\Git\\bin\\bash.exe");
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ BIRDCLAW_BASH_COMMAND: "D:\\Git\\bin\\bash.exe" },
+				() => false,
+			),
+		).toBe("D:\\Git\\bin\\bash.exe");
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ Path: "D:\\PortableGit\\bin;." },
+				(candidate) =>
+					candidate === "D:\\PortableGit\\bin\\bash.exe" ||
+					candidate === "D:\\PortableGit\\cmd\\git.exe",
+			),
+		).toBe("D:\\PortableGit\\bin\\bash.exe");
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ LOCALAPPDATA: "D:\\Users\\Sam\\AppData\\Local" },
+				(candidate) =>
+					candidate ===
+					"D:\\Users\\Sam\\AppData\\Local\\Programs\\Git\\bin\\bash.exe",
+			),
+		).toBe("D:\\Users\\Sam\\AppData\\Local\\Programs\\Git\\bin\\bash.exe");
+		expect(
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ Path: "D:\\PortableGit\\cmd" },
+				(candidate) =>
+					candidate === "D:\\PortableGit\\bin\\bash.exe" ||
+					candidate === "D:\\PortableGit\\cmd\\git.exe",
+			),
+		).toBe("D:\\PortableGit\\bin\\bash.exe");
+		expect(() =>
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ Path: "C:\\Windows\\System32;D:\\PortableGit\\cmd" },
+				(candidate) => candidate === "C:\\Windows\\System32\\bash.exe",
+			),
+		).toThrow("Git Bash unavailable: no trusted bash.exe found");
+		expect(() =>
+			__test__.getBirdStdoutShellCommand(
+				"win32",
+				{ PATH: ".;relative\\bin" },
+				() => false,
+			),
+		).toThrow("Git Bash unavailable: no trusted bash.exe found");
+	});
+
+	it("disables MSYS argument conversion for the Windows redirect wrapper", async () => {
+		const { __test__ } = await import("./bird");
+
+		expect(
+			__test__.getBirdStdoutShellEnv("win32", {
+				PATH: "C:\\Windows",
+				MSYS2_ARG_CONV_EXCL: "/legacy",
+			}),
+		).toEqual({ PATH: "C:\\Windows", MSYS2_ARG_CONV_EXCL: "*" });
+		const posixEnv = { PATH: "/usr/bin" };
+		expect(__test__.getBirdStdoutShellEnv("linux", posixEnv)).toBe(posixEnv);
+	});
+
 	it("maps bird mentions json into xurl-compatible payloads", async () => {
 		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
 		mockBirdStdoutOnce(
@@ -92,6 +210,19 @@ describe("bird transport wrapper", () => {
 						username: "sam",
 						name: "Sam",
 					},
+					_raw: {
+						core: {
+							user_results: {
+								result: {
+									rest_id: "42",
+									avatar: {
+										image_url:
+											"https://pbs.twimg.com/profile_images/42/avatar_normal.jpg",
+									},
+								},
+							},
+						},
+					},
 					media: [
 						{
 							type: "photo",
@@ -101,13 +232,11 @@ describe("bird transport wrapper", () => {
 				},
 			]),
 		);
-		const { listMentionsViaBird } = await import("./bird");
+		const payload = await runBirdEffect((bird) =>
+			bird.listMentionsViaBirdEffect({ maxResults: 12 }),
+		);
 
-		const payload = await listMentionsViaBird({
-			maxResults: 12,
-		});
-
-		expectBirdCommandCall(1, ["mentions", "-n", "12", "--json"]);
+		expectBirdCommandCall(1, ["mentions", "-n", "12", "--json-full"]);
 		expect(payload).toEqual({
 			data: [
 				expect.objectContaining({
@@ -137,6 +266,8 @@ describe("bird transport wrapper", () => {
 						id: "42",
 						username: "sam",
 						name: "Sam",
+						profile_image_url:
+							"https://pbs.twimg.com/profile_images/42/avatar_normal.jpg",
 					},
 				],
 			},
@@ -171,17 +302,80 @@ describe("bird transport wrapper", () => {
 				data: [expect.objectContaining({ id: "tweet_effect_1" })],
 			}),
 		);
-		expectBirdCommandCall(1, ["mentions", "-n", "3", "--json"]);
+		expectBirdCommandCall(1, ["mentions", "-n", "3", "--json-full"]);
+	});
+
+	it("falls back to standard JSON when bird lacks --json-full", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdRejectOnce(
+			Object.assign(new Error("Command failed"), {
+				stderr: "error: unknown option '--json-full'",
+			}),
+		);
+		mockBirdStdoutOnce("[]");
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 5 }),
+			),
+		).resolves.toMatchObject({
+			data: [],
+		});
+		expectBirdCommandCall(1, ["mentions", "-n", "5", "--json-full"]);
+		expectBirdCommandCall(2, ["mentions", "-n", "5", "--json"]);
+	});
+
+	it("keeps an avatar found on a later tweet from the same author", async () => {
+		const { __test__ } = await import("./bird");
+
+		expect(
+			__test__.normalizeBirdTweets([
+				{
+					id: "tweet_without_avatar",
+					text: "first",
+					createdAt: "2026-06-24T00:00:00.000Z",
+					authorId: "42",
+					author: { username: "sam", name: "Sam" },
+				},
+				{
+					id: "tweet_with_avatar",
+					text: "second",
+					createdAt: "2026-06-24T00:01:00.000Z",
+					authorId: "42",
+					_raw: {
+						core: {
+							user_results: {
+								result: {
+									rest_id: "42",
+									avatar: { image_url: "https://img.example/sam_normal.jpg" },
+								},
+							},
+						},
+					},
+				},
+			]),
+		).toMatchObject({
+			includes: {
+				users: [
+					{
+						id: "42",
+						profile_image_url: "https://img.example/sam_normal.jpg",
+					},
+				],
+			},
+		});
 	});
 
 	it("omits max-pages for single-page bird search", async () => {
 		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
 		mockBirdStdoutOnce("[]");
 		mockBirdStdoutOnce("[]");
-		const { searchTweetsViaBird } = await import("./bird");
-
 		await expect(
-			searchTweetsViaBird("ChatGPT", { maxResults: 5, maxPages: 1 }),
+			runBirdEffect((bird) =>
+				bird.searchTweetsViaBirdEffect("ChatGPT", {
+					maxResults: 5,
+					maxPages: 1,
+				}),
+			),
 		).resolves.toEqual({
 			data: [],
 			includes: undefined,
@@ -193,22 +387,24 @@ describe("bird transport wrapper", () => {
 				oldest_id: undefined,
 			},
 		});
-		expectBirdCommandCall(1, ["search", "ChatGPT", "-n", "5", "--json"]);
+		expectBirdCommandCall(1, ["search", "ChatGPT", "-n", "5", "--json-full"]);
 
-		await searchTweetsViaBird("ChatGPT", {
-			maxResults: 5,
-			all: true,
-			maxPages: 2,
-		});
+		await runBirdEffect((bird) =>
+			bird.searchTweetsViaBirdEffect("ChatGPT", {
+				maxResults: 5,
+				all: true,
+				maxPages: 2,
+			}),
+		);
 		expectBirdCommandCall(2, [
 			"search",
 			"ChatGPT",
 			"-n",
 			"5",
-			"--json",
 			"--all",
 			"--max-pages",
 			"2",
+			"--json-full",
 		]);
 	});
 
@@ -239,9 +435,11 @@ describe("bird transport wrapper", () => {
 		);
 		mockBirdStdoutOnce("[]");
 
-		const { listMentionsViaBird } = await import("./bird");
-
-		await expect(listMentionsViaBird({ maxResults: 2 })).resolves.toEqual({
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 2 }),
+			),
+		).resolves.toEqual({
 			data: [
 				expect.objectContaining({
 					id: "tweet_2",
@@ -293,7 +491,11 @@ describe("bird transport wrapper", () => {
 			},
 		});
 
-		await expect(listMentionsViaBird({ maxResults: 0 })).resolves.toEqual({
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 0 }),
+			),
+		).resolves.toEqual({
 			data: [],
 			includes: undefined,
 			meta: {
@@ -308,11 +510,11 @@ describe("bird transport wrapper", () => {
 		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
 		mockBirdStdoutOnce("{}");
 
-		const { listMentionsViaBird } = await import("./bird");
-
-		await expect(listMentionsViaBird({ maxResults: 10 })).rejects.toThrow(
-			"bird mentions returned unexpected JSON",
-		);
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 10 }),
+			),
+		).rejects.toThrow("bird mentions returned unexpected JSON");
 	});
 
 	it("explains how to configure bird when the binary is missing", async () => {
@@ -324,11 +526,24 @@ describe("bird transport wrapper", () => {
 			}),
 		);
 
-		const { listMentionsViaBird } = await import("./bird");
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 10 }),
+			),
+		).rejects.toThrow("bird command unavailable: /missing/bird");
+	});
 
-		await expect(listMentionsViaBird({ maxResults: 10 })).rejects.toThrow(
-			"bird command unavailable: /missing/bird",
+	it("explains how to configure Bash when the wrapper shell is missing", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdRejectOnce(
+			Object.assign(new Error("spawn bash.exe ENOENT"), { code: "ENOENT" }),
 		);
+
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listMentionsViaBirdEffect({ maxResults: 10 }),
+			),
+		).rejects.toThrow("Bash unavailable:");
 	});
 
 	it("tolerates bird json with raw newlines inside tweet text", async () => {
@@ -336,9 +551,11 @@ describe("bird transport wrapper", () => {
 		mockBirdStdoutOnce(
 			'[{ "id": "tweet_1", "text": "first line\nsecond line", "createdAt": "2026-04-26T13:43:34.000Z", "authorId": "42", "author": { "username": "sam", "name": "Sam" } }]',
 		);
-		const { listLikedTweetsViaBird } = await import("./bird");
-
-		await expect(listLikedTweetsViaBird({ maxResults: 1 })).resolves.toEqual(
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listLikedTweetsViaBirdEffect({ maxResults: 1 }),
+			),
+		).resolves.toEqual(
 			expect.objectContaining({
 				data: [
 					expect.objectContaining({
@@ -365,11 +582,11 @@ describe("bird transport wrapper", () => {
 		};
 		mockBirdStdoutOnce(JSON.stringify(payload));
 
-		const { listDirectMessagesViaBird } = await import("./bird");
-
-		await expect(listDirectMessagesViaBird({ maxResults: 5 })).resolves.toEqual(
-			payload,
-		);
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listDirectMessagesViaBirdEffect({ maxResults: 5 }),
+			),
+		).resolves.toEqual(payload);
 		expectBirdCommandCall(1, ["dms", "-n", "5", "--json"]);
 	});
 
@@ -389,6 +606,7 @@ describe("bird transport wrapper", () => {
 		await expect(getAuthenticatedBirdAccount()).resolves.toEqual({
 			id: "25401953",
 			username: "steipete",
+			name: "Peter Steinberger 2026",
 		});
 		expectBirdCommandCall(1, ["whoami"]);
 	});
@@ -398,15 +616,15 @@ describe("bird transport wrapper", () => {
 		const payload = { success: true, conversations: [], events: [] };
 		mockBirdStdoutOnce(JSON.stringify(payload));
 
-		const { listDirectMessagesViaBird } = await import("./bird");
-
 		await expect(
-			listDirectMessagesViaBird({
-				maxResults: 50,
-				inbox: "requests",
-				maxPages: 2,
-				pageDelayMs: 750,
-			}),
+			runBirdEffect((bird) =>
+				bird.listDirectMessagesViaBirdEffect({
+					maxResults: 50,
+					inbox: "requests",
+					maxPages: 2,
+					pageDelayMs: 750,
+				}),
+			),
 		).resolves.toEqual(payload);
 		expectBirdCommandCall(1, [
 			"dms",
@@ -436,6 +654,22 @@ describe("bird transport wrapper", () => {
 			}),
 		).resolves.toEqual(payload);
 		expectBirdCommandCall(1, ["dm-reject", "111-333", "--json"]);
+	});
+
+	it("preserves missing-shell errors from failed bird DM mutations", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdRejectOnce(
+			Object.assign(new Error("spawn bash ENOENT"), { code: "ENOENT" }),
+		);
+
+		const { runDirectMessageRequestMutationViaBird } = await import("./bird");
+
+		await expect(
+			runDirectMessageRequestMutationViaBird({
+				action: "accept",
+				conversationId: "111-333",
+			}),
+		).rejects.toThrow("Bash unavailable:");
 	});
 
 	it("passes pagination options to bird DM block mutations", async () => {
@@ -489,34 +723,122 @@ describe("bird transport wrapper", () => {
 				},
 			]),
 		);
-		const { listBookmarkedTweetsViaBird, listLikedTweetsViaBird } =
-			await import("./bird");
-
-		await expect(listLikedTweetsViaBird({ maxResults: 5 })).resolves.toEqual({
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listLikedTweetsViaBirdEffect({ maxResults: 5 }),
+			),
+		).resolves.toEqual({
 			data: [expect.objectContaining({ id: "liked_1", author_id: "42" })],
 			includes: { users: [{ id: "42", username: "sam", name: "Sam" }] },
 			meta: expect.objectContaining({ result_count: 1 }),
 		});
 		await expect(
-			listBookmarkedTweetsViaBird({
-				maxResults: 7,
-				all: true,
-				maxPages: 2,
-			}),
+			runBirdEffect((bird) =>
+				bird.listBookmarkedTweetsViaBirdEffect({
+					maxResults: 7,
+					all: true,
+					maxPages: 2,
+				}),
+			),
 		).resolves.toEqual({
 			data: [expect.objectContaining({ id: "bookmark_1", author_id: "43" })],
 			includes: { users: [{ id: "43", username: "amelia", name: "Amelia" }] },
 			meta: expect.objectContaining({ result_count: 1 }),
 		});
-		expectBirdCommandCall(1, ["likes", "-n", "5", "--json"]);
+		expectBirdCommandCall(1, ["likes", "-n", "5", "--json-full"]);
 		expectBirdCommandCall(2, [
 			"bookmarks",
 			"-n",
 			"7",
-			"--json",
 			"--all",
 			"--max-pages",
 			"2",
+			"--json-full",
+		]);
+	});
+
+	it("omits max-pages for single-page bird saved collections", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdStdoutOnce("[]");
+		mockBirdStdoutOnce("[]");
+		await runBirdEffect((bird) =>
+			bird.listLikedTweetsViaBirdEffect({ maxResults: 5, maxPages: 2 }),
+		);
+		await runBirdEffect((bird) =>
+			bird.listBookmarkedTweetsViaBirdEffect({ maxResults: 7, maxPages: 3 }),
+		);
+
+		expect(execFileAsyncMock).toHaveBeenCalledTimes(2);
+		expectBirdCommandCall(1, ["likes", "-n", "5", "--json-full"]);
+		expectBirdCommandCall(2, ["bookmarks", "-n", "7", "--json-full"]);
+	});
+
+	it("normalizes owned Lists and paged List membership", async () => {
+		process.env.BIRDCLAW_BIRD_COMMAND = "/tmp/bird";
+		mockBirdStdoutOnce(
+			JSON.stringify([
+				{
+					id: "list_1",
+					name: "Builders",
+					description: "People who build",
+					memberCount: 2,
+					subscriberCount: 3,
+					isPrivate: false,
+					owner: { id: "42", username: "owner", name: "Owner" },
+				},
+			]),
+		);
+		mockBirdStdoutOnce(
+			JSON.stringify({
+				users: [
+					{
+						id: "7",
+						username: "member",
+						name: "Member",
+						followersCount: 50,
+					},
+				],
+				nextCursor: "cursor-next",
+			}),
+		);
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listOwnedXListsViaBirdEffect({ maxResults: 20 }),
+			),
+		).resolves.toMatchObject({
+			data: [
+				{
+					id: "list_1",
+					name: "Builders",
+					memberCount: 2,
+					followerCount: 3,
+					ownerUsername: "owner",
+				},
+			],
+		});
+		await expect(
+			runBirdEffect((bird) =>
+				bird.listXListMembersViaBirdEffect({
+					listId: "list_1",
+					maxResults: 20,
+					maxPages: 3,
+				}),
+			),
+		).resolves.toMatchObject({
+			data: [{ id: "7", username: "member" }],
+			meta: { next_token: "cursor-next", pagination_known_complete: false },
+		});
+		expect(execFileAsyncMock).toHaveBeenCalledTimes(2);
+		expectBirdCommandCall(1, ["lists", "-n", "20", "--json"]);
+		expectBirdCommandCall(2, [
+			"list-members",
+			"list_1",
+			"-n",
+			"20",
+			"--json",
+			"--all",
+			"--max-pages",
+			"3",
 		]);
 	});
 
@@ -533,16 +855,19 @@ describe("bird transport wrapper", () => {
 				},
 			]),
 		);
-		const { listHomeTimelineViaBird } = await import("./bird");
-
 		await expect(
-			listHomeTimelineViaBird({ maxResults: 9, following: true }),
+			runBirdEffect((bird) =>
+				bird.listHomeTimelineViaBirdEffect({
+					maxResults: 9,
+					following: true,
+				}),
+			),
 		).resolves.toEqual({
 			data: [expect.objectContaining({ id: "home_1", author_id: "45" })],
 			includes: { users: [{ id: "45", username: "riley", name: "Riley" }] },
 			meta: expect.objectContaining({ result_count: 1 }),
 		});
-		expectBirdCommandCall(1, ["home", "-n", "9", "--json", "--following"]);
+		expectBirdCommandCall(1, ["home", "-n", "9", "--following", "--json-full"]);
 	});
 
 	it("maps bird follower lists into xurl-compatible users", async () => {
@@ -575,16 +900,16 @@ describe("bird transport wrapper", () => {
 				},
 			]),
 		);
-		const { listFollowUsersViaBird } = await import("./bird");
-
 		await expect(
-			listFollowUsersViaBird({
-				direction: "followers",
-				userId: "25401953",
-				maxResults: 100,
-				all: true,
-				maxPages: 2,
-			}),
+			runBirdEffect((bird) =>
+				bird.listFollowUsersViaBirdEffect({
+					direction: "followers",
+					userId: "25401953",
+					maxResults: 100,
+					all: true,
+					maxPages: 2,
+				}),
+			),
 		).resolves.toEqual({
 			data: [
 				expect.objectContaining({
@@ -600,13 +925,16 @@ describe("bird transport wrapper", () => {
 				result_count: 1,
 				page_count: 1,
 				next_token: "cursor-two",
+				pagination_known_complete: false,
 			},
 		});
 		await expect(
-			listFollowUsersViaBird({
-				direction: "following",
-				maxResults: 10,
-			}),
+			runBirdEffect((bird) =>
+				bird.listFollowUsersViaBirdEffect({
+					direction: "following",
+					maxResults: 10,
+				}),
+			),
 		).resolves.toEqual({
 			data: [
 				expect.objectContaining({
@@ -622,6 +950,7 @@ describe("bird transport wrapper", () => {
 				result_count: 1,
 				page_count: 1,
 				next_token: null,
+				pagination_known_complete: true,
 			},
 		});
 		expectBirdCommandCall(1, [
@@ -653,10 +982,14 @@ describe("bird transport wrapper", () => {
 				},
 			]),
 		);
-		const { listThreadViaBird } = await import("./bird");
-
 		await expect(
-			listThreadViaBird({ tweetId: "reply_1", maxPages: 2, timeoutMs: 5000 }),
+			runBirdEffect((bird) =>
+				bird.listThreadViaBirdEffect({
+					tweetId: "reply_1",
+					maxPages: 2,
+					timeoutMs: 5000,
+				}),
+			),
 		).resolves.toEqual({
 			data: [
 				expect.objectContaining({
@@ -672,9 +1005,9 @@ describe("bird transport wrapper", () => {
 		expectBirdCommandCall(1, [
 			"thread",
 			"reply_1",
-			"--json",
 			"--max-pages",
 			"2",
+			"--json-full",
 		]);
 		expect(execFileAsyncMock.mock.calls[0]?.[2]).toEqual(
 			expect.objectContaining({ timeout: 5000 }),
@@ -697,10 +1030,10 @@ describe("bird transport wrapper", () => {
 				nextCursor: null,
 			}),
 		);
-		const { listBookmarkedTweetsViaBird } = await import("./bird");
-
 		await expect(
-			listBookmarkedTweetsViaBird({ maxResults: 5, all: true }),
+			runBirdEffect((bird) =>
+				bird.listBookmarkedTweetsViaBirdEffect({ maxResults: 5, all: true }),
+			),
 		).resolves.toEqual({
 			data: [expect.objectContaining({ id: "bookmark_2", author_id: "44" })],
 			includes: { users: [{ id: "44", username: "jules", name: "Jules" }] },
@@ -723,9 +1056,9 @@ describe("bird transport wrapper", () => {
 				likeCount: 9,
 			}),
 		);
-		const { lookupTweetsByIdsViaBird } = await import("./bird");
-
-		await expect(lookupTweetsByIdsViaBird(["tweet_1"])).resolves.toEqual({
+		await expect(
+			runBirdEffect((bird) => bird.lookupTweetsByIdsViaBirdEffect(["tweet_1"])),
+		).resolves.toEqual({
 			data: [
 				expect.objectContaining({
 					id: "tweet_1",
@@ -741,7 +1074,7 @@ describe("bird transport wrapper", () => {
 			includes: { users: [{ id: "42", username: "sam", name: "Sam" }] },
 			meta: expect.objectContaining({ result_count: 1 }),
 		});
-		expectBirdCommandCall(1, ["read", "tweet_1", "--json"]);
+		expectBirdCommandCall(1, ["read", "tweet_1", "--json-full"]);
 	});
 
 	it("looks up profiles through bird user json", async () => {
@@ -761,9 +1094,9 @@ describe("bird transport wrapper", () => {
 				},
 			}),
 		);
-		const { lookupProfileViaBird } = await import("./bird");
-
-		await expect(lookupProfileViaBird("42")).resolves.toEqual({
+		await expect(
+			runBirdEffect((bird) => bird.lookupProfileViaBirdEffect("42")),
+		).resolves.toEqual({
 			id: "42",
 			username: "sam",
 			name: "Sam",
@@ -796,9 +1129,9 @@ describe("bird transport wrapper", () => {
 				},
 			}),
 		);
-		const { lookupProfileViaBird } = await import("./bird");
-
-		await expect(lookupProfileViaBird("42")).resolves.toEqual(
+		await expect(
+			runBirdEffect((bird) => bird.lookupProfileViaBirdEffect("42")),
+		).resolves.toEqual(
 			expect.objectContaining({
 				id: "42",
 				username: "sam",
@@ -826,14 +1159,13 @@ describe("bird transport wrapper", () => {
 			}),
 		);
 
-		const { listDirectMessagesViaBird } = await import("./bird");
-
-		await expect(listDirectMessagesViaBird({ maxResults: 5 })).rejects.toThrow(
-			"bird dms returned unexpected JSON",
-		);
-		await expect(listDirectMessagesViaBird({ maxResults: 5 })).rejects.toThrow(
-			"bird dms returned unexpected JSON",
-		);
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			await expect(
+				runBirdEffect((bird) =>
+					bird.listDirectMessagesViaBirdEffect({ maxResults: 5 }),
+				),
+			).rejects.toThrow("bird dms returned unexpected JSON");
+		}
 	});
 
 	it("uses bird profiles for batch profile hydration", async () => {
@@ -855,8 +1187,9 @@ describe("bird transport wrapper", () => {
 			}),
 		);
 
-		const { lookupProfilesViaBird } = await import("./bird");
-		const results = await lookupProfilesViaBird(["@github", "missing"]);
+		const results = await runBirdEffect((bird) =>
+			bird.lookupProfilesViaBirdEffect(["@github", "missing"]),
+		);
 
 		expectBirdCommandCall(1, ["profiles", "github", "missing", "--json"]);
 		expect(results).toEqual([
@@ -890,8 +1223,9 @@ describe("bird transport wrapper", () => {
 			}),
 		);
 
-		const { lookupProfilesViaBird } = await import("./bird");
-		const results = await lookupProfilesViaBird(["github"]);
+		const results = await runBirdEffect((bird) =>
+			bird.lookupProfilesViaBirdEffect(["github"]),
+		);
 
 		expectBirdCommandCall(1, ["profiles", "github", "--json"]);
 		expectBirdCommandCall(2, ["user", "github", "--json", "--profile-only"]);
@@ -909,14 +1243,28 @@ describe("bird transport wrapper", () => {
 			text: "hello\nworld",
 			tab: "a\tb",
 		});
-		expect(__test__.formatBirdCommandError(enoent, "/missing/bird")).toEqual(
+		expect(
+			__test__.formatBirdCommandError(enoent, "/missing/bird", "bash.exe"),
+		).toEqual(
 			expect.objectContaining({
-				message: expect.stringContaining(
-					"bird command unavailable: /missing/bird",
-				),
+				message: expect.stringContaining("Bash unavailable: bash.exe"),
 			}),
 		);
-		expect(__test__.formatBirdCommandError("boom", "/tmp/bird")).toBe("boom");
+		expect(
+			__test__.formatBirdCommandError(
+				enoent,
+				"C:\\bird.cmd",
+				"bash.exe",
+				"win32",
+			),
+		).toEqual(
+			expect.objectContaining({
+				message: expect.stringContaining("Git Bash unavailable: bash.exe"),
+			}),
+		);
+		expect(
+			__test__.formatBirdCommandError("boom", "/tmp/bird", "/bin/bash"),
+		).toBe("boom");
 		expect(
 			__test__.isUnsupportedBirdOptionError(
 				Object.assign(new Error("bad"), {
@@ -951,11 +1299,56 @@ describe("bird transport wrapper", () => {
 			__test__.normalizeBirdTweets([
 				{
 					id: "1",
+					text: "quoting",
+					createdAt: "2026-05-02T00:00:00.000Z",
+					authorId: "42",
+					author: { username: "sam", name: "Sam" },
+					quotedTweet: {
+						id: "quoted",
+						text: "quoted body",
+						createdAt: "2026-05-01T00:00:00.000Z",
+						authorId: "43",
+						author: { username: "alex", name: "Alex" },
+					},
+				},
+			]),
+		).toEqual(
+			expect.objectContaining({
+				data: [
+					expect.objectContaining({
+						id: "1",
+						referenced_tweets: [{ type: "quoted", id: "quoted" }],
+					}),
+				],
+				includes: {
+					users: [
+						{ id: "42", username: "sam", name: "Sam" },
+						{ id: "43", username: "alex", name: "Alex" },
+					],
+					tweets: [
+						expect.objectContaining({
+							id: "quoted",
+							author_id: "43",
+							text: "quoted body",
+							public_metrics: {},
+						}),
+					],
+				},
+			}),
+		);
+		expect(
+			__test__.normalizeBirdTweets([
+				{
+					id: "1",
 					text: "hello",
 					createdAt: "not-a-date",
 					authorId: "42",
 					author: { username: "sam" },
 					media: [{ url: "https://img.example/a.jpg" }],
+					article: {
+						title: "A frontier without an ecosystem is not stable",
+						previewText: "I have been thinking about the future of the firm.",
+					},
 					inReplyToStatusId: "",
 				},
 				{
@@ -972,6 +1365,12 @@ describe("bird transport wrapper", () => {
 						created_at: "not-a-date",
 						conversation_id: "1",
 						entities: expect.objectContaining({
+							article: {
+								title: "A frontier without an ecosystem is not stable",
+								previewText:
+									"I have been thinking about the future of the firm.",
+								url: "https://x.com/sam/status/1",
+							},
 							urls: [
 								expect.objectContaining({ url: "https://img.example/a.jpg" }),
 							],

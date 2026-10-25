@@ -1,9 +1,11 @@
 import { Effect } from "effect";
 
-import { runEffectPromise, tryPromise } from "./effect-runtime";
-import { resolveProfile } from "./moderation-target";
+import { resolveOperationAccount } from "./account-selection";
+import { runEffectPromise } from "./effect-runtime";
+import { resolveProfileEffect } from "./moderation-target";
 import type { ProfileRepliesResponse, XurlReferencedTweet } from "./types";
-import { listUserTweets } from "./xurl";
+import { tweetContentFromXurl } from "./x-tweet-content";
+import { listUserTweetsEffect } from "./xurl";
 
 function getReplyTargetId(references?: XurlReferencedTweet[]) {
 	return references?.find((item) => item.type === "replied_to")?.id;
@@ -15,17 +17,25 @@ function getScanSize(limit: number) {
 
 export function inspectProfileReplies(
 	query: string,
-	{ limit = 12 }: { limit?: number } = {},
+	{ account, limit = 12 }: { account?: string; limit?: number } = {},
 ): Promise<ProfileRepliesResponse> {
-	return runEffectPromise(inspectProfileRepliesEffect(query, { limit }));
+	return runEffectPromise(
+		inspectProfileRepliesEffect(query, { account, limit }),
+	);
 }
 
 export function inspectProfileRepliesEffect(
 	query: string,
-	{ limit = 12 }: { limit?: number } = {},
+	{ account, limit = 12 }: { account?: string; limit?: number } = {},
 ): Effect.Effect<ProfileRepliesResponse, unknown> {
 	return Effect.gen(function* () {
-		const resolved = yield* tryPromise(() => resolveProfile(query));
+		const operationAccount = account
+			? yield* Effect.try({
+					try: () => resolveOperationAccount(account),
+					catch: (error) => error,
+				})
+			: undefined;
+		const resolved = yield* resolveProfileEffect(query);
 		const externalUserId = resolved.externalUserId;
 		if (!externalUserId) {
 			return yield* Effect.fail(
@@ -33,22 +43,22 @@ export function inspectProfileRepliesEffect(
 			);
 		}
 
-		const timeline = yield* tryPromise(() =>
-			listUserTweets(externalUserId, {
-				maxResults: getScanSize(limit),
-				excludeRetweets: true,
-			}),
-		);
+		const timeline = yield* listUserTweetsEffect(externalUserId, {
+			maxResults: getScanSize(limit),
+			excludeRetweets: true,
+			...(operationAccount ? { username: operationAccount.username } : {}),
+		});
 		const items = timeline.items
 			.map((tweet) => {
 				const replyToTweetId = getReplyTargetId(tweet.referenced_tweets);
 				if (!replyToTweetId) {
 					return null;
 				}
+				const content = tweetContentFromXurl(tweet);
 
 				return {
 					id: tweet.id,
-					text: tweet.text,
+					text: content.text,
 					createdAt: tweet.created_at,
 					conversationId: tweet.conversation_id,
 					replyToTweetId,

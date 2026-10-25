@@ -5,6 +5,8 @@ description: "Local cache of pbs.twimg.com images and video.twimg.com mp4 varian
 
 # Media
 
+Tweet videos and GIF clips play directly inside the feed, including read-only archives. Players prefer stored MP4/WebM variants (highest bitrate first), retain HLS-only variants for browsers with native HLS support, show the stored poster, and load video bytes only when playback starts. GIF clips loop muted after you start them. Playback controls do not expand the surrounding tweet conversation. If the archive has only a thumbnail or playback fails, the card links to the original post on X; Birdclaw never invents a media URL.
+
 `birdclaw media fetch` fills the local originals cache with image, video, and animated-GIF files for tweets that already live in the local SQLite store.
 
 ## Posture
@@ -30,7 +32,7 @@ For every tweet row whose `media_json` carries a media item:
 - **videos** from `video.twimg.com`, picking the highest-bitrate mp4 variant; HLS-only media is skipped
 - **animated GIFs** from `video.twimg.com` (same path, separate counter)
 
-`media_json` carries `variants[]` ride-along metadata for every video and animated GIF. [Live syncers](sync.md) — `sync likes`, `sync bookmarks`, `sync timeline`, and `sync mention-threads` — persist that variants array as part of normal sync so `media fetch` always has a URL to download from.
+`media_json` carries `variants[]` ride-along metadata for every video and animated GIF. [Live syncers](sync.md) — `sync likes`, `sync bookmarks`, `sync timeline`, and `sync mention-threads` — preserve MP4, WebM, and HLS variants. The inline player supplies ordered, typed sources so browsers can try an alternate format when a source is unavailable. The download command still caches MP4 variants only.
 
 ## Archive byte reuse
 
@@ -112,3 +114,30 @@ birdclaw media fetch --parallel 3 --pacing-ms 500 --video-pacing-ms 1500 --max-b
 - [Sync](sync.md) — live syncers that populate `media_json` with the variants payload `media fetch` consumes
 - [Archive Import](archive.md) — where archive byte reuse comes from
 - [CLI reference](cli.md#media-fetch) — canonical flag listing
+
+## Avatars
+
+All profile avatars, including the network map, first use the local `/api/avatar` cache. If that request fails,
+the browser makes one fallback attempt to the stored HTTPS `pbs.twimg.com/profile_images/`
+URL without a referrer. Both failures retain initials; arbitrary hosts, credential-bearing
+URLs, and non-profile paths are never used for the fallback. This also lets a read-only
+archive display a known avatar when its local image bytes were not copied.
+
+Xurl tweet reads include referenced tweets and their authors, preserving repost and
+quote author avatars in the normal sync response without separate profile lookups.
+
+## Link preview thumbnails
+
+Link cards show the domain once, a distinct page title and description when available, and a compact thumbnail. Links without metadata retain a readable URL path; links without working images use a small site icon instead of an empty image panel. Failed metadata refreshes retain useful archived titles. Read-only archives continue to use cached metadata and image bytes without fetching or writing preview data.
+
+External link-card images are served through `/api/link-preview?imageUrl=...`,
+with public-address and redirect validation, an 8 MiB decoded-size limit, and
+raster signature checks. The cache accepts JPEG, PNG, GIF, WebP, and AVIF;
+HTML and SVG responses are rejected. Failed requests retain the card's placeholder.
+
+Images are cached by URL (without fragments) under `media/thumbs/previews/`.
+The cache evicts its oldest images before exceeding 256 MiB or 2,048 files. A read-only deployment
+only serves existing files, so copy this directory alongside `media/thumbs/avatars/`
+when preparing an archive. Normal interactive browsing fills missing files.
+Hosting adapters that own separate durable media storage can implement the same
+image endpoint without making the archive database writable.

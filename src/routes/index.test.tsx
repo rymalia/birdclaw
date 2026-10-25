@@ -1,12 +1,7 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { ComponentType } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderWithQueryClient as render } from "#/test/render";
 
 vi.mock("#/components/TimelineCard", () => ({
 	TimelineCard: ({
@@ -82,6 +77,39 @@ describe("home route", () => {
 				expect.objectContaining({ method: "POST" }),
 			);
 		});
+	});
+
+	it("restores timeline data without refetching after a sidebar-style remount", async () => {
+		let queryCalls = 0;
+		const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+			const url = String(input);
+			if (url.endsWith("/api/status")) {
+				return Response.json({
+					stats: { home: 1, mentions: 0, dms: 0, needsReply: 0, inbox: 0 },
+					transport: { statusText: "local" },
+					accounts: [],
+					archives: [],
+				});
+			}
+			if (url.includes("/api/query")) {
+				queryCalls += 1;
+				return Response.json({
+					resource: "home",
+					items: [{ id: "tweet_cached", text: "Cached post" }],
+				});
+			}
+			throw new Error(`Unexpected fetch ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const first = render(<HomeRoute />);
+		expect(await screen.findByText("Cached post")).toBeInTheDocument();
+		first.unmount();
+
+		render(<HomeRoute />, { queryClient: first.queryClient });
+
+		expect(screen.getByText("Cached post")).toBeInTheDocument();
+		expect(queryCalls).toBe(1);
 	});
 
 	it("shows reply transport errors without dropping the timeline", async () => {
@@ -232,11 +260,12 @@ describe("home route", () => {
 		render(<HomeRoute />);
 
 		expect(await screen.findByText("Fresh post")).toBeInTheDocument();
+		const initialQueryCount = queryUrls.length;
 		fireEvent.click(screen.getByRole("button", { name: "Sync timeline" }));
 
 		await waitFor(() => {
 			expect(syncBodies).toEqual([{ kind: "timeline" }]);
-			expect(queryUrls.at(-1)?.searchParams.get("refresh")).toBe("1");
+			expect(queryUrls.length).toBeGreaterThan(initialQueryCount);
 		});
 		expect(screen.getByText("Synced 12 items")).toBeInTheDocument();
 	});

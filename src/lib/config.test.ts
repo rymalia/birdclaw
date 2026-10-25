@@ -5,12 +5,18 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
 	ensureBirdclawDirs,
+	getPreferredTransport,
+	getAutoTransportOrder,
+	setPreferredTransport,
+	defaultLiveSyncMode,
 	getBirdCommand,
 	getBirdclawConfig,
 	getBirdclawPaths,
+	getDefaultAccountSelector,
 	resetBirdclawPathsForTests,
 	resolveActionsTransport,
 	resolveMentionsDataSource,
+	setActionsTransport,
 } from "./config";
 
 const tempRoots: string[] = [];
@@ -19,6 +25,7 @@ const originalPath = process.env.PATH;
 afterEach(() => {
 	resetBirdclawPathsForTests();
 	process.env.PATH = originalPath;
+	delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 	delete process.env.BIRDCLAW_HOME;
 	delete process.env.BIRDCLAW_CONFIG;
 	delete process.env.BIRDCLAW_ACTIONS_TRANSPORT;
@@ -31,6 +38,34 @@ afterEach(() => {
 });
 
 describe("config", () => {
+	it("persists the global preference, keeps other settings, and lets env override it", () => {
+		const tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-config-"));
+		tempRoots.push(tempRoot);
+		process.env.BIRDCLAW_HOME = tempRoot;
+		writeFileSync(
+			path.join(tempRoot, "config.json"),
+			JSON.stringify({
+				actions: { transport: "xurl" },
+				accounts: { default: "steipete" },
+			}),
+		);
+		expect(getAutoTransportOrder("bird")).toEqual(["bird", "xurl"]);
+		setPreferredTransport("bird");
+		expect(getPreferredTransport()).toBe("bird");
+		expect(getAutoTransportOrder()).toEqual(["bird", "xurl"]);
+		expect(defaultLiveSyncMode("xurl")).toBe("auto");
+		expect(resolveActionsTransport()).toBe("xurl");
+		expect(getDefaultAccountSelector()).toBe("steipete");
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = " XURL ";
+		expect(getAutoTransportOrder("bird")).toEqual(["xurl", "bird"]);
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "invalid";
+		expect(getPreferredTransport()).toBe("bird");
+		delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
+		setPreferredTransport("auto");
+		expect(getPreferredTransport()).toBeUndefined();
+		expect(defaultLiveSyncMode("xurl")).toBe("xurl");
+	});
+
 	it("uses BIRDCLAW_HOME when set", () => {
 		const tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-config-"));
 		tempRoots.push(tempRoot);
@@ -61,6 +96,9 @@ describe("config", () => {
 		writeFileSync(
 			path.join(tempRoot, "config.json"),
 			JSON.stringify({
+				accounts: {
+					default: "  @steipete  ",
+				},
 				actions: {
 					transport: "xurl",
 				},
@@ -72,6 +110,9 @@ describe("config", () => {
 		);
 
 		expect(getBirdclawConfig()).toEqual({
+			accounts: {
+				default: "  @steipete  ",
+			},
 			actions: {
 				transport: "xurl",
 			},
@@ -80,6 +121,7 @@ describe("config", () => {
 				birdCommand: "/tmp/custom-bird",
 			},
 		});
+		expect(getDefaultAccountSelector()).toBe("@steipete");
 		expect(resolveMentionsDataSource()).toBe("bird");
 		expect(resolveActionsTransport()).toBe("xurl");
 		expect(getBirdCommand()).toBe("/tmp/custom-bird");
@@ -105,6 +147,34 @@ describe("config", () => {
 		expect(resolveMentionsDataSource()).toBe("xurl");
 		expect(resolveActionsTransport()).toBe("bird");
 		expect(getBirdCommand()).toBe("/tmp/env-bird");
+	});
+
+	it("sets actions transport in the active config file", () => {
+		const tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-config-"));
+		tempRoots.push(tempRoot);
+		process.env.BIRDCLAW_HOME = tempRoot;
+		writeFileSync(
+			path.join(tempRoot, "config.json"),
+			JSON.stringify({
+				mentions: {
+					dataSource: "bird",
+				},
+			}),
+		);
+
+		expect(setActionsTransport("xurl")).toEqual({
+			configPath: path.join(tempRoot, "config.json"),
+			transport: "xurl",
+		});
+		expect(getBirdclawConfig()).toEqual({
+			actions: {
+				transport: "xurl",
+			},
+			mentions: {
+				dataSource: "bird",
+			},
+		});
+		expect(resolveActionsTransport()).toBe("xurl");
 	});
 
 	it("defaults bird command to PATH lookup", () => {

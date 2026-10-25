@@ -1,11 +1,12 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Effect } from "effect";
-import { maybeAutoUpdateBackupEffect } from "#/lib/backup";
+import { tweetConversationResponseSchema } from "#/lib/api-contracts";
+import { requestBackupAutoUpdate } from "#/lib/backup";
 import {
 	runRouteEffect,
 	sensitiveRequestErrorResponse,
 } from "#/lib/http-effect";
-import { getTweetConversation } from "#/lib/queries";
+import { getTweetConversation } from "#/lib/timeline-read-model";
 
 function json(data: unknown, status = 200) {
 	return new Response(JSON.stringify(data), {
@@ -21,11 +22,11 @@ export const Route = createFileRoute("/api/conversation")({
 		handlers: {
 			GET: ({ request }) =>
 				runRouteEffect(
-					Effect.gen(function* () {
+					Effect.sync(() => {
 						const denied = sensitiveRequestErrorResponse(request);
 						if (denied) return denied;
 
-						yield* maybeAutoUpdateBackupEffect();
+						requestBackupAutoUpdate();
 						const url = new URL(request.url);
 						const tweetId = url.searchParams.get("tweetId")?.trim();
 						if (!tweetId) {
@@ -37,7 +38,12 @@ export const Route = createFileRoute("/api/conversation")({
 							return json({ ok: false, error: "Tweet not found" }, 404);
 						}
 
-						return json({ ok: true, ...conversation });
+						return json(
+							tweetConversationResponseSchema.parse({
+								ok: true,
+								...conversation,
+							}),
+						);
 					}),
 				),
 		},

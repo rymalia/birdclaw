@@ -7,9 +7,14 @@ import {
 } from "./identity-search-index";
 import { fetchProfileBioEntities } from "./profile-bio-entities";
 import { fetchProfileSnapshots } from "./profile-history";
+import {
+	getUrlEntityExpandedUrl,
+	profileEntityUrls as getProfileBioUrls,
+} from "./profile-row";
 import { resolveProfilesForIdsEffect } from "./profile-resolver";
 import type { ProfileResolveResult } from "./profile-resolver";
-import { listDmConversations, listTimelineItems } from "./queries";
+import { listDmConversations } from "./dm-read-model";
+import { listTimelineItems } from "./timeline-read-model";
 import { expandUrlsFromTextsEffect } from "./url-expansion";
 import type {
 	DmConversationItem,
@@ -212,31 +217,6 @@ function getMessageTexts(conversation: DmConversationItem) {
 		match.message.text,
 		...match.after.map((message) => message.text),
 	]);
-}
-
-function getUrlEntityExpandedUrl(entity: unknown) {
-	if (!entity || typeof entity !== "object") {
-		return undefined;
-	}
-	const record = entity as Record<string, unknown>;
-	const expanded = record.expandedUrl ?? record.expanded_url ?? record.url;
-	return typeof expanded === "string" && expanded.length > 0
-		? expanded
-		: undefined;
-}
-
-function getProfileBioUrls(profile: ProfileRecord) {
-	const description = profile.entities?.description;
-	if (!description || typeof description !== "object") {
-		return [];
-	}
-	const urls = (description as { urls?: unknown }).urls;
-	if (!Array.isArray(urls)) {
-		return [];
-	}
-	return urls
-		.map(getUrlEntityExpandedUrl)
-		.filter((url): url is string => Boolean(url));
 }
 
 function getAffiliationTexts(affiliation: ProfileAffiliation) {
@@ -954,50 +934,30 @@ const CATEGORY_LABELS: Record<WhoisCandidateCategory, string> = {
 	other: "Other local matches",
 };
 
+const SIGNAL_PRESENTATION: Partial<
+	Record<WhoisEvidenceSignal["kind"], { label: string; rank: number }>
+> = {
+	affiliation: { label: "current affiliation", rank: 0 },
+	bio_handle: { label: "bio handle", rank: 1 },
+	bio_company: { label: "bio company", rank: 2 },
+	profile_history: { label: "profile history", rank: 3 },
+	dm_context: { label: "DM context", rank: 4 },
+	expanded_url: { label: "expanded URL", rank: 5 },
+	profile_url: { label: "domain/link", rank: 6 },
+	profile_bio_url: { label: "domain/link", rank: 6 },
+	bio_domain: { label: "domain/link", rank: 6 },
+};
+
 function summarizeSignal(signal: WhoisEvidenceSignal) {
-	switch (signal.kind) {
-		case "affiliation":
-			return `current affiliation ${signal.value}`;
-		case "bio_handle":
-			return `bio handle ${signal.value}`;
-		case "bio_company":
-			return `bio company ${signal.value}`;
-		case "profile_history":
-			return `profile history ${signal.value}`;
-		case "profile_url":
-		case "profile_bio_url":
-		case "bio_domain":
-			return `domain/link ${signal.value}`;
-		case "dm_context":
-			return `DM context`;
-		case "expanded_url":
-			return `expanded URL ${signal.value}`;
-		default:
-			return `${signal.kind.replace(/^profile_/, "profile ")} ${signal.value}`;
-	}
+	if (signal.kind === "dm_context") return "DM context";
+	const label =
+		SIGNAL_PRESENTATION[signal.kind]?.label ??
+		signal.kind.replace(/^profile_/, "profile ");
+	return `${label} ${signal.value}`;
 }
 
 function signalSummaryRank(signal: WhoisEvidenceSignal) {
-	switch (signal.kind) {
-		case "affiliation":
-			return 0;
-		case "bio_handle":
-			return 1;
-		case "bio_company":
-			return 2;
-		case "profile_history":
-			return 3;
-		case "dm_context":
-			return 4;
-		case "expanded_url":
-			return 5;
-		case "profile_url":
-		case "profile_bio_url":
-		case "bio_domain":
-			return 6;
-		default:
-			return 7;
-	}
+	return SIGNAL_PRESENTATION[signal.kind]?.rank ?? 7;
 }
 
 function explainCandidate(candidate: WhoisCandidate) {

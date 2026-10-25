@@ -1,13 +1,22 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	within,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resetConversationSurface } from "#/lib/conversation-surface";
+import type { ReactNode } from "react";
+import { ConversationSurfaceScope } from "#/lib/conversation-surface";
+import { renderWithQueryClient } from "#/test/render";
 import { TimelineCard } from "./TimelineCard";
+
+function render(ui: ReactNode) {
+	const result = renderWithQueryClient(
+		<ConversationSurfaceScope>{ui}</ConversationSurfaceScope>,
+	);
+	return {
+		...result,
+		rerender: (nextUi: ReactNode) =>
+			result.rerender(
+				<ConversationSurfaceScope>{nextUi}</ConversationSurfaceScope>,
+			),
+	};
+}
 
 const item = {
 	id: "tweet_1",
@@ -104,9 +113,60 @@ const item = {
 };
 
 describe("TimelineCard", () => {
+	it.each([false, true])(
+		"opens each tweet on X without toggling its thread (readOnly=%s)",
+		(readOnly) => {
+			const onReply = vi.fn();
+			renderWithQueryClient(
+				<ConversationSurfaceScope>
+					<TimelineCard
+						item={{
+							...item,
+							id: "2030857479001960633",
+							replyToTweet: { ...item.replyToTweet, id: "20" },
+							quotedTweet: { ...item.quotedTweet, id: "2030857479001960634" },
+						}}
+						onReply={onReply}
+					/>
+				</ConversationSurfaceScope>,
+				{ readOnly },
+			);
+			const links = screen.getAllByRole("link", { name: /^Open on X/ });
+			expect(links.map((link) => link.getAttribute("href"))).toEqual([
+				"https://x.com/i/status/20",
+				"https://x.com/i/status/2030857479001960634",
+				"https://x.com/i/status/2030857479001960633",
+			]);
+			for (const link of links) {
+				expect(link).toHaveAttribute("target", "_blank");
+				expect(link).toHaveAttribute("rel", "noopener noreferrer");
+				expect(link).toHaveAccessibleName("Open on X (opens in a new tab)");
+				fireEvent.click(link);
+				expect(
+					screen.getByRole("button", { name: "Show conversation" }),
+				).toHaveAttribute("aria-expanded", "false");
+			}
+			expect(onReply).not.toHaveBeenCalled();
+		},
+	);
+
+	it("keeps cached tweet content without reply or analysis actions in read-only mode", () => {
+		renderWithQueryClient(
+			<ConversationSurfaceScope>
+				<TimelineCard item={item} onReply={vi.fn()} />
+			</ConversationSurfaceScope>,
+			{ readOnly: true },
+		);
+		expect(
+			screen.queryByRole("button", { name: "Reply" }),
+		).not.toBeInTheDocument();
+		expect(
+			screen.queryByRole("link", { name: /Analyse/ }),
+		).not.toBeInTheDocument();
+		expect(screen.getAllByText("Sam Altman").length).toBeGreaterThan(0);
+	});
 	afterEach(() => {
 		cleanup();
-		resetConversationSurface();
 		vi.unstubAllGlobals();
 	});
 
@@ -122,9 +182,10 @@ describe("TimelineCard", () => {
 		expect(screen.getAllByText("Quoted tweet")[1]).toBeInTheDocument();
 		expect(screen.getByAltText("Demo image")).toBeInTheDocument();
 		expect(screen.getByText("Demo link")).toBeInTheDocument();
-		expect(
-			screen.queryByRole("img", { name: "Demo link" }),
-		).not.toBeInTheDocument();
+		expect(screen.getByRole("img", { name: "Demo link" })).toHaveAttribute(
+			"src",
+			"/api/link-preview?imageUrl=https%3A%2F%2Fexample.com%2Fpreview.jpg",
+		);
 		expect(container.querySelectorAll("header p")).toHaveLength(0);
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_1");
@@ -187,6 +248,10 @@ describe("TimelineCard", () => {
 		expect(screen.queryByText("not bookmarked")).not.toBeInTheDocument();
 		expect(screen.queryByText("Reposted tweet")).not.toBeInTheDocument();
 		expect(screen.queryByText(/RT @ava/)).not.toBeInTheDocument();
+		expect(screen.getByRole("link", { name: /^Open on X/ })).toHaveAttribute(
+			"href",
+			"https://x.com/i/status/tweet_original",
+		);
 
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_original");
@@ -241,6 +306,10 @@ describe("TimelineCard", () => {
 		expect(screen.getByText("Original app idea")).toBeInTheDocument();
 		fireEvent.click(screen.getByRole("button", { name: "Reply" }));
 		expect(onReply).toHaveBeenCalledWith("tweet_manual");
+		expect(screen.getByRole("link", { name: /^Open on X/ })).toHaveAttribute(
+			"href",
+			"https://x.com/i/status/tweet_manual",
+		);
 
 		const row = container.querySelector("[data-perf='timeline-card']");
 		if (!row) throw new Error("timeline card missing");
@@ -330,6 +399,16 @@ describe("TimelineCard", () => {
 		expect(
 			await screen.findByText("Original conversation"),
 		).toBeInTheDocument();
+		const thread = screen.getByRole("region", { name: "Conversation" });
+		const threadLinks = within(thread).getAllByRole("link", {
+			name: /^Open on X/,
+		});
+		expect(threadLinks.map((link) => link.getAttribute("href"))).toEqual([
+			"https://x.com/i/status/tweet_original",
+			"https://x.com/i/status/tweet_original_reply",
+		]);
+		fireEvent.click(threadLinks[1]!);
+		expect(thread).toBeInTheDocument();
 	});
 
 	it("keeps link preview cards on native retweets", () => {
@@ -489,7 +568,12 @@ describe("TimelineCard", () => {
 		expect(
 			screen.getByRole("link", { name: "example.com/kept" }),
 		).toBeInTheDocument();
-		expect(screen.getAllByText("example.com/kept").length).toBeGreaterThan(1);
+		expect(screen.getAllByText("example.com/kept")).toHaveLength(1);
+		expect(
+			screen.getByRole("link", {
+				name: "Open example.com/kept (opens in a new tab)",
+			}),
+		).toHaveAttribute("href", "https://example.com/kept");
 	});
 
 	it("renders direct image URL cards with the image immediately", () => {
@@ -724,6 +808,61 @@ describe("TimelineCard", () => {
 		).toHaveAttribute("href", "https://t.co/1b11HHQIBA");
 		expect(
 			document.querySelector("[data-perf='link-preview-card']"),
+		).toBeNull();
+	});
+
+	it("expands Twitter Articles and hides their shortlinks", () => {
+		const { container } = render(
+			<TimelineCard
+				item={{
+					...item,
+					id: "2066182223213293753",
+					text: "A frontier without an ecosystem is not stable",
+					entities: {
+						urls: [
+							{
+								url: "https://t.co/vLmiBKTtX3",
+								expandedUrl: "https://x.com/i/article/2065582894790365184",
+								displayUrl: "x.com/i/article/2065…",
+								start: 0,
+								end: 0,
+							},
+						],
+						article: {
+							title: "A frontier without an ecosystem is not stable",
+							previewText: "I have been thinking about the future of the firm.",
+							url: "https://x.com/satyanadella/status/2066182223213293753",
+						},
+					},
+					media: [],
+					mediaCount: 0,
+					replyToTweet: null,
+					quotedTweet: null,
+				}}
+				onReply={vi.fn()}
+			/>,
+		);
+
+		expect(
+			screen.getByRole("link", {
+				name: "Read article: A frontier without an ecosystem is not stable",
+			}),
+		).toHaveAttribute(
+			"href",
+			"https://x.com/satyanadella/status/2066182223213293753",
+		);
+		expect(
+			screen.getByText("I have been thinking about the future of the firm."),
+		).toBeInTheDocument();
+		expect(
+			screen.getAllByText("A frontier without an ecosystem is not stable"),
+		).toHaveLength(1);
+		expect(screen.queryByText(/t\.co\/vLmiBKTtX3/)).toBeNull();
+		expect(
+			container.querySelectorAll("[data-perf='tweet-article-card']"),
+		).toHaveLength(1);
+		expect(
+			container.querySelector("[data-perf='link-preview-card']"),
 		).toBeNull();
 	});
 
