@@ -1,12 +1,7 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { ComponentType } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderWithQueryClient as render } from "#/test/render";
 
 vi.mock("#/components/TimelineCard", () => ({
 	TimelineCard: ({
@@ -133,7 +128,9 @@ describe("mentions route", () => {
 			expect(queryUrl?.searchParams.get("replyFilter")).toBe("all");
 		});
 
-		fireEvent.click(screen.getByRole("button", { name: "@steipete signal" }));
+		fireEvent.click(
+			await screen.findByRole("button", { name: "@steipete signal" }),
+		);
 		expect(fetchMock).not.toHaveBeenCalledWith(
 			"/api/action",
 			expect.anything(),
@@ -192,11 +189,12 @@ describe("mentions route", () => {
 		render(<MentionsRoute />);
 
 		expect(await screen.findByText("@steipete fresh")).toBeInTheDocument();
+		const initialQueryCount = queryUrls.length;
 		fireEvent.click(screen.getByRole("button", { name: "Sync mentions" }));
 
 		await waitFor(() => {
 			expect(syncBodies).toEqual([{ kind: "mentions" }]);
-			expect(queryUrls.at(-1)?.searchParams.get("refresh")).toBe("1");
+			expect(queryUrls.length).toBeGreaterThan(initialQueryCount);
 		});
 		expect(screen.getByText("Synced 7 items")).toBeInTheDocument();
 	});

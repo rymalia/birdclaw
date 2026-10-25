@@ -1,11 +1,451 @@
 # CHANGELOG
 
-## 0.6.1 - Unreleased
+## 0.16.4 - Unreleased
+
+## 0.16.3 - 2026-10-24
+
+**Highlights:** Keep Git backups flowing after locally merged legacy profiles or stray Finder metadata, with strict identity proof and backup validation intact.
+
+- Fix backup sync failing on legacy profile rows whose handles moved to canonical profiles; fold proven identities and their references into the canonical rows during merge-import.
+- Ignore regular macOS `.DS_Store` metadata in backup data validation and exclude it from backup commits while retaining strict checks for other unexpected content and symlinks.
+
+## 0.16.2 - 2026-10-23
+
+**Highlights:** Refresh runtime dependencies while retaining the tested Bun, Node, and jsdom compatibility boundaries.
+
+- Refresh TanStack Router/Start, Effect 3, Lucide, and Vite while preserving the pinned Bun toolchain, Node runtime floor, and jsdom compatibility pin.
+
+## 0.16.1 - 2026-10-20
+
+**Highlights:** Refresh icons and runtime dependencies while preserving the tested Bun, Node, and jsdom compatibility boundaries.
+
+- Update Lucide icons to 1.60.0 while retaining the existing runtime and test-environment compatibility pins.
+- Refresh React Query, Effect 3, Lucide, and formatting/lint tooling while retaining the pinned Bun toolchain and Node runtime floor.
+- Update TanStack Router/Start and Lucide while retaining the pinned Bun toolchain, Node runtime floor, and jsdom compatibility pin.
+
+## 0.16.0 - 2026-10-16
+
+**Highlights:** Resume authored sync with Bird, save your automatic transport preference, and recover more shortened links.
+
+- Add resumable Bird authored sync and a saved automatic transport preference while preserving explicit modes, account checks, and transport-specific cursors. (#231 — thanks @transitive-bullshit)
+- Resolve `t.co` HTTP redirects, retry old false expansion hits during normal link backfill, and trim parenthesized text after short links. (#233 — thanks @mihailmariusiondev)
+- Refresh React, TanStack, Mapbox, Zod, and test/lint dependencies while preserving the pinned Bun toolchain, Node runtime floor, and jsdom compatibility pin.
+- Refresh TanStack Router/Start, Lucide, Playwright, Vite, and Node types; retain the tested Bun toolchain and jsdom compatibility pin.
+- Update compatible runtime, build, and test dependencies while retaining the pinned Bun toolchain, Node runtime floor, and jsdom compatibility pin.
+
+## 0.15.0 - 2026-09-22
+
+**Highlights:** Search local tweets by author and keep archive imports safe from malformed data and split UTF-8 text.
+
+- Filter local tweets by author with `--author` or `from:handle`, including saved posts and bounded MCP searches. (#226 — thanks @eferm)
+- Reject malformed archive arrays and non-object records before merge or restore can change stored tweets or search rows.
+- Dismiss open conversations when tapping plain feed text on touchscreens; preserve desktop click-to-open, explicit Thread controls, links, and text selection. (#225 — thanks @sahil7886)
+- Preserve UTF-8 text across archive extraction chunks and reject truncated data arrays before merge or restore can change stored rows.
+
+## 0.14.0 - 2026-09-14
+
+**Highlights:** Play videos and GIFs directly in the feed, explore faster follower maps, share archived conversations with permalinks, and run live workflows without Bird.
+
+- Play tweet videos and GIF clips directly in the feed with posters and native controls, choose playable video variants, and make link previews compact with readable metadata and no repeated URLs or empty image panels.
+- Load large follower maps through cached server-side clustering and paginated viewport reads, preserving full-network search and counts while avoiding full-profile downloads and geocoding delays during navigation.
+- Add shareable `/tweets/<id>` permalinks that open saved conversations, highlight and focus the selected reply, and work in read-only archives with clear missing-post and limited-context states.
+- Make bird optional across live workflows: verify xurl moderation directly, add native cookie-backed DM requests and accept/reject/block actions, preserve DM account selection and invalidate all transport caches, and provide xurl defaults/fallbacks for sync and profile enrichment.
+- Keep Bird optional in scheduled account sync, enable manual and automatic web DM sync for secondary accounts, and reject malformed native DM page containers instead of reporting empty success.
+- Speed up account feeds, saved posts, Inbox, and archive navigation with bounded page selection and shared read-only response caches; preserve sparse matches and rolling date windows, and add a full-page performance audit.
+- Speed up map pagination, search, and panning by reusing bounded viewport and cluster-preview caches, normalizing search text once per profile, and avoiding repeated coordinate calculations; add a reproducible map CPU benchmark.
+- Build read-only maps from compact rows, sort only located groups, and batch visible profile metadata within one SQLite snapshot; accelerate Following and Mutual maps with directional index lookups while preserving full-network search, counts, and GeoJSON output.
+- Speed up uncached Videos queries by rejecting unrelated URLs before exact host checks, and reduce map construction work by grouping locations in one pass while preserving point order and counts.
+- Make search updates incremental through indexed document lookups, skip unchanged text in small updates, and share final-content indexing across sync, replies, imports, and backup merges; reuse rolling Links results until a time boundary or database change alters their inputs.
+- Speed up large DM syncs with one batched search-index deletion, avoid sorting timestamp ties during tweet selection, and cover current network-map membership with a partial SQLite index; add a reproducible SQLite read/write audit.
+- Compile shared API response and report-event validators once with Zod 4.6.5 to speed repeated feed, DM, and map validation while preserving defaults, media normalization, and detailed errors.
+- Keep read-only maps cached through unrelated sync commits, refresh display metadata without rebuilding clusters, honor geocode-suppression expiry, and use a spatial grid for faster panning; schema 14 adds transactional map revision counters and requires writable initialization before read-only serving.
+- Reject empty map benchmark paths before they can fall back to the default archive.
+- Update TanStack Router to 1.170.36, TanStack Start to 1.168.53, Zod to 4.6.4, and compatible transitive dependencies.
+
+## 0.13.0 - 2026-09-13
+
+### Highlights
+
+- **Keep the full post.** Preserve long-form X Note Tweets across sync, search, and backups, and expand them directly in the timeline.
+- **Jump from the archive to X.** Open posts, quoted tweets, and conversations on X from their archive cards, including in read-only deployments.
+- **Read saved records from the CLI.** Look up individual tweets, threads, and DM conversations in the selected account, with JSON output for scripts.
+- **Spend less time waiting.** Start the CLI faster and reduce repeated profile and history work during sync and identity searches.
+
+### Upgrade notes
+
+- Note Tweet storage adds SQLite migration 11. Prepare existing read-only archive snapshots with writable initialization before serving the updated application.
+- Backups remain interoperable with schema-8 readers and writers. Older writers retain full Note Tweet text but omit the optional Note Tweet marker. (#134)
+
+### Fixes and improvements
+
+- Preserve full Note Tweet text and entities through live ingestion, search, archive and backup merges, and expandable timeline rendering. (#134 — thanks @eferm)
+- Add **Open on X** links to feed cards, parent and quoted tweets, and expanded conversations. Reposts open the original tweet when its ID is known. (#189)
+- Show “no threads” in feed cards when no other archived replies are found, instead of opening an empty conversation panel. (#207)
+- Add account-scoped `show tweet`, `show thread`, and `show dm` commands with JSON output, plus `db vacuum` to reclaim unused SQLite space. (#192)
+- Honor `--json` for parser and uncaught runtime failures and server startup, expose global options in nested help, and validate the server port before startup. (#190)
+- Validate numeric CLI options before account lookups or command work, preventing negative limits from requesting unlimited DM results and rejecting invalid score thresholds. (#192)
+
+### Performance
+
+- Reduce CLI startup time by bundling the used Effect modules while keeping other direct dependencies external. (#193)
+- Reconcile each tweet author once per ingested payload, avoiding repeated profile and history work for posts and included references by the same author. (#200)
+- Bound profile-history reads in SQLite, omit unused raw payloads, and index historical follower membership, follow events, and list owners by profile to avoid repeated full-table scans. (#194, #195)
+
+### Developer tools and maintenance
+
+- Add opt-in numeric CLI timing summaries for elapsed time, process CPU, and database work without exposing queries or archive contents. (#191)
+- Consolidate backup merge declarations, API data types, transport pagination, CLI streams, and input-error handling while preserving command output and archive compatibility. (#196, #202, #203)
+- Give digest, discussion, and profile analysis one lifecycle for request construction, persistence, cache replay, and completion events; retain refresh, citation, and streaming behavior. (#206)
+- Share parsing of profile URL entities and identity index insertion rules, and consolidate automatic backup setup and result handling while retaining freshness checks and sync behavior. (#204)
+- Stabilize backup integration tests under slow filesystem I/O with focused fixtures and independent invalid-path cases, retaining real durability and publication checks. Exercise local JSON commands and failures through installed Node and Bun packages. (#190, #205)
+- Update Hono to 4.13.7 and the development/CI Node pin to 26.8.2; installed-package checks retain the Node 26.5.1 minimum. (#201)
+
+## 0.12.6 - 2026-09-12
+
+### Highlights
+
+- **Fresh mentions, even during a backfill.** Refresh the newest mentions without abandoning older pages, with native commands for checking the latest activity and resuming history.
+- **A faster everyday archive.** Feeds, Inbox, search, maps, and long DM conversations do less unnecessary work, while the browser and CLI start with fewer dependencies.
+- **More reliable images.** Avatars and link-preview thumbnails recover when local cached images are missing, including in read-only archives and network maps.
+
+### Fixes and improvements
+
+- Add `sync mentions --latest` and `--resume`. Newest-page reads preserve pending continuations, resumed scans retain their original boundaries, and JSON output reports the scan intent, position, and check time. Web and scheduled account refreshes now request current mentions. (#186)
+- Restore avatar fallbacks throughout profiles and maps, and include original-author profiles when syncing reposts and quoted tweets. (#146, #150, #152)
+- Restore external link-preview thumbnails through a bounded image cache, and cancel obsolete preview work so navigation does not leave new cards waiting behind abandoned requests. (#145, #153)
+- Keep hover previews correctly positioned and unclipped when their layout or content changes. (#167)
+- Preserve deterministic timeline ordering at page boundaries while selecting posts before loading their rich metadata. (#183)
+
+### Performance
+
+- Page long DM histories and cache the selected conversation independently of list filters. Earlier messages remain accessible, and complete CLI/API reads keep their existing behavior. Reuse sender profiles and avoid rerendering unchanged conversations while composing. (#182)
+- Speed up feeds, Inbox, and search by selecting and ranking narrow candidate rows before loading full content. Batch cited tweets, reposts, mention profiles, links, and conversation enrichment instead of repeating lookups per item.
+- Reduce startup requests and browser JavaScript, bootstrap authorized read-only status with the page, reuse validated read-only queries until the database changes, and serve compact versioned branding assets.
+- Make map interactions smoother by reusing profile ordering while panning and zooming. Reuse formatters, pause timestamp updates in hidden tabs, and skip unchanged timeline renders.
+- Speed up large archive imports and live sync by rebuilding tweet and DM search entries in batches instead of repeatedly scanning the full index. (#184, #185)
+- Reduce SQLite allocation and preparation work and reuse a bounded statement cache.
+- Start CLI help and local commands with fewer imports; standalone version checks return directly from package metadata.
+
+## 0.12.5 - 2026-09-12
+
+### Highlights
+
+- Serve a prepared Birdclaw archive in an explicit, opt-in read-only deployment mode.
+
+### Changes
+
+- Add `BIRDCLAW_DEPLOYMENT_READ_ONLY=1` for cached archive deployments, using strict database readers and suppressing automatic backup synchronization and cache population.
+- Reject mutating HTTP operations, live-generation routes, and transport subprocesses while retaining cached archive and authenticated MCP reads.
+- Hide unavailable navigation, reply composers, and sync controls in read-only mode, including automatic sync timers, while preserving normal interactive behavior and recovery pages.
+
+## 0.12.4 - 2026-09-11
+
+### Highlights
+
+- Choose the home-timeline transport used by digests through a deployment-wide environment default.
+
+### Changes
+
+- Add `BIRDCLAW_DIGEST_LIVE_MODE` for `today`, `digest`, and the digest API, preserve explicit overrides and the existing Xurl default, and report the selected home-timeline mode accurately. (#143 — thanks @sahil7886)
+- Refresh React, TanStack Router and Start, Effect, Zod, Lucide icons, Vite, and lint/type tooling while retaining the pinned Bun canary and Node 26 compatibility floor.
+
+## 0.12.3 - 2026-09-07
+
+### Highlights
+
+- Recover retained live-search results locally after an interrupted discussion without repeating paid API reads.
+
+### Changes
+
+- Expose retained keyword matches through `search tweets --resource search` and report saved pages and unique tweets when a later Xurl search request fails. (#138, #141 — thanks @sid-ravikumar)
+- Refresh TanStack Router and Start patch releases while retaining the pinned Bun canary and Node 26 compatibility floor.
+
+## 0.12.2 - 2026-09-05
+
+### Highlights
+
+- Keep local archives intact across interrupted live searches, account-scoped restores, profile identity changes, and recoverable Git backup failures.
+
+### Changes
+
+- Preserve completed Xurl search pages when a later request fails, keeping fetched tweets locally searchable without treating an interrupted discussion as complete. (#138 — thanks @sid-ravikumar)
+- Resume bounded Xurl Likes and Bookmarks backfills from an explicit pagination token without reusing the head-page cache. (#126 — thanks @eferm)
+- Scope replacement archive imports to the primary account's archive-owned data so other accounts, unrelated datasets, and live cursors survive.
+- Preserve numeric profile identities, history, affiliations, and dependent references through legacy rekeys, handle reuse, case-fold collisions, handoffs, swaps, and backup merges; retain rich display names and handle-less DM avatars from sparse payloads.
+- Recover Git backups safely with renewable token-owned leases, validated manifests and journal paths, fsynced publication receipts, repository identity checks, and preservation of unrelated staged files; support validated non-Git exports into empty remotes and roll back failed promotions when safe.
+- Keep backup remote credentials redacted without losing endpoint identity, reject live or cross-host lease takeover, validate receipt roots, and recover through writable transaction locations.
+- Persist authored and profile-analysis tweets through canonical ingestion so sparse refreshes preserve media, rich videos, included context, edit history, and full-text indexes.
+- Make pagination, cache freshness, account verification, saturation, and completeness conservative across timelines, mentions, authored tweets, saved collections, DMs, follow graphs, and Lists; apply consistent ID and handle account selection to follow and network views.
+- Report scheduled account syncs as failed when backup export fails, and renew job leases atomically so overlapping runs remain blocked.
+- Reject invalid LaunchAgent intervals before writing a plist, invalid search limits before archive reads, and non-finite DM follower filters or inbox scores before querying; preserve valid numeric spellings, zero search limits, fractional thresholds, and link-search coercion. (#137, #133, #132 — thanks @devYRPauli)
+- Register `archive find` and `db stats` as strict nested commands, reject unknown subcommands, and return structured HTTP 400 responses for invalid query resources.
+- Refresh mapping and icon libraries, adopt Vitest 5 and Playwright 1.63, update lint/type tooling and pinned GitHub Actions, and retain the checksum-pinned Bun canary and Node 26 compatibility floor.
+- Remove obsolete query and transport facades in favor of their owning read-model, action, and Effect modules, and extend synthetic coverage for identity collisions, atomic cursors, backup recovery, hidden data, corrupt remotes, large shards, and diverged histories.
+
+## 0.12.1 - 2026-08-08
+
+### Changed
+
+- Move source installs, dependency locking, builds, tests, CI, Pages, and source-backed launchd jobs to the checksum-pinned Bun `1.4.0-canary.1+f972c287f` Rust-port runtime while retaining the public Node 26 npm/Homebrew contract.
+
+### Fixed
+
+- Serve web/API reads from the current local snapshot while backup freshness runs in the background, skip unchanged manifest imports, recycle readers after bulk imports, and avoid the duplicate unscoped Home request before account selection resolves.
+- Preserve the original spelling of valid HTTP URLs during backup import so non-canonical but distinct URL-expansion keys round-trip instead of collapsing onto one normalized key.
+- Keep common-term FTS timeline searches bounded under Bun's SQLite 3.51 planner by pinning the dense index and join order and capping match preflight work.
+
+### Testing and maintenance
+
+- Refresh all direct and transitive dependencies to current stable releases and remediate Hono and nanoid security advisories.
+- Add Bun/Istanbul and Node/V8 coverage lanes, dual-runtime installed-package smoke, Playwright against the built Bun production server, and explicit runtime performance metadata.
+
+## 0.12.0 - 2026-08-02
+
+### Highlights
+
+- Expand the explicit fixed-origin FxTwitter transport with public thread, conversation, profile, and bounded search imports while treating ambiguous or interrupted collections conservatively and preserving only positive observations.
+
+### Added
+
+- Add typed FxTwitter failures, cursor-aware public search, conservative partial-state metadata, monotonic canonical provenance, portable fetch/observation shards, and fixture coverage for silent truncation, cursor anomalies, rate limits, and mid-pagination failures. (#99)
+
+### Fixed
+
+- Stream portable database fingerprint rows after the import transaction commits and skip recursive topology rewrites for canonical singleton revisions, reducing large Birdclaw backup imports from hour-scale work to seconds while keeping the same deterministic fingerprint contract.
+
+### Docs
+
+- Rewrite the README around the zero-auth demo, archive-first setup, and progressive links into the documentation site.
+
+### Dependencies and maintenance
+
+- Refresh transitive lockfile resolutions for baseline-browser-mapping 2.11.10, jose 6.2.7, and tinyexec 1.3.0.
+
+## 0.11.2 - 2026-08-01
+
+### Fixed
+
+- Reject negative, fractional, and non-numeric follow-graph `--limit` values before SQLite can treat them as unbounded or return a driver error. (#110 — thanks @devYRPauli)
+
+### Dependencies and maintenance
+
+- Move development and CI to Node 26.5.1 and pnpm 11.18.0 with explicit dependency build approvals; refresh direct packages, lockfile resolutions, and GitHub Actions.
+
+## 0.11.1 - 2026-07-27
+
+### Highlights
+
+- Preserve explicit X archive deletions and observable edit history as portable, source-attributed records without exposing deleted or superseded tweet bodies in active views.
+- Merge archive and backup imports by default so an incomplete snapshot cannot erase destination-only data; exact replacement remains available through explicit `--restore` mode.
+
+### Added
+
+- Preserve explicit X archive deletions as source-attributed tweet, media, and quote tombstones.
+- Retain observable X edit chains as portable revision records while hiding superseded bodies from active views.
+
+### Changed
+
+- Merge archive and backup imports by default so incomplete snapshots never delete destination-only rows; use explicit `--restore` for exact replacement.
+
+### Dependencies and maintenance
+
+- Refresh compatible dependency resolutions, including React 19.2.8, Mapbox GL 3.27.0, Playwright 1.62.0, and Oxlint 1.75.0, without widening declared ranges.
+- Update the remaining pinned test/build tools and override the MCP SDK's Hono server dependency to the patched 2.x line.
+
+## 0.11.0 - 2026-07-18
+
+### Highlights
+
+- Choose an existing account independently for each live operation without changing the database's persistent account identity.
+- Start a fully local sample archive with `init --demo` for immediate zero-auth exploration.
+
+### Added
+
+- Select existing accounts per live operation with `--account <username>` or `accounts.default`, including sync, profile hydration, DMs, compose, moderation, and scheduled jobs, without changing persistent database identity. (idea from #97 - thanks @ivankuznetsov)
+- Add explicit `init --demo` sample data for zero-auth offline exploration while keeping normal initialization empty.
+
+### Fixed
+
+- Keep `birdclaw db stats` local-only so it does not block on unrelated macOS archive discovery.
+
+### Dependencies and maintenance
+
+- Update `lucide-react` to 1.25.0, `@tanstack/react-start` to 1.168.30, and the pnpm 10 release pin to 10.34.5.
+
+## 0.10.0 - 2026-07-17
+
+### Highlights
+
+- Connect agents to account-scoped cached tweet search and thread research through a disabled-by-default, bearer-authenticated read-only MCP endpoint.
+- Import named public tweets without X credentials through an explicit read-only FxTwitter opt-in, with durable provenance and third-party disclosure guidance.
+- Run Bird-backed live workflows on Windows through trusted Git Bash discovery, portable-install overrides, and preserved subprocess diagnostics.
+- Move to Node 26.5.0, current direct dependencies, and xurl-first live-transport onboarding while retaining existing private Bird compatibility.
+
+### Added
+
+- Add a disabled-by-default, bearer-authenticated read-only MCP endpoint with strict account, storage, virtual-host, origin, path, request-size, concurrency, and result-size isolation; expose only cached tweet search and thread tools, excluding DMs, live X, OpenAI, filesystem access, and writes. (#95)
+- Add explicit public-tweet import through the fixed read-only FxTwitter endpoint, reject redirects and custom origins, persist `fxtwitter` source rows through backup schema v5, and document the requested-ID and network-metadata disclosure. (#103; proposal #99 - thanks @0xdevalias)
+
+### Transport and platform
+
+- Run Bird subprocesses through trusted Git Bash discovery on Windows, preserve slash-prefixed arguments and diagnostics, and support a documented `BIRDCLAW_BASH_COMMAND` override for portable Git installations. (#94 - thanks @kristofer-atlas)
+- Recommend xurl for new live-transport setups, remove deprecated public Bird installation/repository guidance, preserve existing private Bird compatibility, and report unavailable xurl states as local/archive mode. (#100; issue #93 - thanks @TheAngryPit)
+- Move the supported runtime from EOL Node 25.8.1 to Node 26.5.0, adopt TypeScript 7, and refresh all compatible direct runtime and development dependencies. (#102)
+
+### Testing and maintenance
+
+- Stabilize filtered mention rendering coverage by waiting for the refetched card before exercising reply behavior. (#101)
+- Refresh compatible transitive lockfile resolutions after verifying every direct runtime and development dependency is current. (#104)
+
+## 0.9.5 - 2026-07-06
+
+### Fixed
+
+- Keep desktop sidebar labels visible by applying screen-reader-only styling only below the compact breakpoint. (#91 - thanks @MarkVillacampa)
+
+## 0.9.4 - 2026-07-05
+
+### Fixed
+
+- `search tweets` now returns in well under a second on large archives (previously ~60s, minutes for common terms): the FTS5 match set is materialized once instead of SQLite re-running the MATCH scan per timeline edge row, the join order adapts to term frequency, the LIMIT is resolved on an id-only inner query, and snippets are computed only for returned rows.
+
+## 0.9.3 - 2026-07-04
+
+### Changed
+
+- Modernize Effect usage across the transports: hidden 429 retries now run through a composed `Schedule` (capped exponential backoff, deadline- and abort-aware), transport/auth lookups are memoized with `Effect.cachedWithTTL`, xurl failures carry a typed `XurlCommandError` with structured rate-limit classification, link-preview DNS resolution uses `Effect.timeoutFail`, xurl/bird operations are traced `Effect.fn` spans, and live read paths call Effect transports directly instead of round-tripping through Promise wrappers.
+
+## 0.9.2 - 2026-07-04
+
+### Fixed
+
+- Split oversized backup JSONL outputs into deterministic 48 MiB part files and serialize and validate them sequentially, keeping large archives below hosted Git limits without Git LFS.
+
+## 0.9.1 - 2026-07-02
+
+### Added
+
+- Route inbox scoring and Responses API requests through `BIRDCLAW_OPENAI_BASE_URL`, retain `OPENAI_BASE_URL` as a compatibility fallback, and add opt-in OpenAI transport diagnostics. (#89 - thanks @martintrojer)
+
+### Fixed
+
+- Correct the seeded local account handle, display name, user ID, and stale avatar from the authenticated Bird identity during explicit profile hydration. (#88 - thanks @martintrojer)
+
+## 0.9.0 - 2026-07-02
+
+### Added
+
+- Add explicit, rate-limited owned X List sync through Bird or xurl, durable List/member metadata with completeness state, deterministic backup shards, local List inspection, and `--list` / `--list-id` tweet search filters. (#65)
+- Add opt-in, per-account Home and Mentions auto-sync with persisted intervals, overlap protection, hidden-page pauses, visible status, and failure backoff. (#73 - thanks @Gatsby1s)
+
+### Changed
+
+- Refresh runtime and development dependencies to current supported releases, including Vite 8.1, Node 26 type definitions, and the July 1 TypeScript native preview.
+
+### Fixed
+
+- Restore web Likes and Bookmarks sync when automatic transport selection falls back to Bird without all-pages mode. (#87 - thanks @zuyu)
+- Bundle the TanStack Start H3 runtime into production server artifacts so installed npm packages can start without undeclared transitive dependencies.
+- Add completed Today digest PDF export with route-scoped print styling, while excluding partial failed streams. (#77 - thanks @Gatsby1s)
+- Make the Today digest's selected period visually distinct and expose its pressed state to assistive technology. (#72 - thanks @Gatsby1s)
+- Keep backup Git commits inside the configured repository root and pin hashed backup text files to LF line endings. (#79 - thanks @rodriguez46p-ui)
+- Persist profile avatars exposed by Bird's full live-sync payloads. (#75 - thanks @RajvardhanPatil07)
+- Persist quoted tweet payloads returned by Bird-backed live syncs so quote cards render without a separate hydrate. (#76 - thanks @lukaskawerau)
+- Keep included quote-only replies out of local replied/unreplied state during collection and thread-context syncs. (#76 - thanks @lukaskawerau)
+- Show full tweet text in Today citation popovers instead of truncating long posts after six lines.
+- Show inline tweet images in Today citation popovers instead of leaving media-only `t.co` links in the preview text.
+
+## 0.8.5 - 2026-06-21
+
+### Fixed
+
+- Keep large Likes, Bookmarks, and Today digest reads on indexed tweet lookups instead of blocking the web server with quadratic SQLite scans.
+- Normalize legacy tweet URL entities at the API boundary so saved and quoted tweets remain readable without expanded-link metadata.
+
+## 0.8.4 - 2026-06-19
+
+### Changed
+
+- Ship compiled CLI and production SSR/static artifacts, remove runtime TypeScript and Vite requirements, and validate installed npm tarballs end to end.
+- Normalize tweet ownership and saved state into account edges and collections, add transactional schema migrations, and preserve older databases and backups through boundary adapters.
+- Consolidate API schemas, NDJSON clients, React Query caches, profile codecs, moderation state, scheduled jobs, and live pagination while deleting superseded runtime paths.
+- Split archive import, portable backup codecs, and CLI command registration into domain-owned modules with shared contract tests.
+- Refresh runtime and development dependencies and resolve esbuild 0.28.1, clearing the active dependency advisory.
+- Rank link insights with a lightweight first pass and hydrate only the requested top groups, substantially reducing all-time Links latency.
+
+### Fixed
+
+- Preserve backup JSONL rows containing Unicode line or paragraph separators during export and import. (#62 - thanks @uwe-schwarz)
+- Derive unauthenticated local API access from the production server peer socket so spoofed host headers cannot bypass remote-access controls.
+- Normalize legacy stored media types at the API boundary so older archives and backups remain readable through typed response contracts.
+
+## 0.8.3 - 2026-06-15
+
+### Changed
+
+- Centralize SQLite writes and migrations, unify live-sync ingestion, and move retained web server state to TanStack Query for faster sidebar navigation and fewer duplicate reads.
+- Isolate web reads onto query-only SQLite connections while serializing action and sync writes through one measured writer queue.
+- Share page caps, cursor progression, delays, and repeated-cursor protection across live timeline, DM, and follow-graph sync.
+- Stream archive arrays and backup JSONL records through resumable batches instead of buffering entire source files.
+- Split query access into typed timeline, DM, status, resource, and action modules while retaining the existing compatibility import.
+- Retain Blocks, Inbox, Data Sources, and Rate Limits server state in TanStack Query across sidebar navigation and targeted refreshes.
+- Split compose, inbox, follow-graph, database, and backup CLI registration into domain-owned command modules.
+
+### Fixed
+
+- Preload hover-preview avatars after page load so citation and profile cards open with cached thumbnails.
+
+## 0.8.2 - 2026-06-15
+
+### Fixed
+
+- Wait for concurrent SQLite writers before starting write transactions and avoid unnecessary legacy backfill writes during normal startup.
+- Retain timeline and DM data across sidebar navigation, deduplicate status reads, debounce searches, skip unused Spotlight archive scans in web status, and remove TanStack debug controls.
+- Keep tweet and profile hover previews outside wrapped links, flip them to the roomier vertical side, and constrain them to the viewport.
+- Expand Twitter Articles into titled preview cards and citation popovers instead of showing bare `t.co` links.
+
+## 0.8.1 - 2026-06-13
+
+### Changed
+
+- Refresh dependency backstop updates for `@steipete/sweet-cookie`, `@types/node`, the adopted TypeScript native-preview toolchain, and the pnpm 10 package-manager pin.
+- Remove the separate public read-only web profile; deployments can expose the full private app behind an external authentication boundary.
+- Show recent web timestamps as live relative time, then switch to calendar dates with exact local time on hover.
+
+### Fixed
+
+- Open long-running AI streams immediately, keep the Today digest within proxy limits by using the locally synchronized archive, and show actionable retry errors when a connection is interrupted.
+- Reuse freshly generated Today reports across reloads while background sync updates the archive, and hydrate locally stored cited tweets so source hovercards remain available outside the selected time window.
+
+## 0.8.0 - 2026-06-10
+
+### Added
+
+- Add localized Today/digest reports through `--language <locale-id>`, `BIRDCLAW_DIGEST_LANGUAGE`, and the period-digest API, with canonical locale validation and separate caches. (#47 - thanks @yujiawei)
+
+### Changed
+
+- Update runtime and development dependencies, align TanStack Start packages, and move pnpm's native build allowlist into workspace configuration.
+
+### Fixed
+
+- Add accurate archive-first Sign in and archive-request onboarding, including account-binding requirements, current xurl/bird setup, scoped transport selection, and clean autolink rendering. (#46 - thanks @peetzweg)
+- Respect `OPENAI_BASE_URL` when sending Today/digest requests to OpenAI-compatible API endpoints.
+- Anchor Link Insights' Today range to UTC midnight so it matches stored `created_at` timestamps across local time zones.
+
+## 0.7.0 - 2026-06-01
 
 ### Added
 
 - Stream live `birdclaw import archive` progress to stderr: per-slice parsing ticks (tweets, DMs, likes, bookmarks, follows, media) and chunked write-phase progress every 1,000 rows for profiles, tweets, likes+bookmarks, and DM messages. `--json` still keeps stdout clean for scripting.
 - Add `birdclaw discuss <query>` and a Discuss web view for live keyword search via `bird`/`xurl`, persisted search-result tweets, and streaming OpenAI summaries with optional private DM context.
+- Add `birdclaw profile-analyze <handle>` plus a Profile Analyse web view that backfills profile timelines and conversation context through `xurl`, caches the fetched context and AI result in SQLite, and exposes Analyse actions on tweet cards.
+- Add canonical `/profiles/:handle` pages with profile headers and cached Profile Analyse output.
+- Add a Rate Limits web view for observed `xurl` profile-analysis calls, 429s, local throttle settings, and documented X API recent-search windows.
+- Add a Network Map web view for current followers/following, with SQLite geocode caching, OpenCage refreshes, Mapbox rendering, and a local fallback map.
+- Render Network Map clusters as avatar stacks with relationship-weighted rings and avatar-rich profile/cluster overlays.
+- Make the Network Map people list follow the current viewport with an in-view search panel.
+- Add a Data Sources web view showing Birdclaw, bird, and xurl health, authenticated accounts, and automatic fallback order.
 - Prefetch cached avatars for Discuss hover citations so source previews avoid fallback initials once profile metadata includes an avatar URL.
 - Refresh Today digests from live `xurl` home timelines, mentions, and mention conversations before AI analysis so reports see more current context and reply parents.
 
@@ -15,11 +455,31 @@
 
 ### Fixed
 
+- Implement `birdclaw auth use <auto|bird|xurl>` so the documented command persists the preferred moderation action transport. (#45 - thanks @peetzweg)
+- Keep `birdclaw init` alive when the macOS Downloads scan is blocked, falling back to the other archive discovery paths. (#44 - thanks @peetzweg)
 - Show live Today fetch progress while Birdclaw pulls X home timeline, mentions, and reply context before the first AI tokens arrive.
 - Include live fetch counts and page/thread progress in Today status messages before AI summary streaming begins.
 - Recover live `xurl` sync when the valid OAuth token is stored under a different local xurl username label than the Birdclaw account handle.
+- Keep Profile Analyse citation hover cards linked to real tweet/avatar sources, throttle `xurl` conversation searches, and retry 429s before continuing AI summaries with partial context.
+- Open `/profiles/:handle` analysis streams immediately, use same-origin profile fetches, and let `BIRDCLAW_PROFILE_ANALYSIS_ACCOUNT` select the xurl account used for profile backfills.
+- Keep Profile Analyse headers from slicing through loaded avatars/names and turn unresolved numeric tweet citations into safe X source links without leaking raw IDs.
+- Group adjacent Profile Analyse tweet citations so cached AI reports show numbered source links instead of repeated generic `source` labels.
+- Highlight hydrated Profile Analyse `@handle` mentions with profile previews and link multi-source citations to readable clauses when possible.
+- Hydrate Profile Analyse header bio `@handle` mentions as soon as the profile context loads, so affiliation-style bios show profile hover previews.
+- Flip tweet and profile hover previews above their trigger when there is not enough room below.
+- Show expanded URLs instead of `t.co` shortlinks in tweet citation hover previews whenever tweet URL entities are available.
+- Show expanded URLs instead of `t.co` shortlinks in Profile Analyse account bios when X description URL entities are available.
+- Keep emoji-bearing profile bios and media tweets aligned with X entity ranges, and route `@handle` profile-preview links to internal `/profiles/:handle` analysis pages.
+- Make Discuss search source/mode controls look like dropdowns in one row, raise live tweet search depth to 20,000 results / 200 pages, combine bird plus xurl in auto mode, and include matching local timeline/saved tweets in Live search discussions.
+- Default Discuss live mode to xurl now that OAuth2 search is authorized.
+- Use the default authorized xurl OAuth2 user for Discuss/Profile Analyse recent-search reads instead of the selected Birdclaw account handle.
+- Keep Discuss/Profile Analyse recent-search reads from inheriting `BIRDCLAW_XURL_OAUTH2_*` overrides, so account-scoped xurl settings do not force stale app/user auth into global search calls.
 - Let normal Discuss web searches reuse cached AI discussions while keeping the Refresh button as the explicit forced-refresh path.
+- Keep Discuss Live search scoped to live/search-result tweets instead of sweeping every local timeline bucket before AI streaming starts.
+- Link unresolved model-emitted `tweet_<id>` citations in AI reports to X source URLs instead of showing raw citation tokens.
 - Tighten AI report line height and first-block spacing in Today and Discuss.
+- Keep Network Map profile positions anchored to exact geocoded locations and render dense areas through smarter avatar clusters instead of random scatter.
+- Ignore stale configured OAuth2 xurl account overrides for Profile Analyse user lookup and profile timeline reads.
 
 ## 0.6.0 - 2026-05-22
 

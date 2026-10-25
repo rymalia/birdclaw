@@ -1,12 +1,6 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
-import type { ComponentType } from "react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { renderWithQueryClient as render } from "#/test/render";
 
 vi.mock("#/components/InboxCard", () => ({
 	InboxCard: ({
@@ -44,9 +38,7 @@ vi.mock("#/components/InboxCard", () => ({
 	),
 }));
 
-import { Route } from "./inbox";
-
-const InboxRoute = Route.options.component as ComponentType;
+import { InboxRouteView as InboxRoute } from "./inbox";
 
 afterEach(() => {
 	cleanup();

@@ -5,56 +5,42 @@ import path from "node:path";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
-import { getConversationThread, listDmConversations } from "./queries";
+import { getConversationThread, listDmConversations } from "./dm-read-model";
 import { getNativeDb, resetDatabaseForTests } from "./db";
+import { refreshSearchRows } from "./search-index";
 
 const listDirectMessagesViaBirdMock = vi.fn();
 const getAuthenticatedBirdAccountMock = vi.fn();
 const listDirectMessageEventsViaXurlMock = vi.fn();
 const lookupAuthenticatedUserMock = vi.fn();
+const readWebDirectMessagesMock = vi.fn();
+
+vi.mock("./x-web-dms", () => ({
+	readWebDirectMessages: (...args: unknown[]) =>
+		readWebDirectMessagesMock(...args),
+}));
 
 vi.mock("./bird", async () => {
-	const { Effect } = await import("effect");
+	const { effectFromMock } = await import("../test/effect-mocks");
 	return {
-		getAuthenticatedBirdAccount: (...args: unknown[]) =>
-			getAuthenticatedBirdAccountMock(...args),
-		getAuthenticatedBirdAccountEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => getAuthenticatedBirdAccountMock(...args),
-				catch: (error) => error,
-			}),
-		listDirectMessagesViaBird: (...args: unknown[]) =>
-			listDirectMessagesViaBirdMock(...args),
-		listDirectMessagesViaBirdEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => listDirectMessagesViaBirdMock(...args),
-				catch: (error) => error,
-			}),
+		getAuthenticatedBirdAccountEffect: effectFromMock(
+			getAuthenticatedBirdAccountMock,
+		),
+		listDirectMessagesViaBirdEffect: effectFromMock(
+			listDirectMessagesViaBirdMock,
+		),
 	};
 });
 
 vi.mock("./xurl", async () => {
-	const { Effect } = await import("effect");
+	const { effectFromMock } = await import("../test/effect-mocks");
 	return {
-		lookupAuthenticatedUser: (...args: unknown[]) =>
-			lookupAuthenticatedUserMock(...args),
-		lookupAuthenticatedUserEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => lookupAuthenticatedUserMock(...args),
-				catch: (error) => error,
-			}),
-		lookupAuthenticatedOAuth2UserEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => lookupAuthenticatedUserMock(...args),
-				catch: (error) => error,
-			}),
-		listDirectMessageEventsViaXurl: (...args: unknown[]) =>
-			listDirectMessageEventsViaXurlMock(...args),
-		listDirectMessageEventsViaXurlEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => listDirectMessageEventsViaXurlMock(...args),
-				catch: (error) => error,
-			}),
+		lookupAuthenticatedOAuth2UserEffect: effectFromMock(
+			lookupAuthenticatedUserMock,
+		),
+		listDirectMessageEventsViaXurlEffect: effectFromMock(
+			listDirectMessageEventsViaXurlMock,
+		),
 	};
 });
 
@@ -67,8 +53,23 @@ function makeTempHome() {
 	return tempDir;
 }
 
+function mockRepeatedXurlDmPages() {
+	listDirectMessageEventsViaXurlMock
+		.mockResolvedValueOnce({
+			data: [{ id: "dm_repeated_1", event_type: "MessageCreate" }],
+			meta: { next_token: "same-page" },
+		})
+		.mockResolvedValueOnce({
+			data: [{ id: "dm_repeated_2", event_type: "MessageCreate" }],
+			meta: { next_token: "same-page" },
+		});
+}
+
 describe("cached live DMs", () => {
 	beforeEach(() => {
+		vi.stubEnv("AUTH_TOKEN", "");
+		vi.stubEnv("CT0", "");
+		readWebDirectMessagesMock.mockReset();
 		listDirectMessagesViaBirdMock.mockReset();
 		getAuthenticatedBirdAccountMock.mockReset();
 		listDirectMessageEventsViaXurlMock.mockReset();
@@ -84,6 +85,8 @@ describe("cached live DMs", () => {
 	});
 
 	afterEach(() => {
+		delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
+		vi.unstubAllEnvs();
 		resetDatabaseForTests();
 		resetBirdclawPathsForTests();
 		delete process.env.BIRDCLAW_HOME;
@@ -91,6 +94,100 @@ describe("cached live DMs", () => {
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	it("prefers Bird for auto DMs and falls back to xurl after a Bird failure", async () => {
+		makeTempHome();
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "bird";
+		listDirectMessagesViaBirdMock.mockResolvedValue({
+			success: true,
+			conversations: [],
+			events: [],
+		});
+		listDirectMessageEventsViaXurlMock.mockResolvedValue({
+			data: [],
+			meta: {},
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "auto", refresh: true }),
+		).resolves.toMatchObject({ source: "bird" });
+		expect(listDirectMessageEventsViaXurlMock).not.toHaveBeenCalled();
+		listDirectMessagesViaBirdMock.mockRejectedValueOnce(new Error("offline"));
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "auto", refresh: true }),
+		).resolves.toMatchObject({ source: "xurl" });
+	});
+
+	it("falls back from failed native requests to independently verified Bird in auto mode", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("expired native session"),
+		);
+		listDirectMessagesViaBirdMock.mockResolvedValue({
+			success: true,
+			conversations: [],
+			events: [],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				inbox: "requests",
+				mode: "auto",
+				refresh: true,
+			}),
+		).resolves.toMatchObject({ source: "bird", messages: 0 });
+		expect(getAuthenticatedBirdAccountMock).toHaveBeenCalledTimes(1);
+		expect(readWebDirectMessagesMock).toHaveBeenCalledTimes(1);
+		expect(listDirectMessageEventsViaXurlMock).not.toHaveBeenCalled();
+	});
+
+	it("falls back to xurl after a preferred native full-inbox read fails", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("native metadata unavailable"),
+		);
+		listDirectMessageEventsViaXurlMock.mockResolvedValue({
+			data: [],
+			meta: { result_count: 0 },
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "auto", refresh: true }),
+		).resolves.toMatchObject({ source: "xurl", messages: 0 });
+		expect(readWebDirectMessagesMock).toHaveBeenCalledTimes(1);
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
+	});
+
+	it("keeps explicit native failures and rejects wrong-account Bird fallbacks", async () => {
+		makeTempHome();
+		vi.stubEnv("AUTH_TOKEN", "synthetic-cookie");
+		vi.stubEnv("CT0", "synthetic-csrf");
+		readWebDirectMessagesMock.mockRejectedValue(
+			new Error("native unavailable"),
+		);
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "web", refresh: true }),
+		).rejects.toThrow("native unavailable");
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
+		expect(lookupAuthenticatedUserMock).not.toHaveBeenCalled();
+		getAuthenticatedBirdAccountMock.mockResolvedValue({
+			id: "999",
+			username: "other",
+		});
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				mode: "auto",
+				inbox: "requests",
+				refresh: true,
+			}),
+		).rejects.toThrow("refusing to sync");
+		expect(listDirectMessagesViaBirdMock).not.toHaveBeenCalled();
 	});
 
 	it("keeps cached DM sync effects lazy", async () => {
@@ -116,6 +213,110 @@ describe("cached live DMs", () => {
 			messages: 0,
 		});
 		expect(listDirectMessagesViaBirdMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("refreshes a large DM search batch, removes previews, deduplicates events, and rolls back failures", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		const conversationId = "25401953-55";
+		const event = (id: string, text: string) => ({
+			id,
+			conversationId,
+			text,
+			createdAt: "2026-09-13T20:00:00.000Z",
+			senderId: "55",
+			recipientId: "25401953",
+		});
+		const events = Array.from({ length: 1200 }, (_, index) =>
+			event(`batch_dm_${index}`, `Batch search text ${index}`),
+		);
+		events.push(event("batch_dm_0", "Final duplicate text"));
+		listDirectMessagesViaBirdMock.mockResolvedValue({
+			success: true,
+			conversations: [
+				{
+					id: conversationId,
+					participants: [
+						{ id: "25401953", username: "steipete" },
+						{ id: "55", username: "syntheticpeer" },
+					],
+				},
+			],
+			events,
+		});
+		db.exec(`
+			insert into dm_messages(id,conversation_id,sender_profile_id,text,created_at,direction) values
+				('batch_dm_0','25401953-55','profile_me','obsolete','','inbound'),
+				('preview:25401953-55','25401953-55','profile_me','old preview','','inbound'),
+				('unrelated_dm','dm_001','profile_me','keep sentinel','','inbound');
+		`);
+		refreshSearchRows(db, "dm", [
+			"batch_dm_0",
+			"preview:25401953-55",
+			"unrelated_dm",
+		]);
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+		const prepare = vi.spyOn(db, "prepare");
+		try {
+			await syncDirectMessagesViaCachedBird({ mode: "bird", refresh: true });
+			expect(
+				prepare.mock.calls.filter(([sql]) =>
+					/^\s*delete from dm_fts/i.test(sql),
+				),
+			).toHaveLength(1);
+		} finally {
+			prepare.mockRestore();
+		}
+		expect(
+			db.prepare("select text from dm_fts where message_id='batch_dm_0'").all(),
+		).toEqual([{ text: "Final duplicate text" }]);
+		expect(
+			db
+				.prepare("select text from dm_fts where message_id=?")
+				.all(`preview:${conversationId}`),
+		).toEqual([]);
+		expect(
+			db
+				.prepare(
+					"select count(*) n from dm_fts where message_id like 'batch_dm_%'",
+				)
+				.get(),
+		).toEqual({ n: 1200 });
+		expect(
+			db
+				.prepare("select text from dm_fts where message_id='unrelated_dm'")
+				.get(),
+		).toEqual({ text: "keep sentinel" });
+		expect(
+			db
+				.prepare("select message_id from dm_fts where dm_fts match 'Final'")
+				.all(),
+		).toEqual([{ message_id: "batch_dm_0" }]);
+
+		const originalPrepare = db.prepare.bind(db);
+		const failInsert = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+			const statement = originalPrepare(sql);
+			if (sql.includes("insert into dm_fts")) {
+				statement.run = () => {
+					throw new Error("synthetic index failure");
+				};
+			}
+			return statement;
+		});
+		events.push(event("batch_dm_0", "Rolled back change"));
+		try {
+			await expect(
+				syncDirectMessagesViaCachedBird({ mode: "bird", refresh: true }),
+			).rejects.toThrow("synthetic index failure");
+		} finally {
+			failInsert.mockRestore();
+		}
+		expect(
+			db.prepare("select text from dm_messages where id='batch_dm_0'").get(),
+		).toEqual({ text: "Final duplicate text" });
+		expect(
+			db.prepare("select text from dm_fts where message_id='batch_dm_0'").all(),
+		).toEqual([{ text: "Final duplicate text" }]);
 	});
 
 	it("fetches bird DMs, caches them, and syncs them into the local store", async () => {
@@ -215,7 +416,7 @@ describe("cached live DMs", () => {
 		]);
 	});
 
-	it("fetches recent xurl DM events into the local store", async () => {
+	it("defaults to xurl DM events without requiring bird", async () => {
 		makeTempHome();
 		listDirectMessageEventsViaXurlMock.mockResolvedValueOnce({
 			data: [
@@ -241,7 +442,6 @@ describe("cached live DMs", () => {
 
 		const summary = await syncDirectMessagesViaCachedBird({
 			account: "acct_primary",
-			mode: "xurl",
 			limit: 5,
 			refresh: true,
 		});
@@ -279,6 +479,8 @@ describe("cached live DMs", () => {
 				sender: expect.objectContaining({ handle: "sam" }),
 			}),
 		]);
+		expect(listDirectMessagesViaBirdMock).not.toHaveBeenCalled();
+		expect(getAuthenticatedBirdAccountMock).not.toHaveBeenCalled();
 	});
 
 	it("paginates xurl DM events when requested", async () => {
@@ -344,6 +546,70 @@ describe("cached live DMs", () => {
 		});
 	});
 
+	it("rejects repeated xurl DM cursors without persisting the partial snapshot", async () => {
+		makeTempHome();
+		mockRepeatedXurlDmPages();
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				mode: "xurl",
+				limit: 5,
+				maxPages: 1,
+				refresh: true,
+			}),
+		).rejects.toThrow("xurl DM pagination stopped on a repeated cursor");
+		expect(
+			getNativeDb()
+				.prepare(
+					"select count(*) as count from dm_messages where id like 'dm_repeated_%'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+		expect(
+			getNativeDb()
+				.prepare(
+					"select cache_key from sync_cache where cache_key like 'dms:xurl:%'",
+				)
+				.get(),
+		).toBeUndefined();
+	});
+
+	it("falls back to Bird when xurl DM pagination repeats", async () => {
+		makeTempHome();
+		mockRepeatedXurlDmPages();
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
+			success: true,
+			conversations: [],
+			events: [],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		await expect(
+			syncDirectMessagesViaCachedBird({
+				mode: "auto",
+				limit: 5,
+				maxPages: 1,
+				refresh: true,
+			}),
+		).resolves.toMatchObject({ source: "bird", messages: 0 });
+		expect(listDirectMessageEventsViaXurlMock).toHaveBeenCalledTimes(2);
+		expect(listDirectMessagesViaBirdMock).toHaveBeenCalledTimes(1);
+		expect(
+			getNativeDb()
+				.prepare(
+					"select count(*) as count from dm_messages where id like 'dm_repeated_%'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+		const cache = getNativeDb()
+			.prepare(
+				"select value_json from sync_cache where cache_key like 'dms:auto:%'",
+			)
+			.get() as { value_json: string };
+		expect(cache.value_json).not.toContain("dm_repeated_");
+	});
+
 	it("reuses fresh cache without spending another bird call", async () => {
 		makeTempHome();
 		listDirectMessagesViaBirdMock.mockResolvedValue({
@@ -371,14 +637,14 @@ describe("cached live DMs", () => {
 		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
 
 		await expect(syncDirectMessagesViaCachedBird({ limit: 0 })).rejects.toThrow(
-			"bird DM mode requires --limit of at least 1",
+			"--limit must be at least 1",
 		);
 		await expect(
 			syncDirectMessagesViaCachedBird({ account: "missing", limit: 1 }),
 		).rejects.toThrow("Unknown account: missing");
 		await expect(
 			syncDirectMessagesViaCachedBird({ mode: "xurl", limit: 101 }),
-		).rejects.toThrow("xurl DM mode requires --limit between 1 and 100");
+		).rejects.toThrow("--limit must be between 1 and 100");
 		await expect(
 			syncDirectMessagesViaCachedBird({
 				mode: "xurl",
@@ -386,6 +652,9 @@ describe("cached live DMs", () => {
 				limit: 5,
 			}),
 		).rejects.toThrow("xurl DM mode cannot read the message-request inbox");
+		await expect(
+			syncDirectMessagesViaCachedBird({ mode: "invalid" as never }),
+		).rejects.toThrow("--mode");
 	});
 
 	it("falls back from xurl to bird in auto mode", async () => {
@@ -577,6 +846,309 @@ describe("cached live DMs", () => {
 		]);
 	});
 
+	it("updates sparse remote DM identity without downgrading rich profile fields", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`insert into profiles (
+			 id, handle, display_name, bio, followers_count, following_count,
+			 public_metrics_json, avatar_hue, avatar_url, entities_json, raw_json,
+			 created_at
+			) values (
+			 'profile_user_4242', 'old4242', 'Old Name', 'rich remote bio', 4242, 242,
+			 '{"followers_count":4242,"following_count":242}', 42,
+			 'https://img.example/4242.jpg', '{"description":{"urls":[]}}',
+			 '{"id":"4242","username":"old4242","rich":true}',
+			 '2025-01-01T00:00:00.000Z'
+			)`,
+		).run();
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
+			success: true,
+			conversations: [
+				{
+					id: "25401953-4242",
+					participants: [
+						{ id: "25401953" },
+						{
+							id: "4242",
+							username: "new4242",
+							name: "New Name",
+							profileImageUrl: "https://img.example/new4242.jpg",
+						},
+					],
+					messages: [],
+				},
+			],
+			events: [
+				{
+					id: "dm_sparse_remote",
+					conversationId: "25401953-4242",
+					text: "Sparse remote participant",
+					createdAt: "2026-04-25T20:00:00.000Z",
+					senderId: "4242",
+					recipientId: "25401953",
+					sender: {
+						id: "4242",
+						username: "new4242",
+						name: "New Name",
+						profileImageUrl: "https://img.example/new4242.jpg",
+					},
+				},
+			],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		await syncDirectMessagesViaCachedBird({ limit: 5, refresh: true });
+
+		const row = db
+			.prepare(
+				`select handle, display_name, bio, followers_count, following_count,
+				 public_metrics_json, avatar_url, entities_json, raw_json
+				 from profiles where id = 'profile_user_4242'`,
+			)
+			.get() as Record<string, unknown>;
+		expect(row).toMatchObject({
+			handle: "new4242",
+			display_name: "New Name",
+			bio: "rich remote bio",
+			followers_count: 4242,
+			following_count: 242,
+			public_metrics_json: '{"followers_count":4242,"following_count":242}',
+			avatar_url: "https://img.example/new4242.jpg",
+			entities_json: '{"description":{"urls":[]}}',
+		});
+		expect(JSON.parse(String(row.raw_json))).toMatchObject({
+			id: "4242",
+			username: "new4242",
+			rich: true,
+		});
+	});
+
+	it("preserves a rich display name for a username-only DM participant", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`insert into profiles (
+			 id, handle, display_name, bio, followers_count, avatar_hue, raw_json, created_at
+			) values (
+			 'profile_user_4243', 'old4243', 'Rich Display Name', 'rich bio', 43, 43,
+			 '{"id":"4243","username":"old4243"}', '2025-01-01T00:00:00.000Z'
+			)`,
+		).run();
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
+			success: true,
+			conversations: [
+				{
+					id: "25401953-4243",
+					participants: [
+						{ id: "25401953" },
+						{ id: "4243", username: "new4243" },
+					],
+					messages: [],
+				},
+			],
+			events: [],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		await syncDirectMessagesViaCachedBird({ limit: 5, refresh: true });
+
+		const row = db
+			.prepare(
+				"select handle, display_name, bio, raw_json from profiles where id = 'profile_user_4243'",
+			)
+			.get() as Record<string, unknown>;
+		expect(row).toMatchObject({
+			handle: "new4243",
+			display_name: "Rich Display Name",
+			bio: "rich bio",
+		});
+		expect(JSON.parse(String(row.raw_json))).toMatchObject({
+			id: "4243",
+			username: "new4243",
+		});
+	});
+
+	it("indexes a learned name for a handle-less remote DM participant", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
+			success: true,
+			conversations: [
+				{
+					id: "25401953-4343",
+					participants: [
+						{ id: "25401953" },
+						{
+							id: "4343",
+							name: "Name Only",
+							profileImageUrl:
+								"https://pbs.twimg.com/profile_images/4343/name_normal.jpg",
+						},
+					],
+					messages: [],
+				},
+			],
+			events: [
+				{
+					id: "dm_handleless_remote",
+					conversationId: "25401953-4343",
+					text: "Handle-less remote participant",
+					createdAt: "2026-04-25T20:00:00.000Z",
+					senderId: "4343",
+					recipientId: "25401953",
+					sender: {
+						id: "4343",
+						name: "Name Only",
+					},
+				},
+			],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		await syncDirectMessagesViaCachedBird({ limit: 5, refresh: true });
+
+		const profile = db
+			.prepare(
+				`select handle, display_name, avatar_url, raw_json
+				 from profiles where id = 'profile_user_4343'`,
+			)
+			.get() as Record<string, unknown>;
+		expect(profile).toMatchObject({
+			display_name: "Name Only",
+			avatar_url: "https://pbs.twimg.com/profile_images/4343/name.jpg",
+		});
+		expect(String(profile.handle)).toMatch(/^birdclaw_stub_/);
+		expect(JSON.parse(String(profile.raw_json))).toEqual({ id: "4343" });
+		expect(
+			db
+				.prepare(
+					`select value from identity_search_index
+					 where profile_id = 'profile_user_4343' and kind = 'profile_name'`,
+				)
+				.get(),
+		).toEqual({ value: "Name Only" });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from profile_snapshots where profile_id = 'profile_user_4343'",
+				)
+				.get(),
+		).toEqual({ count: 2 });
+	});
+
+	it("coalesces handle-less DM avatars without downgrading a rich profile", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`insert into profiles (
+			 id, handle, display_name, bio, followers_count, following_count,
+			 public_metrics_json, avatar_hue, avatar_url, entities_json, raw_json,
+			 created_at
+			) values (
+			 'profile_user_4444', 'birdclaw_stub_existing4444', 'Rich Person',
+			 'rich handle-less bio', 444, 44,
+			 '{"followers_count":444,"following_count":44}', 44,
+			 'https://img.example/original4444.jpg', '{"description":{"urls":[]}}',
+			 '{"id":"4444","rich":true}', '2025-01-01T00:00:00.000Z'
+			)`,
+		).run();
+		const payload = (profileImageUrl?: string) => ({
+			success: true as const,
+			conversations: [
+				{
+					id: "25401953-4444",
+					participants: [
+						{ id: "25401953" },
+						{
+							id: "4444",
+							name: "Incoming Sparse Name",
+							...(profileImageUrl ? { profileImageUrl } : {}),
+						},
+					],
+					messages: [],
+				},
+			],
+			events: [
+				{
+					id: profileImageUrl
+						? "dm_handleless_avatar_new"
+						: "dm_handleless_no_avatar",
+					conversationId: "25401953-4444",
+					text: "Sparse handle-less participant",
+					createdAt: "2026-04-25T20:00:00.000Z",
+					senderId: "4444",
+					recipientId: "25401953",
+					sender: {
+						id: "4444",
+						name: "Incoming Sparse Name",
+						...(profileImageUrl ? { profileImageUrl } : {}),
+					},
+				},
+			],
+		});
+		const { syncDirectMessagesViaCachedBird } = await import("./dms-live");
+
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce(payload());
+		await syncDirectMessagesViaCachedBird({ limit: 5, refresh: true });
+		const first = db
+			.prepare(
+				`select handle, display_name, bio, followers_count, following_count,
+				 public_metrics_json, avatar_url, entities_json, raw_json
+				 from profiles where id = 'profile_user_4444'`,
+			)
+			.get() as Record<string, unknown>;
+		expect(first).toMatchObject({
+			handle: "birdclaw_stub_existing4444",
+			display_name: "Rich Person",
+			bio: "rich handle-less bio",
+			followers_count: 444,
+			following_count: 44,
+			public_metrics_json: '{"followers_count":444,"following_count":44}',
+			avatar_url: "https://img.example/original4444.jpg",
+			entities_json: '{"description":{"urls":[]}}',
+		});
+
+		listDirectMessagesViaBirdMock.mockResolvedValueOnce(
+			payload(
+				"https://pbs.twimg.com/profile_images/4444/replacement_normal.jpg",
+			),
+		);
+		await syncDirectMessagesViaCachedBird({ limit: 5, refresh: true });
+		const updated = db
+			.prepare(
+				`select handle, display_name, bio, followers_count, avatar_url, raw_json
+				 from profiles where id = 'profile_user_4444'`,
+			)
+			.get() as Record<string, unknown>;
+		expect(updated).toMatchObject({
+			handle: "birdclaw_stub_existing4444",
+			display_name: "Rich Person",
+			bio: "rich handle-less bio",
+			followers_count: 444,
+			avatar_url: "https://pbs.twimg.com/profile_images/4444/replacement.jpg",
+		});
+		expect(JSON.parse(String(updated.raw_json))).toEqual({
+			id: "4444",
+			rich: true,
+		});
+		expect(
+			db
+				.prepare(
+					`select value from identity_search_index
+					 where profile_id = 'profile_user_4444' and kind = 'profile_name'`,
+				)
+				.get(),
+		).toEqual({ value: "Rich Person" });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from profile_snapshots where profile_id = 'profile_user_4444'",
+				)
+				.get(),
+		).toEqual({ count: 1 });
+	});
+
 	it("keeps request conversations that only have a last-message preview", async () => {
 		makeTempHome();
 		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
@@ -645,13 +1217,30 @@ describe("cached live DMs", () => {
 
 	it("imports sparse outbound messages from the stable account id", async () => {
 		makeTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`update profiles set bio = 'rich local account', followers_count = 999,
+				 avatar_url = 'https://img.example/account.jpg',
+				 entities_json = '{"description":{"urls":[]}}', raw_json = '{}'
+				 where id = 'profile_me'`,
+		).run();
+		db.prepare(
+			"insert into tweets (id, author_profile_id, text, created_at) values ('dm-local-proof-tweet', 'profile_me', 'local proof', '2026-01-01T00:00:00.000Z')",
+		).run();
+		db.prepare(
+			"insert into profile_snapshots (profile_id, snapshot_hash, observed_at, last_seen_at, source, handle, display_name, bio, followers_count, following_count) values ('profile_me', 'dm-local-proof-snapshot', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', 'test', 'steipete', 'Peter Steinberger', 'rich local account', 999, 0)",
+		).run();
 		listDirectMessagesViaBirdMock.mockResolvedValueOnce({
 			success: true,
 			conversations: [
 				{
 					id: "25401953-66",
 					participants: [
-						{ id: "25401953" },
+						{
+							id: "25401953",
+							username: "steipete",
+							name: "Sparse Peter",
+						},
 						{ id: "66", username: "pat", name: "Pat" },
 					],
 					messages: [],
@@ -690,6 +1279,43 @@ describe("cached live DMs", () => {
 				direction: "outbound",
 			}),
 		]);
+		expect(
+			db
+				.prepare(
+					`select bio, followers_count, avatar_url, entities_json
+					 from profiles where id = 'profile_user_25401953'`,
+				)
+				.get(),
+		).toEqual({
+			bio: "rich local account",
+			followers_count: 999,
+			avatar_url: "https://img.example/account.jpg",
+			entities_json: '{"description":{"urls":[]}}',
+		});
+		expect(
+			db.prepare("select 1 from profiles where id = 'profile_me'").get(),
+		).toBeUndefined();
+		expect(
+			db
+				.prepare(
+					"select author_profile_id from tweets where id = 'dm-local-proof-tweet'",
+				)
+				.get(),
+		).toEqual({ author_profile_id: "profile_user_25401953" });
+		expect(
+			db
+				.prepare(
+					"select sender_profile_id from dm_messages where id = 'dm_sparse_outbound'",
+				)
+				.get(),
+		).toEqual({ sender_profile_id: "profile_user_25401953" });
+		expect(
+			db
+				.prepare(
+					"select profile_id from profile_snapshots where handle = 'steipete' and bio = 'rich local account' limit 1",
+				)
+				.get(),
+		).toEqual({ profile_id: "profile_user_25401953" });
 	});
 
 	it("uses the live bird account id when the selected account has no stored external id", async () => {
@@ -872,7 +1498,7 @@ describe("cached live DMs", () => {
 				id: "25401953-99",
 				needsReply: false,
 				participant: expect.objectContaining({
-					handle: "user_99",
+					handle: expect.stringMatching(/^birdclaw_stub_/),
 					displayName: "No Handle",
 				}),
 			}),

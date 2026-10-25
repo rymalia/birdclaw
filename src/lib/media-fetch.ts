@@ -334,6 +334,8 @@ function queryRows(options: MediaFetchOptions) {
     select t.id, t.media_json
     from tweets t
     where t.media_json not in ('', '[]', 'null')
+	  and t.deleted_at is null
+	  and t.superseded_at is null
   `;
 	const scopeClause = buildScopeClause(params, account, kind);
 	if (scopeClause) sql += ` and (${scopeClause})`;
@@ -387,26 +389,17 @@ function buildScopeClause(
 			clauses.push(
 				`exists (select 1 from tweet_collections collection where collection.tweet_id = t.id and collection.kind = ?${accountClause("collection")})`,
 			);
-			const legacyColumn = savedKind === "likes" ? "liked" : "bookmarked";
-			pushAccount();
-			clauses.push(
-				`t.${legacyColumn} = 1${account ? " and t.account_id = ?" : ""}`,
-			);
 		}
-		params.push(kind);
-		pushAccount();
-		clauses.push(`t.kind = ?${account ? " and t.account_id = ?" : ""}`);
 		return clauses.join(" or ");
 	}
 	if (account) {
-		params.push(account, account, account);
+		params.push(account, account);
 		clauses.push(
 			"exists (select 1 from tweet_account_edges edge where edge.tweet_id = t.id and edge.account_id = ?)",
 		);
 		clauses.push(
 			"exists (select 1 from tweet_collections collection where collection.tweet_id = t.id and collection.account_id = ?)",
 		);
-		clauses.push("t.account_id = ?");
 	}
 	return clauses.join(" or ");
 }
@@ -695,38 +688,19 @@ function runGroupEffect(
 		});
 		return { item, previous, release };
 	});
-	const runPaced = ({
-		item,
-		previous,
-		release,
-	}: {
-		item: Candidate;
-		previous: Promise<void>;
-		release: () => void;
-	}) =>
-		tryMediaPromise(() =>
-			previous.then(() => {
+	const runPaced = ({ item, previous, release }: (typeof pacedItems)[number]) =>
+		tryMediaPromise(async () => {
+			await previous;
+			try {
 				const waitMs =
 					lastStart !== null ? Math.max(0, lastStart + pacingMs - now()) : 0;
-				const wait = waitMs > 0 ? sleep(waitMs) : Promise.resolve();
-				return wait.then(
-					() => {
-						let work: Promise<void>;
-						try {
-							lastStart = now();
-							work = worker(item);
-						} finally {
-							release();
-						}
-						return work;
-					},
-					(error: unknown) => {
-						release();
-						throw error;
-					},
-				);
-			}),
-		);
+				if (waitMs > 0) await sleep(waitMs);
+				lastStart = now();
+				return worker(item);
+			} finally {
+				release();
+			}
+		});
 	return Effect.forEach(pacedItems, runPaced, {
 		concurrency: Math.min(parallel, items.length),
 		discard: true,

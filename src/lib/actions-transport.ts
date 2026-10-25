@@ -1,24 +1,29 @@
 import {
-	blockUserViaBird,
-	muteUserViaBird,
-	readBirdStatusViaBird,
-	unblockUserViaBird,
-	unmuteUserViaBird,
+	blockUserViaBirdEffect,
+	muteUserViaBirdEffect,
+	unblockUserViaBirdEffect,
+	unmuteUserViaBirdEffect,
 } from "./bird-actions";
-import { type ActionsTransport, resolveActionsTransport } from "./config";
+import { verifyBirdAccountMatchesEffect } from "./bird-account";
+import {
+	type ActionsTransport,
+	resolveActionsTransport,
+	getAutoTransportOrder,
+} from "./config";
 import { Effect } from "effect";
-import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { runEffectPromise, trySync } from "./effect-runtime";
+import { profileHandleKey } from "./profile-row";
 import type {
 	ModerationAction,
 	ModerationActionTransportResult,
 	ModerationTransportKind,
 } from "./types";
 import {
-	blockUserViaXurl,
-	lookupAuthenticatedUserFresh,
-	muteUserViaXurl,
-	unblockUserViaXurl,
-	unmuteUserViaXurl,
+	blockUserViaXurlEffect,
+	lookupAuthenticatedUserFreshEffect,
+	muteUserViaXurlEffect,
+	unblockUserViaXurlEffect,
+	unmuteUserViaXurlEffect,
 } from "./xurl";
 
 export type ActionTransportResult = ModerationActionTransportResult;
@@ -37,27 +42,12 @@ export interface ExpectedActionAccount {
 	externalUserId?: string | null;
 }
 
-function toError(error: unknown) {
-	return error instanceof Error ? error : new Error(String(error));
-}
-
-function trySync<T>(try_: () => T) {
-	return Effect.try({
-		try: try_,
-		catch: toError,
-	});
-}
-
 function normalizeFailure(transport: ModerationTransportKind, output: string) {
 	return `${transport}: ${output}`;
 }
 
 function liveWritesDisabled() {
 	return process.env.BIRDCLAW_DISABLE_LIVE_WRITES === "1";
-}
-
-function normalizeHandle(value: string | null | undefined) {
-	return value?.replace(/^@/, "").toLowerCase() ?? "";
 }
 
 function verifyExpectedAccountEffect(
@@ -67,15 +57,15 @@ function verifyExpectedAccountEffect(
 		if (!expectedAccount) return null;
 		if (liveWritesDisabled()) return null;
 
-		const sourceUser = yield* tryPromise(() => lookupAuthenticatedUserFresh());
+		const sourceUser = yield* lookupAuthenticatedUserFreshEffect();
 		const sourceUserId =
 			sourceUser && typeof sourceUser.id === "string" ? sourceUser.id : "";
 		const sourceUsername =
 			sourceUser && typeof sourceUser.username === "string"
-				? normalizeHandle(sourceUser.username)
+				? profileHandleKey(sourceUser.username)
 				: "";
 		const expectedExternalUserId = expectedAccount.externalUserId?.trim() ?? "";
-		const expectedHandle = normalizeHandle(expectedAccount.handle);
+		const expectedHandle = profileHandleKey(expectedAccount.handle);
 
 		if (expectedExternalUserId) {
 			if (sourceUserId === expectedExternalUserId) return sourceUserId;
@@ -101,17 +91,23 @@ function verifyExpectedAccountEffect(
 function runBirdActionEffect(
 	action: ModerationAction,
 	query: string,
+	expectedAccount?: ExpectedActionAccount,
 ): Effect.Effect<ActionTransportResult, unknown> {
 	return Effect.gen(function* () {
-		const result = yield* tryPromise(() =>
-			action === "block"
-				? blockUserViaBird(query)
-				: action === "unblock"
-					? unblockUserViaBird(query)
-					: action === "mute"
-						? muteUserViaBird(query)
-						: unmuteUserViaBird(query),
-		);
+		if (expectedAccount && !liveWritesDisabled()) {
+			yield* verifyBirdAccountMatchesEffect({
+				accountId: expectedAccount.id,
+				username: profileHandleKey(expectedAccount.handle),
+				externalUserId: expectedAccount.externalUserId ?? undefined,
+			});
+		}
+		const result = yield* action === "block"
+			? blockUserViaBirdEffect(query)
+			: action === "unblock"
+				? unblockUserViaBirdEffect(query)
+				: action === "mute"
+					? muteUserViaBirdEffect(query)
+					: unmuteUserViaBirdEffect(query);
 
 		return {
 			...result,
@@ -120,21 +116,8 @@ function runBirdActionEffect(
 	});
 }
 
-function getVerifyExpectation(action: ModerationAction) {
-	return action === "block" || action === "unblock"
-		? {
-				field: "blocking" as const,
-				expected: action === "block",
-			}
-		: {
-				field: "muting" as const,
-				expected: action === "mute",
-			};
-}
-
 function runXurlActionEffect(
 	action: ModerationAction,
-	query: string,
 	targetUserId?: string,
 	verifiedSourceUserId?: string | null,
 ): Effect.Effect<ActionTransportResult, unknown> {
@@ -149,9 +132,7 @@ function runXurlActionEffect(
 
 		let sourceUserId = verifiedSourceUserId ?? "";
 		if (!sourceUserId) {
-			const sourceUser = yield* tryPromise(() =>
-				lookupAuthenticatedUserFresh(),
-			);
+			const sourceUser = yield* lookupAuthenticatedUserFreshEffect();
 			sourceUserId =
 				sourceUser && typeof sourceUser.id === "string" ? sourceUser.id : "";
 		}
@@ -163,50 +144,16 @@ function runXurlActionEffect(
 			};
 		}
 
-		const result = yield* tryPromise(() =>
-			action === "block"
-				? blockUserViaXurl(sourceUserId, targetUserId)
-				: action === "unblock"
-					? unblockUserViaXurl(sourceUserId, targetUserId)
-					: action === "mute"
-						? muteUserViaXurl(sourceUserId, targetUserId)
-						: unmuteUserViaXurl(sourceUserId, targetUserId),
-		);
-
-		if (!result.ok) {
-			return {
-				...result,
-				transport: "xurl",
-			};
-		}
-
-		const status = yield* tryPromise(() => readBirdStatusViaBird(query));
-		const { field: verifyField, expected: expectedValue } =
-			getVerifyExpectation(action);
-		const actualValue =
-			status && typeof status[verifyField] === "boolean"
-				? Boolean(status[verifyField])
-				: null;
-
-		if (actualValue === null) {
-			return {
-				ok: false,
-				output: `${result.output}\nxurl verify unavailable from bird status`,
-				transport: "xurl",
-			};
-		}
-
-		if (actualValue !== expectedValue) {
-			return {
-				ok: false,
-				output: `${result.output}\nxurl verify mismatch ${verifyField}=${String(actualValue)}`,
-				transport: "xurl",
-			};
-		}
+		const result = yield* action === "block"
+			? blockUserViaXurlEffect(sourceUserId, targetUserId)
+			: action === "unblock"
+				? unblockUserViaXurlEffect(sourceUserId, targetUserId)
+				: action === "mute"
+					? muteUserViaXurlEffect(sourceUserId, targetUserId)
+					: unmuteUserViaXurlEffect(sourceUserId, targetUserId);
 
 		return {
-			ok: true,
-			output: `${result.output}\nverified ${verifyField}=${String(actualValue)}`,
+			...result,
 			transport: "xurl",
 		};
 	});
@@ -236,7 +183,7 @@ export function runModerationActionEffect({
 			);
 
 		if (requestedTransport === "bird") {
-			return yield* runBirdActionEffect(action, query);
+			return yield* runBirdActionEffect(action, query, expectedAccount);
 		}
 		if (requestedTransport === "xurl") {
 			const accountCheck = yield* verifyXurlAccount();
@@ -245,49 +192,47 @@ export function runModerationActionEffect({
 			}
 			return yield* runXurlActionEffect(
 				action,
-				query,
 				targetUserId,
 				typeof accountCheck === "string" ? accountCheck : null,
 			);
 		}
 
-		const birdResult = yield* runBirdActionEffect(action, query);
-		if (birdResult.ok) {
-			return birdResult;
+		const failures: string[] = [];
+		let lastTransport: ModerationTransportKind = "xurl";
+		for (const source of getAutoTransportOrder("bird")) {
+			lastTransport = source;
+			const attempt =
+				source === "bird"
+					? runBirdActionEffect(action, query, expectedAccount)
+					: Effect.gen(function* () {
+							const accountCheck = yield* verifyXurlAccount();
+							if (accountCheck && typeof accountCheck === "object")
+								return accountCheck;
+							return yield* runXurlActionEffect(
+								action,
+								targetUserId,
+								typeof accountCheck === "string" ? accountCheck : null,
+							);
+						});
+			const result = yield* attempt.pipe(
+				Effect.catchAll((error) =>
+					Effect.succeed({
+						ok: false,
+						output: error instanceof Error ? error.message : String(error),
+						transport: source,
+					}),
+				),
+			);
+			if (result.ok)
+				return {
+					...result,
+					output: failures.length
+						? `${result.output}\nfalling back after ${failures.join("; ")}`
+						: result.output,
+				};
+			failures.push(normalizeFailure(source, result.output));
 		}
-
-		const accountCheck = yield* verifyXurlAccount();
-		if (accountCheck && typeof accountCheck === "object") {
-			return {
-				ok: false,
-				output: [
-					normalizeFailure("bird", birdResult.output),
-					normalizeFailure("xurl", accountCheck.output),
-				].join("\n"),
-				transport: "xurl",
-			};
-		}
-		const xurlResult = yield* runXurlActionEffect(
-			action,
-			query,
-			targetUserId,
-			typeof accountCheck === "string" ? accountCheck : null,
-		);
-		if (xurlResult.ok) {
-			return {
-				...xurlResult,
-				output: `${xurlResult.output}\nfalling back after ${normalizeFailure("bird", birdResult.output)}`,
-			};
-		}
-
-		return {
-			ok: false,
-			output: [
-				normalizeFailure("bird", birdResult.output),
-				normalizeFailure("xurl", xurlResult.output),
-			].join("\n"),
-			transport: xurlResult.transport,
-		};
+		return { ok: false, output: failures.join("\n"), transport: lastTransport };
 	});
 }
 

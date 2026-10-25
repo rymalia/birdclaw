@@ -7,16 +7,19 @@ description: "Scheduler-friendly bookmark sync with launchd integration, audit l
 
 `birdclaw jobs` is the scheduler-friendly subset of sync: short defaults, JSONL audit logs, lock files to prevent overlap, and launchd installers for macOS.
 
+Both LaunchAgent installers accept `--interval-seconds <seconds>` as a positive safe integer. Zero, negative, fractional, non-numeric, and unsafe values exit nonzero before writing a plist. Existing numeric spellings such as `1e3` (1,000 seconds) and `0x10` (16 seconds) remain accepted.
+
 ## `jobs sync-account`
 
 ```bash
-birdclaw --json jobs sync-account --account acct_openclaw --limit 100 --max-pages 3 --refresh --allow-bird-account
+birdclaw --json jobs sync-account --account acct_openclaw --mode xurl --limit 100 --max-pages 3 --refresh
 ```
 
 What it does:
 
 - refreshes home timeline, mentions, mention threads, likes, bookmarks, and DMs for one account
-- uses `bird` for home and mentions; DMs can use `auto`/`xurl` for accepted-message imports, while message-request state still needs `bird`
+- works without Bird: `--mode xurl` covers every step; `auto` retains available fallbacks, and mention threads always use xurl
+- default-account `auto` DM sync uses native web access when `AUTH_TOKEN` and `CT0` are configured, preserving message-request state without Bird
 - appends one JSONL audit entry per run to `~/.birdclaw/audit/account-sync.jsonl`
 - records each step independently so one rate-limited surface does not hide the others
 - runs backup auto-sync after the scheduled refresh when enabled
@@ -24,10 +27,10 @@ What it does:
 Install the LaunchAgent:
 
 ```bash
-birdclaw --json jobs install-account-launchd --account acct_openclaw --program /opt/homebrew/bin/birdclaw --env-path ~/.config/bird/openclaw.env --allow-bird-account
+birdclaw --json jobs install-account-launchd --account acct_openclaw --mode xurl --program /opt/homebrew/bin/birdclaw
 ```
 
-The default interval is 1,800 seconds (30 minutes). Use `--steps timeline,mentions,dms` for a narrower job, or `--env-path ~/.config/bird/openclaw.env` when launchd needs account cookies. Pass `--allow-bird-account` only when the sourced cookies match `--account`; without it, Bird-backed timeline, mentions, and `--mode bird` DM steps refuse non-default account writes.
+The default interval is 1,800 seconds (30 minutes). Use `--steps timeline,mentions,dms` for a narrower job, or `--env-path ~/.config/birdclaw/account.env` when launchd needs native web or legacy Bird cookies. Pass `--allow-bird-account` only when the sourced cookies match `--account`; it permits optional Bird fallback and never forces Bird in `auto` mode. Without it, explicitly selected non-default accounts use xurl in `auto` mode and refuse explicit Bird steps. To schedule native request sync for another account, invoke `birdclaw dms sync --account <account> --mode web --inbox requests` directly; the native transport verifies cookie identity before reading.
 
 ## `jobs sync-bookmarks`
 
@@ -74,6 +77,16 @@ macOS only. Writes a LaunchAgent plist that runs `jobs sync-bookmarks` every 3 h
 birdclaw --json jobs install-bookmarks-launchd --program /opt/homebrew/bin/birdclaw
 ```
 
+A source checkout can pin both the runtime and program in the plist instead of relying on launchd's limited `PATH`:
+
+```bash
+BUN=$(./scripts/install-bun-canary.sh)
+./scripts/bun-canary.sh bin/birdclaw.mjs --json jobs install-bookmarks-launchd \
+  --runtime "$BUN" \
+  --runtime-arg=--no-env-file \
+  --program "$PWD/bin/birdclaw.mjs"
+```
+
 What it writes:
 
 - `~/Library/LaunchAgents/com.steipete.birdclaw.bookmarks-sync.plist`
@@ -84,7 +97,9 @@ What it writes:
 
 Flags:
 
-- `--program <path>` — absolute path to the `birdclaw` executable on this machine (Homebrew, npm global, or source build)
+- `--program <path>` — `birdclaw` executable, or an absolute source launcher when `--runtime` is set
+- `--runtime <absolute-path>` — invoke `--program` through this exact runtime rather than its shebang
+- `--runtime-arg <value>` — repeatable runtime argument; Bun source jobs should pass `--runtime-arg=--no-env-file`
 - `--env-path <path>` — source an export-only shell env file inside the scheduled process
 - `--no-load` — write the plist but do not load it; useful when you want to inspect first
 - `--all` — pass `--all` to the underlying sync, fetching every retrievable page each run (default caps at 5 pages)

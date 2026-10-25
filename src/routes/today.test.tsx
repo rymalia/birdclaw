@@ -2,15 +2,13 @@ import {
 	act,
 	cleanup,
 	fireEvent,
-	render,
 	screen,
 	waitFor,
 } from "@testing-library/react";
-import type { ComponentType } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Route } from "./today";
-
-const TodayRoute = Route.options.component as ComponentType;
+import { ndjsonResponse } from "#/test/ndjson";
+import { renderWithQueryClient as render } from "#/test/render";
+import { TodayRouteView as TodayRoute } from "./today";
 
 const authorProfile = {
 	id: "profile_alice",
@@ -109,13 +107,6 @@ function digestResult(label: string, markdown: string, includeDms = false) {
 	};
 }
 
-function ndjsonResponse(events: unknown[]) {
-	const body = events.map((event) => `${JSON.stringify(event)}\n`).join("");
-	return new Response(body, {
-		headers: { "content-type": "application/x-ndjson" },
-	});
-}
-
 describe("today route", () => {
 	beforeEach(() => {
 		vi.restoreAllMocks();
@@ -176,10 +167,8 @@ describe("today route", () => {
 		expect(screen.queryByText(/Action items/i)).toBeNull();
 		expect(screen.queryByText("# Today")).not.toBeInTheDocument();
 		expect(screen.getByText("Reply:")).toBeInTheDocument();
-		expect(screen.getByRole("link", { name: "@alice" })).toHaveAttribute(
-			"href",
-			"https://x.com/alice",
-		);
+		const aliceLink = screen.getByRole("link", { name: "@alice" });
+		expect(aliceLink).toHaveAttribute("href", "/profiles/alice");
 		expect(screen.getByRole("link", { name: "tweet_1" })).toHaveAttribute(
 			"href",
 			"https://x.com/alice/status/tweet_1",
@@ -187,12 +176,22 @@ describe("today route", () => {
 		expect(
 			screen.getByText("3 home · 2 mentions · 4 links"),
 		).toBeInTheDocument();
-		await waitFor(() =>
-			expect(screen.getAllByText("Alice Fresh").length).toBeGreaterThan(0),
+		const todayButton = screen.getByRole("button", { name: "Today" });
+		const weekButton = screen.getByRole("button", { name: "Week" });
+		expect(todayButton).toHaveAttribute("aria-pressed", "true");
+		expect(todayButton).toHaveClass(
+			"bg-[var(--accent-soft)]!",
+			"text-[var(--accent)]!",
 		);
-		expect(
-			screen.getAllByRole("img", { name: "Alice Fresh" })[0],
-		).toHaveAttribute(
+		expect(weekButton).toHaveAttribute("aria-pressed", "false");
+		await waitFor(() =>
+			expect(urls.some((url) => url.pathname === "/api/profile-hydrate")).toBe(
+				true,
+			),
+		);
+		fireEvent.pointerEnter(aliceLink.parentElement as Element);
+		await screen.findByText("Alice Fresh");
+		expect(screen.getByRole("img", { name: "Alice Fresh" })).toHaveAttribute(
 			"src",
 			expect.stringContaining("/api/avatar?profileId=profile_alice&v="),
 		);
@@ -201,6 +200,12 @@ describe("today route", () => {
 		expect(
 			await screen.findByRole("heading", { name: "Last 7 days", level: 1 }),
 		).toBeInTheDocument();
+		expect(todayButton).toHaveAttribute("aria-pressed", "false");
+		expect(weekButton).toHaveAttribute("aria-pressed", "true");
+		expect(weekButton).toHaveClass(
+			"bg-[var(--accent-soft)]!",
+			"text-[var(--accent)]!",
+		);
 
 		fireEvent.click(screen.getByLabelText("DMs"));
 		expect(
@@ -220,9 +225,65 @@ describe("today route", () => {
 			urls.some(
 				(url) =>
 					url.searchParams.get("period") === "week" &&
-					url.searchParams.get("includeDms") === "true",
+					url.searchParams.get("includeDms") === "true" &&
+					url.searchParams.get("liveSync") === "false",
 			),
 		).toBe(true);
+	}, 15_000);
+
+	it("exports a completed digest through the browser PDF flow", async () => {
+		document.title = "birdclaw";
+		const printMock = vi.spyOn(window, "print").mockImplementation(() => {
+			expect(document.title).toBe("BirdClaw Today digest");
+			window.dispatchEvent(new Event("afterprint"));
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: RequestInfo | URL) => {
+				const url = new URL(String(input));
+				if (url.pathname === "/api/profile-hydrate") {
+					return new Response(JSON.stringify({ ok: true, results: [] }), {
+						headers: { "content-type": "application/json" },
+					});
+				}
+				const markdown = "# Today\n\nDone.";
+				return ndjsonResponse([
+					{ type: "delta", delta: markdown },
+					{ type: "done", result: digestResult("Today", markdown) },
+				]);
+			}),
+		);
+
+		render(<TodayRoute />);
+
+		await screen.findByRole("heading", { name: "Today", level: 1 });
+		const exportButton = screen.getByRole("button", { name: "Export PDF" });
+		expect(exportButton).toBeEnabled();
+
+		fireEvent.click(exportButton);
+
+		expect(printMock).toHaveBeenCalledTimes(1);
+		expect(document.title).toBe("birdclaw");
+	});
+
+	it("does not export a partial digest after the stream fails", async () => {
+		const printMock = vi.spyOn(window, "print").mockImplementation(() => {});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () =>
+				ndjsonResponse([
+					{ type: "delta", delta: "# Partial digest" },
+					{ type: "error", error: "Digest generation failed" },
+				]),
+			),
+		);
+
+		render(<TodayRoute />);
+
+		await screen.findByRole("heading", { name: "Partial digest", level: 1 });
+		await screen.findByRole("alert");
+		expect(screen.queryByRole("button", { name: "Export PDF" })).toBeNull();
+		expect(printMock).not.toHaveBeenCalled();
 	});
 
 	it("shows request errors", async () => {
@@ -251,6 +312,31 @@ describe("today route", () => {
 				"Digest request failed (403): Remote API access requires BIRDCLAW_ALLOW_REMOTE_WEB=1 for a trusted private proxy, or BIRDCLAW_WEB_TOKEN for tokened access",
 			),
 		).toBeInTheDocument();
+	});
+
+	it("shows an actionable message when the digest connection drops", async () => {
+		const fetchMock = vi.fn(async () => {
+			throw new TypeError("network error");
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		render(<TodayRoute />);
+
+		expect(
+			await screen.findByText(
+				"Digest connection was interrupted while starting digest. Retry to continue.",
+			),
+		).toBeInTheDocument();
+		expect(screen.getByText("Digest failed")).toBeInTheDocument();
+		expect(
+			screen.getByText("No digest was generated. Retry to start a new run."),
+		).toBeInTheDocument();
+		expect(
+			screen.queryByText("Waiting for the first tokens..."),
+		).not.toBeInTheDocument();
+
+		fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 	});
 
 	it("shows fetch status before the first markdown token", async () => {

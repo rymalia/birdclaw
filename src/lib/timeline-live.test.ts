@@ -4,34 +4,29 @@ import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { birdAccountForTest } from "../test/bird-account";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
-import { listTimelineItems } from "./queries";
+import { listTimelineItems } from "./timeline-read-model";
 
 const listHomeTimelineViaBirdMock = vi.fn();
 const listHomeTimelineViaXurlMock = vi.fn();
+const getAuthenticatedBirdAccountMock = vi.fn();
 
 vi.mock("./bird", async () => {
-	const { Effect } = await import("effect");
+	const { effectFromMock } = await import("../test/effect-mocks");
 	return {
-		listHomeTimelineViaBird: (...args: unknown[]) =>
-			listHomeTimelineViaBirdMock(...args),
-		listHomeTimelineViaBirdEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => listHomeTimelineViaBirdMock(...args),
-				catch: (error) => error,
-			}),
+		getAuthenticatedBirdAccountEffect: effectFromMock(
+			getAuthenticatedBirdAccountMock,
+		),
+		listHomeTimelineViaBirdEffect: effectFromMock(listHomeTimelineViaBirdMock),
 	};
 });
 
 vi.mock("./xurl", async () => {
-	const { Effect } = await import("effect");
+	const { effectFromMock } = await import("../test/effect-mocks");
 	return {
-		listHomeTimelineViaXurlEffect: (...args: unknown[]) =>
-			Effect.tryPromise({
-				try: () => listHomeTimelineViaXurlMock(...args),
-				catch: (error) => error,
-			}),
+		listHomeTimelineViaXurlEffect: effectFromMock(listHomeTimelineViaXurlMock),
 	};
 });
 
@@ -43,15 +38,21 @@ function makeTempHome() {
 	);
 	tempDirs.push(tempDir);
 	process.env.BIRDCLAW_HOME = tempDir;
+	getAuthenticatedBirdAccountMock.mockResolvedValue({
+		id: "25401953",
+		username: "steipete",
+	});
 	return tempDir;
 }
 
 afterEach(() => {
+	delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
 	delete process.env.BIRDCLAW_HOME;
 	listHomeTimelineViaBirdMock.mockReset();
 	listHomeTimelineViaXurlMock.mockReset();
+	getAuthenticatedBirdAccountMock.mockReset();
 
 	for (const dir of tempDirs.splice(0)) {
 		rmSync(dir, { recursive: true, force: true });
@@ -59,6 +60,44 @@ afterEach(() => {
 });
 
 describe("live home timeline sync", () => {
+	it("honors config preference and does not reuse another auto preference's cache", async () => {
+		makeTempHome();
+		const { setPreferredTransport } = await import("./config");
+		setPreferredTransport("bird");
+		listHomeTimelineViaBirdMock.mockResolvedValue({ data: [], meta: {} });
+		listHomeTimelineViaXurlMock.mockResolvedValue({ data: [], meta: {} });
+		const { syncHomeTimeline } = await import("./timeline-live");
+		await expect(syncHomeTimeline({})).resolves.toMatchObject({
+			source: "bird",
+		});
+		expect(listHomeTimelineViaXurlMock).not.toHaveBeenCalled();
+		setPreferredTransport("xurl");
+		await expect(syncHomeTimeline({})).resolves.toMatchObject({
+			source: "xurl",
+		});
+	});
+
+	it("rejects a mismatched Bird account before timeline persistence", async () => {
+		makeTempHome();
+		getAuthenticatedBirdAccountMock.mockResolvedValue({
+			id: "999",
+			username: "wrong",
+		});
+		const { syncHomeTimeline } = await import("./timeline-live");
+
+		await expect(
+			syncHomeTimeline({ mode: "bird", limit: 5, refresh: true }),
+		).rejects.toThrow("refusing to sync");
+		expect(listHomeTimelineViaBirdMock).not.toHaveBeenCalled();
+		expect(
+			getNativeDb()
+				.prepare(
+					"select count(*) as count from sync_cache where cache_key like 'timeline:%'",
+				)
+				.get(),
+		).toEqual({ count: 0 });
+	});
+
 	it("keeps home timeline sync effects lazy", async () => {
 		makeTempHome();
 		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
@@ -94,9 +133,8 @@ describe("live home timeline sync", () => {
 	it("stores account-scoped home timeline edges without moving canonical tweets", async () => {
 		makeTempHome();
 		const db = getNativeDb();
-		db.prepare("update tweets set account_id = ? where id = ?").run(
-			"acct_primary",
-			"tweet_001",
+		getAuthenticatedBirdAccountMock.mockResolvedValue(
+			birdAccountForTest(db, "acct_studio"),
 		);
 		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
 			data: [
@@ -109,21 +147,37 @@ describe("live home timeline sync", () => {
 				},
 			],
 			includes: {
-				users: [{ id: "42", username: "sam", name: "Sam" }],
+				users: [
+					{
+						id: "42",
+						username: "sam",
+						name: "Sam",
+						profile_image_url:
+							"https://pbs.twimg.com/profile_images/42/avatar_normal.jpg",
+					},
+				],
 			},
 			meta: { result_count: 1 },
 		});
 		const { syncHomeTimeline } = await import("./timeline-live");
 
 		await syncHomeTimeline({
+			mode: "bird",
 			account: "acct_studio",
 			limit: 5,
 			refresh: true,
 		});
 
 		expect(
-			db.prepare("select account_id from tweets where id = ?").get("tweet_001"),
-		).toEqual({ account_id: "acct_primary" });
+			db.prepare("select id from tweets where id = ?").get("tweet_001"),
+		).toEqual({ id: "tweet_001" });
+		expect(
+			db
+				.prepare(
+					"select account_id, kind from tweet_account_edges where tweet_id = ? and account_id = ?",
+				)
+				.get("tweet_001", "acct_primary"),
+		).toEqual({ account_id: "acct_primary", kind: "home" });
 		expect(
 			db
 				.prepare(
@@ -134,6 +188,11 @@ describe("live home timeline sync", () => {
 			account_id: "acct_studio",
 			kind: "home",
 			source: "bird",
+		});
+		expect(
+			db.prepare("select avatar_url from profiles where handle = ?").get("sam"),
+		).toEqual({
+			avatar_url: "https://pbs.twimg.com/profile_images/42/avatar.jpg",
 		});
 		expect(
 			listTimelineItems({
@@ -150,6 +209,118 @@ describe("live home timeline sync", () => {
 		]);
 	});
 
+	it("persists included quoted tweets without home timeline edges", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
+			data: [
+				{
+					id: "tweet_quote_ref",
+					author_id: "42",
+					text: "read this quote",
+					created_at: "2026-04-26T13:43:34.000Z",
+					referenced_tweets: [{ type: "quoted", id: "tweet_quoted" }],
+					public_metrics: { like_count: 12 },
+				},
+			],
+			includes: {
+				users: [
+					{ id: "42", username: "sam", name: "Sam" },
+					{ id: "43", username: "alex", name: "Alex" },
+				],
+				tweets: [
+					{
+						id: "tweet_quoted",
+						author_id: "43",
+						text: "the quoted body",
+						created_at: "2026-04-25T13:43:34.000Z",
+						public_metrics: { like_count: 5 },
+					},
+				],
+			},
+			meta: { result_count: 1 },
+		});
+		const { syncHomeTimeline } = await import("./timeline-live");
+
+		await syncHomeTimeline({
+			account: "acct_primary",
+			limit: 5,
+			refresh: true,
+		});
+
+		expect(
+			db.prepare("select text from tweets where id = ?").get("tweet_quoted"),
+		).toEqual({ text: "the quoted body" });
+		expect(
+			db
+				.prepare("select tweet_id from tweet_account_edges where tweet_id = ?")
+				.get("tweet_quoted"),
+		).toBeUndefined();
+		expect(
+			listTimelineItems({
+				resource: "home",
+				account: "acct_primary",
+				search: "quote",
+				limit: 5,
+			}),
+		).toEqual([
+			expect.objectContaining({
+				id: "tweet_quote_ref",
+				quotedTweet: expect.objectContaining({
+					id: "tweet_quoted",
+					text: "the quoted body",
+				}),
+			}),
+		]);
+	});
+
+	it("preserves stored metrics when an included quote omits them", async () => {
+		makeTempHome();
+		const db = getNativeDb();
+		db.prepare(
+			`insert into tweets (
+				id, author_profile_id, text, created_at, is_replied,
+				like_count, media_count, entities_json, media_json
+			) values (?, 'profile_user_42', ?, ?, 0, 42, 0, '{}', '[]')`,
+		).run("tweet_quoted_existing", "stored quote", "2026-04-25T13:43:34.000Z");
+		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
+			data: [
+				{
+					id: "tweet_quote_ref_existing",
+					author_id: "42",
+					text: "read this existing quote",
+					created_at: "2026-04-26T13:43:34.000Z",
+					referenced_tweets: [{ type: "quoted", id: "tweet_quoted_existing" }],
+				},
+			],
+			includes: {
+				users: [{ id: "42", username: "sam", name: "Sam" }],
+				tweets: [
+					{
+						id: "tweet_quoted_existing",
+						author_id: "42",
+						text: "updated quote body",
+						created_at: "2026-04-25T13:43:34.000Z",
+					},
+				],
+			},
+			meta: { result_count: 1 },
+		});
+		const { syncHomeTimeline } = await import("./timeline-live");
+
+		await syncHomeTimeline({
+			account: "acct_primary",
+			limit: 5,
+			refresh: true,
+		});
+
+		expect(
+			db
+				.prepare("select text, like_count from tweets where id = ?")
+				.get("tweet_quoted_existing"),
+		).toEqual({ text: "updated quote body", like_count: 42 });
+	});
+
 	it("preserves existing media_json when home payload omits media details", async () => {
 		makeTempHome();
 		const db = getNativeDb();
@@ -163,10 +334,10 @@ describe("live home timeline sync", () => {
 		db.prepare(
 			`
       insert into tweets (
-        id, account_id, author_profile_id, kind, text, created_at,
-        is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-        entities_json, media_json, quoted_tweet_id
-      ) values (?, 'acct_primary', 'profile_user_42', 'home', ?, ?, 0, null, 0, 1, 0, 0, '{}', ?, null)
+		id, author_profile_id, text, created_at,
+		is_replied, reply_to_id, like_count, media_count,
+		entities_json, media_json, quoted_tweet_id
+	  ) values (?, 'profile_user_42', ?, ?, 0, null, 0, 1, '{}', ?, null)
       `,
 		).run(
 			"home_partial_media",
@@ -204,6 +375,64 @@ describe("live home timeline sync", () => {
 
 		expect(row.media_count).toBe(1);
 		expect(row.media_json).toBe(existingMediaJson);
+	});
+
+	it("persists Twitter Article metadata for timeline cards and popovers", async () => {
+		makeTempHome();
+		listHomeTimelineViaBirdMock.mockResolvedValueOnce({
+			data: [
+				{
+					id: "2066182223213293753",
+					author_id: "20571756",
+					text: "A frontier without an ecosystem is not stable",
+					created_at: "2026-06-14T15:33:24.000Z",
+					entities: {
+						article: {
+							title: "A frontier without an ecosystem is not stable",
+							previewText: "I have been thinking about the future of the firm.",
+							url: "https://x.com/satyanadella/status/2066182223213293753",
+						},
+					},
+				},
+			],
+			includes: {
+				users: [
+					{
+						id: "20571756",
+						username: "satyanadella",
+						name: "Satya Nadella",
+					},
+				],
+			},
+			meta: { result_count: 1 },
+		});
+		const { syncHomeTimeline } = await import("./timeline-live");
+
+		await syncHomeTimeline({
+			account: "acct_primary",
+			limit: 5,
+			refresh: true,
+		});
+
+		expect(
+			listTimelineItems({
+				resource: "home",
+				account: "acct_primary",
+				search: "frontier",
+				limit: 5,
+			}),
+		).toEqual([
+			expect.objectContaining({
+				id: "2066182223213293753",
+				entities: expect.objectContaining({
+					article: {
+						title: "A frontier without an ecosystem is not stable",
+						previewText: "I have been thinking about the future of the firm.",
+						url: "https://x.com/satyanadella/status/2066182223213293753",
+					},
+				}),
+			}),
+		]);
 	});
 
 	it("fetches paginated xurl home timeline and stores reply context", async () => {
@@ -419,4 +648,56 @@ describe("live home timeline sync", () => {
 		).rejects.toThrow("no xurl");
 		expect(listHomeTimelineViaBirdMock).not.toHaveBeenCalled();
 	});
+});
+
+it("stores expanded original-author avatars without adding referenced tweets to Home", async () => {
+	makeTempHome();
+	listHomeTimelineViaXurlMock.mockResolvedValueOnce({
+		data: [
+			{
+				id: "repost-avatar",
+				author_id: "9001",
+				text: "RT @original: Original post",
+				created_at: "2026-09-12T01:00:00Z",
+				referenced_tweets: [{ type: "retweeted", id: "original-avatar" }],
+			},
+		],
+		includes: {
+			tweets: [
+				{
+					id: "original-avatar",
+					author_id: "9002",
+					text: "Original post",
+					created_at: "2026-09-12T00:00:00Z",
+				},
+			],
+			users: [
+				{ id: "9001", username: "reposter", name: "Reposter" },
+				{
+					id: "9002",
+					username: "original",
+					name: "Original Author",
+					profile_image_url:
+						"https://pbs.twimg.com/profile_images/9002/avatar_normal.jpg",
+				},
+			],
+		},
+		meta: { result_count: 1 },
+	});
+	const { syncHomeTimeline } = await import("./timeline-live");
+	await syncHomeTimeline({
+		account: "acct_primary",
+		mode: "xurl",
+		limit: 5,
+		refresh: true,
+	});
+	const rows = listTimelineItems({ account: "acct_primary", resource: "home" });
+	const repost = rows.find((row) => row.id === "repost-avatar");
+	expect(repost?.retweetedTweet?.author).toMatchObject({
+		id: "profile_user_9002",
+		displayName: "Original Author",
+		avatarUrl: "https://pbs.twimg.com/profile_images/9002/avatar.jpg",
+	});
+	expect(rows.some((row) => row.id === "original-avatar")).toBe(false);
+	expect(listHomeTimelineViaXurlMock).toHaveBeenCalledTimes(1);
 });

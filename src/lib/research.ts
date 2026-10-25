@@ -1,12 +1,14 @@
+import { parseJsonField } from "./json-codec";
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { Effect } from "effect";
 import { getNativeDb } from "./db";
 import { runEffectPromise } from "./effect-runtime";
-import { listTimelineItems } from "./queries";
+import { listTimelineItems } from "./timeline-read-model";
 import { lookupTweetsByIdsEffect } from "./tweet-lookup";
 import { renderTweetMarkdown, renderTweetPlainText } from "./tweet-render";
 import type { TweetEntities, XurlMentionUser } from "./types";
+import { tweetContentFromXurl } from "./x-tweet-content";
 
 type ResearchNodeSource = "local" | "live";
 
@@ -58,9 +60,6 @@ export interface ResearchOptions {
 
 interface ResearchRow {
 	id: string;
-	account_id: string;
-	account_handle: string;
-	kind: string;
 	text: string;
 	created_at: string;
 	is_replied: number;
@@ -85,18 +84,6 @@ function trySync<T>(try_: () => T) {
 		try: try_,
 		catch: (cause) => cause,
 	});
-}
-
-function parseJsonField<T>(value: unknown, fallback: T): T {
-	if (typeof value !== "string" || value.length === 0) {
-		return fallback;
-	}
-
-	try {
-		return JSON.parse(value) as T;
-	} catch {
-		return fallback;
-	}
 }
 
 function normalizeTweetEntities(raw: unknown): TweetEntities {
@@ -215,15 +202,18 @@ function getTweetRowById(tweetId: string): ResearchRow | null {
 			`
       select
         t.id,
-        t.account_id,
-        a.handle as account_handle,
-        t.kind,
         t.text,
         t.created_at,
         t.is_replied,
         t.like_count,
-        t.bookmarked,
-        t.liked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'bookmarks'
+		) as bookmarked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'likes'
+		) as liked,
         t.reply_to_id,
         t.quoted_tweet_id,
         t.entities_json,
@@ -236,9 +226,8 @@ function getTweetRowById(tweetId: string): ResearchRow | null {
         p.avatar_url as author_avatar_url,
         p.created_at as author_created_at
       from tweets t
-      join accounts a on a.id = t.account_id
       join profiles p on p.id = t.author_profile_id
-      where t.id = ?
+	  where t.id = ? and t.deleted_at is null and t.superseded_at is null
       `,
 		)
 		.get(tweetId) as ResearchRow | undefined;
@@ -257,7 +246,7 @@ function getTweetDescendants(
       with recursive thread(id, depth, path) as (
         select id, 0 as depth, ',' || id || ',' as path
         from tweets
-        where id = ?
+		where id = ? and deleted_at is null and superseded_at is null
         union all
         select child.id, thread.depth + 1, thread.path || child.id || ','
         from tweets child
@@ -267,15 +256,18 @@ function getTweetDescendants(
       )
       select
         t.id,
-        t.account_id,
-        a.handle as account_handle,
-        t.kind,
         t.text,
         t.created_at,
         t.is_replied,
         t.like_count,
-        t.bookmarked,
-        t.liked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'bookmarks'
+		) as bookmarked,
+		exists (
+		  select 1 from tweet_collections collection
+		  where collection.tweet_id = t.id and collection.kind = 'likes'
+		) as liked,
         t.reply_to_id,
         t.quoted_tweet_id,
         t.entities_json,
@@ -290,7 +282,8 @@ function getTweetDescendants(
         thread.depth as thread_depth
       from thread
       join tweets t on t.id = thread.id
-      join accounts a on a.id = t.account_id
+	  and t.deleted_at is null
+	  and t.superseded_at is null
       join profiles p on p.id = t.author_profile_id
       order by t.created_at asc, t.id asc
       `,
@@ -309,7 +302,8 @@ function lookupTweetNodeEffect(
 		if (!tweet) {
 			return null;
 		}
-		const entities = normalizeTweetEntities(tweet.entities);
+		const content = tweetContentFromXurl(tweet);
+		const entities = content.entities;
 
 		const usersById = new Map(
 			(payload.includes?.users ?? []).map((user: XurlMentionUser) => [
@@ -329,9 +323,9 @@ function lookupTweetNodeEffect(
 			authorHandle: author.username,
 			authorName: author.name,
 			createdAt: tweet.created_at,
-			text: tweet.text,
-			plainText: renderTweetPlainText(tweet.text, entities),
-			markdown: renderTweetMarkdown(tweet.text, entities),
+			text: content.text,
+			plainText: renderTweetPlainText(content.text, entities),
+			markdown: renderTweetMarkdown(content.text, entities),
 			likeCount: Number(tweet.public_metrics?.like_count ?? 0),
 			bookmarked: false,
 			liked: false,

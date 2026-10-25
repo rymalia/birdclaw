@@ -1,13 +1,23 @@
+import { useRouteSearchState } from "#/components/useRouteSearchState";
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useDeploymentMode } from "#/lib/deployment-mode";
+import {
+	keepPreviousData,
+	useQuery,
+	useQueryClient,
+} from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AvatarChip } from "#/components/AvatarChip";
+import { useDebouncedValue } from "#/components/useDebouncedValue";
+import { blockListResponseSchema } from "#/lib/api-contracts";
+import { fetchJson, fetchQueryEnvelope, postAction } from "#/lib/api-client";
 import { formatCompactNumber } from "#/lib/present";
-import type {
-	BlockItem,
-	BlockListResponse,
-	BlockSearchItem,
-	QueryEnvelope,
-} from "#/lib/types";
+import { queryKeys } from "#/lib/query-client";
+import {
+	type BlocksRouteSearch,
+	type RouteSearchChange,
+	validateBlocksSearch,
+} from "#/lib/route-search";
 import {
 	blockRowBodyClass,
 	blockRowClass,
@@ -26,137 +36,162 @@ import {
 	statusCopyClass,
 	textFieldClass,
 	textFieldShortClass,
-	textFieldWideClass,
 	timestampClass,
 } from "#/lib/ui";
 
 export const Route = createFileRoute("/blocks")({
 	component: BlocksRoute,
+	validateSearch: validateBlocksSearch,
 });
 
 function BlocksRoute() {
-	const [meta, setMeta] = useState<QueryEnvelope | null>(null);
-	const [accountId, setAccountId] = useState<string>("acct_primary");
-	const [search, setSearch] = useState("");
-	const [items, setItems] = useState<BlockItem[]>([]);
-	const [matches, setMatches] = useState<BlockSearchItem[]>([]);
-	const [refreshTick, setRefreshTick] = useState(0);
+	const search = Route.useSearch();
+	const navigate = Route.useNavigate();
+	return (
+		<BlocksRouteView
+			searchState={search}
+			onSearchChange={(next, options) =>
+				void navigate({ search: next, replace: options?.replace })
+			}
+		/>
+	);
+}
+
+export function BlocksRouteView({
+	searchState: controlledSearch,
+	onSearchChange,
+}: {
+	searchState?: BlocksRouteSearch;
+	onSearchChange?: RouteSearchChange<BlocksRouteSearch>;
+} = {}) {
+	const queryClient = useQueryClient();
+	const { readOnly, ready } = useDeploymentMode();
+	const { searchState, updateSearch } = useRouteSearchState(
+		controlledSearch,
+		onSearchChange,
+		validateBlocksSearch,
+	);
+	const accountId = searchState.account;
+	const search = searchState.q;
+	const searchStateRef = useRef(searchState);
+	searchStateRef.current = searchState;
+	const [searchInput, setSearchInput] = useState(search);
+	const searchInputRef = useRef(search);
+	const searchInputDirtyRef = useRef(false);
+	const pendingSearchRef = useRef<string | null>(null);
 	const [isSubmitting, setIsSubmitting] = useState(false);
-	const [isSyncing, setIsSyncing] = useState(false);
 	const [message, setMessage] = useState("");
-	const [error, setError] = useState("");
+	const [actionError, setActionError] = useState("");
+	const statusQuery = useQuery({
+		queryKey: queryKeys.status,
+		queryFn: ({ signal }) => fetchQueryEnvelope({ signal }),
+	});
+	const meta = statusQuery.data ?? null;
+	const debouncedSearch = useDebouncedValue(searchInput, 180);
 	const hasAccountId = accountId.trim().length > 0;
 	const isReady = Boolean(meta);
-
-	useEffect(() => {
-		const controller = new AbortController();
-
-		fetch("/api/status", { signal: controller.signal })
-			.then((response) => response.json())
-			.then((data: QueryEnvelope) => {
-				setMeta(data);
-				setAccountId(data.accounts[0]?.id ?? "acct_primary");
-				setError("");
-			})
-			.catch((error: unknown) => {
-				if (error instanceof DOMException && error.name === "AbortError") {
-					return;
-				}
-				setError(
-					error instanceof Error
-						? error.message
-						: "Unable to load blocklist status",
-				);
+	const blocksQueryKey = [
+		...queryKeys.blocks,
+		{ accountId, search: debouncedSearch },
+	] as const;
+	const blocksQuery = useQuery({
+		queryKey: blocksQueryKey,
+		enabled: hasAccountId,
+		queryFn: async ({ signal }) => {
+			const params = new URLSearchParams({
+				account: accountId,
+				limit: "12",
 			});
-
-		return () => {
-			controller.abort();
-		};
-	}, []);
-
-	useEffect(() => {
-		const controller = new AbortController();
-		const params = new URLSearchParams({
-			account: accountId,
-			limit: "12",
-			refresh: String(refreshTick),
-		});
-		if (search.trim()) {
-			params.set("search", search.trim());
-		}
-
-		fetch(`/api/blocks?${params.toString()}`, { signal: controller.signal })
-			.then((response) => response.json())
-			.then((data: BlockListResponse) => {
-				setItems(data.items);
-				setMatches(data.matches);
-				setError("");
-			})
-			.catch((error: unknown) => {
-				if (error instanceof DOMException && error.name === "AbortError") {
-					return;
-				}
-				setError(
-					error instanceof Error ? error.message : "Unable to load blocklist",
-				);
-			});
-
-		return () => {
-			controller.abort();
-		};
-	}, [accountId, refreshTick, search]);
-
-	useEffect(() => {
-		if (!hasAccountId) {
-			return;
-		}
-
-		const controller = new AbortController();
-		setIsSyncing(true);
-
-		fetch("/api/action", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
+			if (debouncedSearch.trim()) {
+				params.set("search", debouncedSearch.trim());
+			}
+			return fetchJson(
+				`/api/blocks?${params.toString()}`,
+				{ signal },
+				blockListResponseSchema,
+				"Blocklist request failed",
+			);
+		},
+		placeholderData: keepPreviousData,
+		staleTime: 5 * 60_000,
+	});
+	const items = blocksQuery.data?.items ?? [];
+	const matches = blocksQuery.data?.matches ?? [];
+	const blockSyncQuery = useQuery({
+		queryKey: [...queryKeys.blockSync, accountId],
+		enabled: hasAccountId && ready && !readOnly,
+		retry: false,
+		queryFn: async () => {
+			const data = await postAction({
 				kind: "syncBlocks",
 				accountId,
-			}),
-			signal: controller.signal,
-		})
-			.then((response) => response.json())
-			.then(
-				(data: {
-					ok?: boolean;
-					synced?: boolean;
-					syncedCount?: number;
-					transport?: { ok?: boolean; output?: string };
-				}) => {
-					if (data.ok === false) {
-						setError(data.transport?.output ?? "Block sync failed");
-						return;
-					}
-					setRefreshTick((value) => value + 1);
-					if (data.transport?.output?.includes("disabled")) {
-						return;
-					}
-					setMessage(
-						data.transport?.output ??
-							`Synced ${String(data.syncedCount ?? 0)} remote blocks`,
-					);
-				},
-			)
-			.catch((error: unknown) => {
-				if (error instanceof DOMException && error.name === "AbortError") {
-					return;
-				}
-				setError(error instanceof Error ? error.message : "Block sync failed");
-			})
-			.finally(() => setIsSyncing(false));
+			});
+			if (data.ok === false || data.transport?.ok === false) {
+				throw new Error(data.transport?.output ?? "Block sync failed");
+			}
+			await queryClient.invalidateQueries({ queryKey: queryKeys.blocks });
+			return data;
+		},
+		staleTime: 5 * 60_000,
+	});
+	const isSyncing = blockSyncQuery.isFetching;
+	const queryError =
+		statusQuery.error ?? blocksQuery.error ?? blockSyncQuery.error ?? null;
+	const error =
+		actionError ||
+		(queryError instanceof Error
+			? queryError.message
+			: queryError
+				? "Unable to load blocklist"
+				: "");
 
-		return () => {
-			controller.abort();
-		};
-	}, [accountId, hasAccountId]);
+	useEffect(() => {
+		const pendingSearch = pendingSearchRef.current;
+		if (pendingSearch !== null) {
+			if (search !== pendingSearch) return;
+			pendingSearchRef.current = null;
+		}
+		if (searchInputDirtyRef.current) {
+			if (searchInputRef.current !== search) return;
+			searchInputDirtyRef.current = false;
+		}
+		searchInputRef.current = search;
+		setSearchInput(search);
+	}, [search]);
+
+	useEffect(() => {
+		const currentSearch = searchStateRef.current;
+		if (currentSearch.q === debouncedSearch) {
+			pendingSearchRef.current = null;
+			if (searchInputRef.current === debouncedSearch) {
+				searchInputDirtyRef.current = false;
+			}
+			return;
+		}
+		pendingSearchRef.current = debouncedSearch;
+		updateSearch({ ...currentSearch, q: debouncedSearch }, { replace: true });
+	}, [debouncedSearch]);
+
+	useEffect(() => {
+		if (!meta?.accounts.length) return;
+		if (meta.accounts.some((account) => account.id === accountId)) return;
+		updateSearch(
+			{
+				...searchState,
+				account: meta.accounts[0]?.id ?? "acct_primary",
+			},
+			{ replace: true },
+		);
+	}, [accountId, meta]);
+
+	useEffect(() => {
+		const data = blockSyncQuery.data;
+		if (!data || data.transport?.output?.includes("disabled")) return;
+		setMessage(
+			data.transport?.output ??
+				`Synced ${String(data.syncedCount ?? 0)} remote blocks`,
+		);
+	}, [blockSyncQuery.data]);
 
 	const subtitle = useMemo(() => {
 		if (!meta) {
@@ -177,26 +212,17 @@ function BlocksRoute() {
 		if (!normalized) return;
 
 		setIsSubmitting(true);
-		setError("");
+		setActionError("");
 		setMessage("");
 
 		try {
-			const response = await fetch("/api/action", {
-				method: "POST",
-				headers: { "content-type": "application/json" },
-				body: JSON.stringify({
-					kind,
-					accountId,
-					query: normalized,
-				}),
+			const data = await postAction({
+				kind,
+				accountId,
+				query: normalized,
 			});
-			const data = (await response.json()) as {
-				ok?: boolean;
-				profile?: { handle?: string };
-				transport?: { ok?: boolean; output?: string };
-			};
 			if (data.ok === false || data.transport?.ok === false) {
-				setError(data.transport?.output ?? "Blocklist action failed");
+				setActionError(data.transport?.output ?? "Blocklist action failed");
 				return;
 			}
 
@@ -205,9 +231,9 @@ function BlocksRoute() {
 					data.profile?.handle ?? normalized.replace(/^@/, "")
 				} · ${data.transport?.output ?? "local"}`,
 			);
-			setRefreshTick((value) => value + 1);
+			await queryClient.invalidateQueries({ queryKey: queryKeys.blocks });
 		} catch (submitError) {
-			setError(
+			setActionError(
 				submitError instanceof Error
 					? submitError.message
 					: "Blocklist action failed",
@@ -224,7 +250,9 @@ function BlocksRoute() {
 					<div className="flex min-w-0 flex-col">
 						<h1 className={pageTitleClass}>Blocks</h1>
 						<h2 className={cx(pageSubtitleClass, "text-[14px]")}>
-							Maintain a clean blocklist locally.
+							{readOnly
+								? "Read the cached blocklist."
+								: "Maintain a clean blocklist locally."}
 						</h2>
 						<p className={pageSubtitleClass}>{subtitle}</p>
 					</div>
@@ -233,7 +261,9 @@ function BlocksRoute() {
 					<select
 						className={cx(selectFieldClass, textFieldShortClass)}
 						disabled={!isReady}
-						onChange={(event) => setAccountId(event.target.value)}
+						onChange={(event) =>
+							updateSearch({ ...searchState, account: event.target.value })
+						}
 						value={accountId}
 					>
 						{meta?.accounts.map((account) => (
@@ -243,20 +273,23 @@ function BlocksRoute() {
 						))}
 					</select>
 					<input
-						className={cx(
-							textFieldClass,
-							textFieldWideClass,
-							"flex-1 min-w-[200px]",
-						)}
+						className={cx(textFieldClass, "flex-1 min-w-[200px]")}
 						disabled={!hasAccountId}
-						onChange={(event) => setSearch(event.target.value)}
+						onChange={(event) => {
+							const nextSearch = event.target.value;
+							searchInputRef.current = nextSearch;
+							searchInputDirtyRef.current =
+								nextSearch !== searchStateRef.current.q;
+							setSearchInput(nextSearch);
+						}}
 						placeholder="Handle, name, bio, or Twitter URL"
-						value={search}
+						value={searchInput}
 					/>
 					<button
 						className={primaryButtonClass}
-						disabled={!hasAccountId || isSubmitting || !search.trim()}
-						onClick={() => void submit("blockProfile", search)}
+						disabled={!hasAccountId || isSubmitting || !searchInput.trim()}
+						hidden={readOnly}
+						onClick={() => void submit("blockProfile", searchInput)}
 						type="button"
 					>
 						{isSubmitting ? "Working..." : "Block"}
@@ -299,6 +332,7 @@ function BlocksRoute() {
 										className={
 											match.isBlocked ? secondaryButtonClass : dangerButtonClass
 										}
+										hidden={readOnly}
 										onClick={() =>
 											void submit(
 												match.isBlocked ? "unblockProfile" : "blockProfile",
@@ -353,6 +387,7 @@ function BlocksRoute() {
 								</div>
 								<button
 									className={secondaryButtonClass}
+									hidden={readOnly}
 									onClick={() => void submit("unblockProfile", item.profile.id)}
 									type="button"
 								>

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
+import type { TweetEntities } from "./types";
 import {
 	enrichFallbackUrlEntities,
+	profileDescriptionEntitiesFromXurl,
 	renderTweetMarkdown,
 	renderTweetPlainText,
+	tweetEntitiesFromXurl,
 } from "./tweet-render";
 
 describe("tweet render helpers", () => {
@@ -34,6 +37,62 @@ describe("tweet render helpers", () => {
 				],
 			}),
 		).toBe("Hi @sam https://example.com/demo #ship");
+	});
+
+	it("normalizes X API url entities for expanded preview text", () => {
+		const entities = tweetEntitiesFromXurl({
+			urls: [
+				{
+					url: "https://t.co/demo",
+					expanded_url: "https://example.com/demo",
+					display_url: "example.com/demo",
+					start: 6,
+					end: 23,
+				},
+			],
+		});
+
+		expect(renderTweetPlainText("Read: https://t.co/demo", entities)).toBe(
+			"Read: https://example.com/demo",
+		);
+	});
+
+	it("normalizes Twitter Article metadata", () => {
+		expect(
+			tweetEntitiesFromXurl({
+				article: {
+					title: "A frontier without an ecosystem is not stable",
+					preview_text: "I have been thinking about the future of the firm.",
+					url: "https://x.com/satyanadella/status/2066182223213293753",
+				},
+			}),
+		).toEqual({
+			article: {
+				title: "A frontier without an ecosystem is not stable",
+				previewText: "I have been thinking about the future of the firm.",
+				url: "https://x.com/satyanadella/status/2066182223213293753",
+			},
+		});
+	});
+
+	it("normalizes X API profile description url entities", () => {
+		const entities = profileDescriptionEntitiesFromXurl({
+			description: {
+				urls: [
+					{
+						url: "https://t.co/bio",
+						expanded_url: "https://github.com/example-org/agent-kit",
+						display_url: "github.com/example-org/agent-kit",
+						start: 8,
+						end: 24,
+					},
+				],
+			},
+		});
+
+		expect(renderTweetPlainText("Github: https://t.co/bio", entities)).toBe(
+			"Github: https://github.com/example-org/agent-kit",
+		);
 	});
 
 	it("renders markdown with mention and url links", () => {
@@ -130,5 +189,31 @@ describe("tweet render helpers", () => {
 			imageUrl: "https://peekaboo.sh/social.png",
 			siteName: "Peekaboo",
 		});
+	});
+
+	it("normalizes legacy url entities without expanded fields", () => {
+		const legacyEntities = {
+			urls: [
+				{
+					url: "https://t.co/demo",
+					start: 10,
+					end: 27,
+				},
+			],
+		} as unknown as TweetEntities;
+		const entities = enrichFallbackUrlEntities(
+			"Check it: https://t.co/demo",
+			legacyEntities,
+		);
+
+		expect(entities.urls).toEqual([
+			{
+				url: "https://t.co/demo",
+				expandedUrl: "https://t.co/demo",
+				displayUrl: "t.co/demo",
+				start: 10,
+				end: 27,
+			},
+		]);
 	});
 });

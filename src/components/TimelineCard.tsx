@@ -6,15 +6,23 @@ import {
 	Image,
 	MessageCircle,
 	Repeat2,
+	UserSearch,
 } from "lucide-react";
-import { formatCompactNumber, formatShortTimestamp } from "#/lib/present";
+import { memo, useRef } from "react";
+import { formatCompactNumber } from "#/lib/present";
+import {
+	isTweetArticleUrlEntity,
+	normalizeTweetUrlEntityRangeForText,
+} from "#/lib/tweet-render";
 import type {
+	EmbeddedTweet,
 	TimelineItem,
 	TweetEntities,
 	TweetMediaItem,
 	TweetUrlEntity,
 } from "#/lib/types";
 import { useConversationSurface } from "#/lib/conversation-surface";
+import { useDeploymentMode } from "#/lib/deployment-mode";
 import {
 	cx,
 	embeddedCardClass,
@@ -36,9 +44,13 @@ import {
 } from "#/lib/ui";
 import { AvatarChip } from "./AvatarChip";
 import { ConversationThread } from "./ConversationThread";
+import { TweetPermalinkLink } from "./TweetPermalinkLink";
 import { EmbeddedTweetCard } from "./EmbeddedTweetCard";
 import { LinkPreviewCard } from "./LinkPreviewCard";
+import { OpenTweetLink } from "./OpenTweetLink";
 import { ProfilePreview } from "./ProfilePreview";
+import { SmartTimestamp } from "./SmartTimestamp";
+import { TweetArticleCard } from "./TweetArticleCard";
 import { TweetMediaGrid } from "./TweetMediaGrid";
 import { TweetRichText } from "./TweetRichText";
 
@@ -98,10 +110,10 @@ function isUnresolvedShortUrlEntity(entry: TweetUrlEntity) {
 	return !entry.displayUrl && isShortUrl(entry.url);
 }
 
-function unresolvedShortUrlRanges(entities: TweetEntities) {
+function unresolvedShortUrlRanges(text: string, entities: TweetEntities) {
 	return (entities.urls ?? [])
 		.filter(isUnresolvedShortUrlEntity)
-		.map((entry) => ({ start: entry.start, end: entry.end }));
+		.map((entry) => normalizeTweetUrlEntityRangeForText(text, entry));
 }
 
 function textOutsideRanges(
@@ -133,7 +145,7 @@ function shouldHideUnresolvedShortUrls(
 	mediaUrls: Set<string>,
 ) {
 	if (mediaUrls.size === 0) return false;
-	const ranges = unresolvedShortUrlRanges(entities);
+	const ranges = unresolvedShortUrlRanges(text, entities);
 	if (ranges.length === 0) return false;
 	return textOutsideRanges(text, ranges).trim().length === 0;
 }
@@ -201,7 +213,7 @@ function getHiddenMediaUrlRanges(
 				isMediaUrlEntity(entry, mediaUrls, tweetId) ||
 				(hideUnresolvedShortUrls && isUnresolvedShortUrlEntity(entry)),
 		)
-		.map((entry) => ({ start: entry.start, end: entry.end }));
+		.map((entry) => normalizeTweetUrlEntityRangeForText(text, entry));
 }
 
 function getVisibleUrlCards(
@@ -210,6 +222,9 @@ function getVisibleUrlCards(
 ) {
 	return (entities.urls ?? []).filter((entry) => {
 		if (isUnresolvedShortUrlEntity(entry)) return false;
+		if (entities.article && isTweetArticleUrlEntity(entry, entities.article)) {
+			return false;
+		}
 		if (!quotedTweetId) return true;
 		return !entry.expandedUrl.includes(quotedTweetId);
 	});
@@ -218,11 +233,60 @@ function getVisibleUrlCards(
 function isInteractiveTarget(target: EventTarget | null) {
 	return (
 		target instanceof Element &&
-		Boolean(target.closest("a,button,input,textarea,select,[role='button']"))
+		Boolean(
+			target.closest("a,button,video,input,textarea,select,[role='button']"),
+		)
 	);
 }
 
-export function TimelineCard({
+function TweetPresentation({
+	tweet,
+	hiddenUrlRanges,
+	visibleUrlCards,
+	replyToTweet,
+	quotedTweet,
+}: {
+	tweet: TimelineItem | EmbeddedTweet;
+	hiddenUrlRanges: Array<{ start: number; end: number }>;
+	visibleUrlCards: TweetUrlEntity[];
+	replyToTweet?: EmbeddedTweet | null;
+	quotedTweet?: EmbeddedTweet | null;
+}) {
+	return (
+		<>
+			<TweetRichText
+				className={feedRowTextClass}
+				collapsible={Boolean(tweet.noteTweet)}
+				entities={tweet.entities}
+				hiddenUrlRanges={hiddenUrlRanges}
+				text={tweet.text}
+			/>
+			<TweetMediaGrid items={tweet.media} tweetId={tweet.id} />
+			{tweet.entities.article ? (
+				<TweetArticleCard article={tweet.entities.article} />
+			) : null}
+			{replyToTweet ? (
+				<div className={embeddedCardClass}>
+					<EmbeddedTweetCard item={replyToTweet} label="In reply to" />
+				</div>
+			) : null}
+			{quotedTweet ? (
+				<div className={embeddedCardClass}>
+					<EmbeddedTweetCard item={quotedTweet} label="Quoted tweet" />
+				</div>
+			) : null}
+			{visibleUrlCards.map((entry, index) => (
+				<LinkPreviewCard
+					key={`${entry.expandedUrl}-${String(index)}`}
+					entry={entry}
+					index={index}
+				/>
+			))}
+		</>
+	);
+}
+
+export const TimelineCard = memo(function TimelineCard({
 	item,
 	onReply,
 	showReplyControls = true,
@@ -231,8 +295,12 @@ export function TimelineCard({
 	onReply: (tweetId: string) => void;
 	showReplyControls?: boolean;
 }) {
+	const { readOnly } = useDeploymentMode();
 	const canReply =
-		showReplyControls && item.kind !== "like" && item.kind !== "bookmark";
+		!readOnly &&
+		showReplyControls &&
+		item.kind !== "like" &&
+		item.kind !== "bookmark";
 	const displayTweet = item.retweetedTweet ?? item;
 	const displayTweetId = displayTweet.id;
 	const interactionTweetId =
@@ -241,6 +309,9 @@ export function TimelineCard({
 			: displayTweetId;
 	const displayAuthor = displayTweet.author;
 	const conversation = useConversationSurface(item.id, interactionTweetId);
+	const pointerType = useRef("");
+	const noThreads =
+		conversation.status === "ready" && conversation.items.length <= 1;
 	const visibleEntities = getVisibleEntities(
 		displayTweet.entities,
 		displayTweet.media,
@@ -274,13 +345,43 @@ export function TimelineCard({
 
 	return (
 		<article
-			className={cx(feedRowClass, "cursor-pointer")}
+			className={cx(
+				feedRowClass,
+				"[content-visibility:auto] [contain-intrinsic-size:auto_280px]",
+				!noThreads && "cursor-pointer",
+			)}
 			data-perf="timeline-card"
 			onFocus={conversation.prefetch}
 			onMouseEnter={conversation.prefetch}
+			onPointerDown={(event) => {
+				pointerType.current = event.pointerType;
+			}}
+			onPointerCancel={() => {
+				pointerType.current = "";
+			}}
 			onClick={(event) => {
+				// Some browsers still emit MouseEvent clicks after touch pointers.
+				const inputType =
+					"pointerType" in event.nativeEvent
+						? event.nativeEvent.pointerType
+						: event.detail === 0
+							? ""
+							: pointerType.current;
+				pointerType.current = "";
 				if (isInteractiveTarget(event.target)) return;
-				conversation.toggle();
+				const selection = window.getSelection();
+				if (
+					selection &&
+					!selection.isCollapsed &&
+					(event.currentTarget.contains(selection.anchorNode) ||
+						event.currentTarget.contains(selection.focusNode))
+				)
+					return;
+				if (inputType === "touch") {
+					conversation.closeAny();
+				} else if (!noThreads) {
+					conversation.toggle();
+				}
 			}}
 		>
 			<AvatarChip
@@ -310,9 +411,10 @@ export function TimelineCard({
 						</span>
 					</ProfilePreview>
 					<span className={feedRowDotClass}>·</span>
-					<span className={feedRowTimestampClass}>
-						{formatShortTimestamp(displayTweet.createdAt)}
-					</span>
+					<SmartTimestamp
+						className={feedRowTimestampClass}
+						value={displayTweet.createdAt}
+					/>
 					{canReply || hasConversation ? (
 						<span className="ml-auto inline-flex items-center gap-1">
 							{hasConversation ? (
@@ -350,81 +452,53 @@ export function TimelineCard({
 						</span>
 					) : null}
 				</header>
-				{item.retweetedTweet ? (
-					<>
-						<TweetRichText
-							className={feedRowTextClass}
-							entities={displayTweet.entities}
-							hiddenUrlRanges={hiddenMediaUrlRanges}
-							text={displayTweet.text}
-						/>
-						<TweetMediaGrid items={displayTweet.media} />
-						{visibleUrlCards.map((entry, index) => (
-							<LinkPreviewCard
-								key={`${entry.expandedUrl}-${String(index)}`}
-								entry={entry}
-								index={index}
-							/>
-						))}
-					</>
-				) : (
-					<>
-						<TweetRichText
-							className={feedRowTextClass}
-							entities={item.entities}
-							hiddenUrlRanges={hiddenMediaUrlRanges}
-							text={item.text}
-						/>
-						<TweetMediaGrid items={item.media} />
-						{item.replyToTweet ? (
-							<div className={embeddedCardClass}>
-								<EmbeddedTweetCard
-									item={item.replyToTweet}
-									label="In reply to"
-								/>
-							</div>
-						) : null}
-						{item.quotedTweet ? (
-							<div className={embeddedCardClass}>
-								<EmbeddedTweetCard
-									item={item.quotedTweet}
-									label="Quoted tweet"
-								/>
-							</div>
-						) : null}
-						{visibleUrlCards.map((entry, index) => (
-							<LinkPreviewCard
-								key={`${entry.expandedUrl}-${String(index)}`}
-								entry={entry}
-								index={index}
-							/>
-						))}
-					</>
-				)}
+				<TweetPresentation
+					hiddenUrlRanges={hiddenMediaUrlRanges}
+					quotedTweet={item.retweetedTweet ? null : item.quotedTweet}
+					replyToTweet={item.retweetedTweet ? null : item.replyToTweet}
+					tweet={displayTweet}
+					visibleUrlCards={visibleUrlCards}
+				/>
 				<footer className={feedRowActionsClass}>
-					<div className="flex items-center gap-3 text-[13px] text-[var(--ink-soft)]">
-						<button
-							aria-expanded={conversation.isOpen}
-							aria-label={
-								conversation.isOpen ? "Hide conversation" : "Show conversation"
-							}
-							className={feedActionButtonClass}
-							onClick={(event) => {
-								event.stopPropagation();
-								conversation.toggle();
-							}}
-							type="button"
-						>
-							<span className={feedActionIconWrapClass}>
-								<MessageCircle
-									className={feedActionIconClass}
-									strokeWidth={1.7}
-								/>
+					<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] text-[var(--ink-soft)]">
+						{noThreads ? (
+							<span className="inline-flex items-center gap-1 px-2 py-1 text-[13px]">
+								<span className={feedActionIconWrapClass}>
+									<MessageCircle
+										className={feedActionIconClass}
+										strokeWidth={1.7}
+									/>
+								</span>
+								no threads
 							</span>
-							<span className="text-[13px]">
-								{conversation.isOpen ? "Hide thread" : "Thread"}
-							</span>
-						</button>
+						) : (
+							<button
+								aria-expanded={conversation.isOpen}
+								aria-label={
+									conversation.isOpen
+										? "Hide conversation"
+										: "Show conversation"
+								}
+								className={feedActionButtonClass}
+								onClick={(event) => {
+									event.stopPropagation();
+									conversation.toggle();
+								}}
+								type="button"
+							>
+								<span className={feedActionIconWrapClass}>
+									<MessageCircle
+										className={feedActionIconClass}
+										strokeWidth={1.7}
+									/>
+								</span>
+								<span className="text-[13px]">
+									{conversation.isOpen ? "Hide thread" : "Thread"}
+								</span>
+							</button>
+						)}
+						<OpenTweetLink tweetId={interactionTweetId} />
+						<TweetPermalinkLink tweetId={interactionTweetId} />
 						{canReply ? (
 							<button
 								className={feedActionButtonClass}
@@ -444,6 +518,21 @@ export function TimelineCard({
 								<span className="text-[13px]">Reply</span>
 							</button>
 						) : null}
+						<a
+							hidden={readOnly}
+							aria-label={`Analyse @${displayAuthor.handle}`}
+							className={feedActionButtonClass}
+							href={`/profiles/${encodeURIComponent(displayAuthor.handle)}`}
+							onClick={(event) => {
+								event.stopPropagation();
+							}}
+							title={`Analyse @${displayAuthor.handle}`}
+						>
+							<span className={feedActionIconWrapClass}>
+								<UserSearch className={feedActionIconClass} strokeWidth={1.7} />
+							</span>
+							<span className="text-[13px]">Analyse</span>
+						</a>
 						{showLikeIndicator ? (
 							<span
 								aria-label={`${formatCompactNumber(displayLikeCount)} likes`}
@@ -485,7 +574,7 @@ export function TimelineCard({
 						) : null}
 					</div>
 				</footer>
-				{conversation.isOpen ? (
+				{conversation.isOpen && !noThreads ? (
 					<ConversationThread
 						anchorId={interactionTweetId}
 						error={conversation.error}
@@ -496,4 +585,4 @@ export function TimelineCard({
 			</div>
 		</article>
 	);
-}
+});

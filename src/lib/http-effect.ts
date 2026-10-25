@@ -1,7 +1,50 @@
 import { Effect } from "effect";
 import { runEffectPromise, tryPromise } from "./effect-runtime";
+import { LOCAL_WEB_PEER_HEADER } from "./local-peer";
+import { isReadOnlyDeployment } from "./config";
+
+export { LOCAL_WEB_PEER_HEADER } from "./local-peer";
 
 const LOCAL_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+const ARCHIVE_READ_APIS = new Set([
+	"/api/status",
+	"/api/query",
+	"/api/inbox",
+	"/api/blocks",
+	"/api/conversation",
+	"/api/network-map",
+	"/api/avatar",
+	"/api/link-preview",
+	"/api/link-insights",
+]);
+
+export function readOnlyRequestErrorResponse(
+	request: Pick<Request, "url" | "method">,
+	apiRoute = false,
+) {
+	if (!isReadOnlyDeployment()) return null;
+	if (request.method !== "GET" && request.method !== "HEAD") {
+		return jsonResponse(
+			{ ok: false, message: "This archive deployment is read-only" },
+			{ status: 405 },
+		);
+	}
+	const pathname = new URL(request.url).pathname;
+	if (
+		(apiRoute || pathname.startsWith("/api/")) &&
+		!ARCHIVE_READ_APIS.has(pathname)
+	) {
+		return jsonResponse(
+			{
+				ok: false,
+				message:
+					"This operation is unavailable in a read-only archive deployment",
+			},
+			{ status: 403 },
+		);
+	}
+	return null;
+}
 
 export function jsonResponse(data: unknown, init?: ResponseInit) {
 	const headers = new Headers(init?.headers);
@@ -83,8 +126,12 @@ function isLocalWebHost(value: string) {
 	return LOCAL_HOSTS.has(host) || host.endsWith(".localhost");
 }
 
-function allowsUnauthenticatedLocalWeb() {
-	return process.env.BIRDCLAW_LOCAL_WEB === "1";
+function allowsUnauthenticatedLocalWeb(request: Request) {
+	const mode = process.env.BIRDCLAW_LOCAL_WEB;
+	if (mode === "socket") {
+		return request.headers.get(LOCAL_WEB_PEER_HEADER) === "1";
+	}
+	return mode === "1";
 }
 
 function hasForwardedRequestHeaders(request: Request) {
@@ -131,10 +178,12 @@ function sameRequestOrigin(request: Request, origin: string, url: URL) {
 }
 
 export function sensitiveRequestErrorResponse(request: Request) {
+	const readOnlyDenied = readOnlyRequestErrorResponse(request, true);
+	if (readOnlyDenied) return readOnlyDenied;
 	const url = new URL(request.url);
 	const token = requestWebTokenStatus(request);
 	const isLocalRequest =
-		allowsUnauthenticatedLocalWeb() &&
+		allowsUnauthenticatedLocalWeb(request) &&
 		isLocalWebHost(url.hostname) &&
 		!hasForwardedRequestHeaders(request);
 	const fetchSite = request.headers.get("sec-fetch-site");

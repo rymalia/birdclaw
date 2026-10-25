@@ -6,7 +6,7 @@ import { Effect } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
-import { listTimelineItems } from "./queries";
+import { listTimelineItems } from "./timeline-read-model";
 
 const mocks = vi.hoisted(() => ({
 	listThreadViaBird: vi.fn(),
@@ -14,32 +14,20 @@ const mocks = vi.hoisted(() => ({
 	getTweetById: vi.fn(),
 }));
 
-vi.mock("./bird", () => ({
-	listThreadViaBird: mocks.listThreadViaBird,
-	listThreadViaBirdEffect: (options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.listThreadViaBird(options),
-			catch: (error) => error,
-		}),
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return { listThreadViaBirdEffect: effectFromMock(mocks.listThreadViaBird) };
+});
 
-vi.mock("./xurl", () => ({
-	searchRecentByConversationId: mocks.searchRecentByConversationId,
-	searchRecentByConversationIdEffect: (
-		conversationId: string,
-		options: unknown,
-	) =>
-		Effect.tryPromise({
-			try: () => mocks.searchRecentByConversationId(conversationId, options),
-			catch: (error) => error,
-		}),
-	getTweetById: mocks.getTweetById,
-	getTweetByIdEffect: (id: string, options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.getTweetById(id, options),
-			catch: (error) => error,
-		}),
-}));
+vi.mock("./xurl", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return {
+		searchRecentByConversationIdEffect: effectFromMock(
+			mocks.searchRecentByConversationId,
+		),
+		getTweetByIdEffect: effectFromMock(mocks.getTweetById),
+	};
+});
 
 const tempRoots: string[] = [];
 
@@ -51,31 +39,36 @@ function setupTempHome() {
 	resetDatabaseForTests();
 	const db = getNativeDb();
 	db.exec(
-		"delete from tweet_account_edges; delete from tweets; delete from tweets_fts;",
+		"delete from tweet_account_edges; delete from tweet_collections; delete from tweets; delete from tweets_fts;",
 	);
 	db.prepare(
 		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, 'acct_primary', 'profile_user_42', 'mention', ?, ?, 0, null, 0, 0, 0, 0, '{}', '[]', null)
+	  id, author_profile_id, text, created_at,
+	  is_replied, reply_to_id, like_count, media_count,
+	  entities_json, media_json, quoted_tweet_id
+	) values (?, 'profile_user_42', ?, ?, 0, null, 0, 0, '{}', '[]', null)
     `,
 	).run("mention_1", "mention text", "2026-05-04T07:00:00.000Z");
+	upsertMentionEdge("mention_1", {
+		id: "mention_1",
+		text: "mention text",
+		created_at: "2026-05-04T07:00:00.000Z",
+	});
 }
 
 function insertMention(id: string, text: string, createdAt: string) {
-	getNativeDb()
-		.prepare(
-			`
+	const db = getNativeDb();
+	db.prepare(
+		`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at,
-      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
-      entities_json, media_json, quoted_tweet_id
-    ) values (?, 'acct_primary', 'profile_user_42', 'mention', ?, ?, 0, null, 0, 0, 0, 0, '{}', '[]', null)
+	  id, author_profile_id, text, created_at,
+	  is_replied, reply_to_id, like_count, media_count,
+	  entities_json, media_json, quoted_tweet_id
+	) values (?, 'profile_user_42', ?, ?, 0, null, 0, 0, '{}', '[]', null)
     `,
-		)
-		.run(id, text, createdAt);
+	).run(id, text, createdAt);
+	upsertMentionEdge(id, { id, text, created_at: createdAt }, createdAt);
 }
 
 function upsertMentionEdge(
@@ -101,6 +94,7 @@ function upsertMentionEdge(
 }
 
 afterEach(() => {
+	delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
 	delete process.env.BIRDCLAW_HOME;
@@ -113,11 +107,28 @@ afterEach(() => {
 });
 
 describe("mention thread sync", () => {
+	it("uses Bird first for auto threads and falls back to xurl", async () => {
+		setupTempHome();
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "bird";
+		mocks.listThreadViaBird.mockResolvedValue({ data: [], meta: {} });
+		const { syncMentionThreads } = await import("./mention-threads-live");
+		await expect(
+			syncMentionThreads({ mode: "auto", limit: 1, delayMs: 0 }),
+		).resolves.toMatchObject({ source: "bird", failed: 0 });
+		expect(mocks.getTweetById).not.toHaveBeenCalled();
+		mocks.listThreadViaBird.mockRejectedValueOnce(new Error("offline"));
+		mocks.getTweetById.mockResolvedValue({ data: [] });
+		await expect(
+			syncMentionThreads({ mode: "auto", limit: 1, delayMs: 0 }),
+		).resolves.toMatchObject({ source: "xurl", failed: 0 });
+	});
+
 	it("builds mention thread sync effects lazily", async () => {
 		setupTempHome();
 		const { syncMentionThreadsEffect } = await import("./mention-threads-live");
 
 		const effect = syncMentionThreadsEffect({
+			mode: "bird",
 			limit: 1,
 			delayMs: 0,
 			timeoutMs: 5000,
@@ -148,7 +159,7 @@ describe("mention thread sync", () => {
 		setupTempHome();
 		const { syncMentionThreadsEffect } = await import("./mention-threads-live");
 
-		const effect = syncMentionThreadsEffect({ limit: 0 });
+		const effect = syncMentionThreadsEffect({ mode: "bird", limit: 0 });
 
 		await expect(Effect.runPromise(effect)).rejects.toThrow(
 			"--limit must be at least 1",
@@ -198,13 +209,19 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			limit: 1,
 			delayMs: 0,
 			timeoutMs: 5000,
 		});
 		const db = getNativeDb();
 		const sideReply = db
-			.prepare("select kind, reply_to_id from tweets where id = ?")
+			.prepare("select reply_to_id from tweets where id = ?")
+			.get("side_reply_1");
+		const sideReplyContext = db
+			.prepare(
+				"select kind from tweet_account_edges where tweet_id = ? and kind = 'thread_context'",
+			)
 			.get("side_reply_1");
 		const home = listTimelineItems({ resource: "home", limit: 10 });
 		const mentions = listTimelineItems({ resource: "mentions", limit: 10 });
@@ -231,7 +248,8 @@ describe("mention thread sync", () => {
 			kind: "mention",
 			replyToTweet: expect.objectContaining({ id: "root_1" }),
 		});
-		expect(sideReply).toEqual({ kind: "thread", reply_to_id: "root_1" });
+		expect(sideReply).toEqual({ reply_to_id: "root_1" });
+		expect(sideReplyContext).toEqual({ kind: "thread_context" });
 	});
 
 	it("hydrates explicit mention ids instead of the newest mentions", async () => {
@@ -255,6 +273,7 @@ describe("mention thread sync", () => {
 		const progress: unknown[] = [];
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			tweetIds: ["mention_1"],
 			limit: 5,
 			delayMs: 0,
@@ -283,6 +302,7 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			tweetIds: [],
 			limit: 5,
 			delayMs: 0,
@@ -334,7 +354,12 @@ describe("mention thread sync", () => {
 		});
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
-		await syncMentionThreads({ limit: 1, delayMs: 0, timeoutMs: 5000 });
+		await syncMentionThreads({
+			mode: "bird",
+			limit: 1,
+			delayMs: 0,
+			timeoutMs: 5000,
+		});
 		const row = getNativeDb()
 			.prepare("select media_count, media_json from tweets where id = ?")
 			.get("mention_1") as { media_count: number; media_json: string };
@@ -379,7 +404,12 @@ describe("mention thread sync", () => {
 		});
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
-		await syncMentionThreads({ limit: 1, delayMs: 0, timeoutMs: 5000 });
+		await syncMentionThreads({
+			mode: "bird",
+			limit: 1,
+			delayMs: 0,
+			timeoutMs: 5000,
+		});
 		const row = getNativeDb()
 			.prepare("select media_count, media_json from tweets where id = ?")
 			.get("mention_1") as { media_count: number; media_json: string };
@@ -394,6 +424,7 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			limit: 1,
 			delayMs: 0,
 			timeoutMs: 1000,
@@ -440,6 +471,7 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			limit: 2,
 			delayMs: 1,
 			timeoutMs: 1200,
@@ -500,6 +532,7 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
+			mode: "bird",
 			limit: 2,
 			delayMs: 0,
 			timeoutMs: 5000,
@@ -566,7 +599,6 @@ describe("mention thread sync", () => {
 		const { syncMentionThreads } = await import("./mention-threads-live");
 
 		const result = await syncMentionThreads({
-			mode: "xurl",
 			limit: 1,
 			delayMs: 0,
 		});
@@ -577,7 +609,7 @@ describe("mention thread sync", () => {
 			)
 			.all();
 		const root = db
-			.prepare("select kind from tweets where id = ?")
+			.prepare("select id from tweets where id = ?")
 			.get("root_recent");
 
 		expect(result).toMatchObject({
@@ -612,7 +644,7 @@ describe("mention thread sync", () => {
 			{ tweet_id: "mention_recent", kind: "thread_context", source: "xurl" },
 			{ tweet_id: "root_recent", kind: "thread_context", source: "xurl" },
 		]);
-		expect(root).toEqual({ kind: "thread" });
+		expect(root).toEqual({ id: "root_recent" });
 
 		await syncMentionThreads({ mode: "xurl", limit: 1, delayMs: 0 });
 		const edgeCount = db
@@ -625,6 +657,11 @@ describe("mention thread sync", () => {
 
 	it("classifies xurl context tweets authored by the account as home", async () => {
 		setupTempHome();
+		getNativeDb()
+			.prepare(
+				"update accounts set handle = '@Steipete' where id = 'acct_primary'",
+			)
+			.run();
 		insertMention(
 			"mention_own_context",
 			"reply to own context",
@@ -669,7 +706,9 @@ describe("mention thread sync", () => {
 		await syncMentionThreads({ mode: "xurl", limit: 1, delayMs: 0 });
 
 		const row = getNativeDb()
-			.prepare("select kind from tweets where id = ?")
+			.prepare(
+				"select kind from tweet_account_edges where tweet_id = ? and kind = 'home'",
+			)
 			.get("own_context_root");
 		const home = listTimelineItems({ resource: "home", limit: 10 });
 		expect(row).toEqual({ kind: "home" });
@@ -1157,15 +1196,29 @@ describe("mention thread sync", () => {
 			.prepare(
 				`
 	    insert into tweets (
-	      id, account_id, author_profile_id, kind, text, created_at,
-	      is_replied, reply_to_id, like_count, media_count, bookmarked, liked,
+	      id, author_profile_id, text, created_at,
+	      is_replied, reply_to_id, like_count, media_count,
 	      entities_json, media_json, quoted_tweet_id
 	    ) values (
-	      'authored_context', 'acct_primary', 'profile_user_25401953',
-	      'authored', 'authored original', '2026-05-12T09:58:00.000Z',
-	      0, null, 1, 1, 0, 0, '{}', '[{"url":"https://img.example/authored.jpg","type":"image"}]', null
+	      'authored_context', 'profile_user_25401953',
+	      'authored original', '2026-05-12T09:58:00.000Z',
+	      0, null, 1, 1, '{}', '[{"url":"https://img.example/authored.jpg","type":"image"}]', null
 	    )
 	    `,
+			)
+			.run();
+		getNativeDb()
+			.prepare(
+				`
+				insert into tweet_account_edges (
+				  account_id, tweet_id, kind, first_seen_at, last_seen_at,
+				  seen_count, source, raw_json, updated_at
+				) values (
+				  'acct_primary', 'authored_context', 'authored',
+				  '2026-05-12T09:58:00.000Z', '2026-05-12T09:58:00.000Z',
+				  1, 'test', '{}', '2026-05-12T09:58:00.000Z'
+				)
+				`,
 			)
 			.run();
 		upsertMentionEdge("mention_to_authored", {
@@ -1208,16 +1261,22 @@ describe("mention thread sync", () => {
 
 		const row = getNativeDb()
 			.prepare(
-				"select kind, text, like_count, media_count, media_json from tweets where id = ?",
+				"select text, like_count, media_count, media_json from tweets where id = ?",
 			)
 			.get("authored_context");
 		expect(row).toEqual({
-			kind: "authored",
 			text: "authored original with fresh context",
 			like_count: 5,
 			media_count: 1,
 			media_json: '[{"url":"https://img.example/authored.jpg","type":"image"}]',
 		});
+		expect(
+			getNativeDb()
+				.prepare(
+					"select kind from tweet_account_edges where tweet_id = ? and kind = 'authored'",
+				)
+				.get("authored_context"),
+		).toEqual({ kind: "authored" });
 	});
 
 	it("prefers fetched anchor data when cached xurl mentions lack parent metadata", async () => {
@@ -1453,7 +1512,15 @@ describe("mention thread sync", () => {
 		});
 		const chainRows = getNativeDb()
 			.prepare(
-				"select id, kind, reply_to_id from tweets where id in (?, ?, ?) order by id",
+				"select id, reply_to_id from tweets where id in (?, ?, ?) order by id",
+			)
+			.all("mention_old", "parent_old", "root_old");
+		const classifiedEdges = getNativeDb()
+			.prepare(
+				`select tweet_id, kind
+				 from tweet_account_edges
+				 where tweet_id in (?, ?, ?) and kind in ('mention', 'home')
+				 order by tweet_id, kind`,
 			)
 			.all("mention_old", "parent_old", "root_old");
 
@@ -1485,9 +1552,13 @@ describe("mention thread sync", () => {
 			],
 		});
 		expect(chainRows).toEqual([
-			{ id: "mention_old", kind: "mention", reply_to_id: "parent_old" },
-			{ id: "parent_old", kind: "thread", reply_to_id: "root_old" },
-			{ id: "root_old", kind: "home", reply_to_id: null },
+			{ id: "mention_old", reply_to_id: "parent_old" },
+			{ id: "parent_old", reply_to_id: "root_old" },
+			{ id: "root_old", reply_to_id: null },
+		]);
+		expect(classifiedEdges).toEqual([
+			{ tweet_id: "mention_old", kind: "mention" },
+			{ tweet_id: "root_old", kind: "home" },
 		]);
 	});
 
@@ -1559,16 +1630,16 @@ describe("mention thread sync", () => {
 			"--limit must be at least 1",
 		);
 		await expect(syncMentionThreads({ delayMs: -1 })).rejects.toThrow(
-			"--delay-ms must be non-negative",
+			"--delay-ms must be a non-negative integer",
 		);
 		await expect(syncMentionThreads({ timeoutMs: 0 })).rejects.toThrow(
 			"--timeout-ms must be at least 1",
 		);
 		await expect(syncMentionThreads({ maxPages: -1 })).rejects.toThrow(
-			"--max-pages must be non-negative",
+			"--max-pages must be at least 0",
 		);
-		await expect(syncMentionThreads({ mode: "auto" })).rejects.toThrow(
-			"--mode must be bird or xurl",
+		await expect(syncMentionThreads({ mode: "invalid" })).rejects.toThrow(
+			"--mode must be auto, bird, or xurl",
 		);
 		await expect(syncMentionThreads({ account: "missing" })).rejects.toThrow(
 			"Unknown account: missing",

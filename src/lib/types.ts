@@ -1,52 +1,19 @@
-export type ResourceKind = "home" | "mentions" | "authored" | "search" | "dms";
-export type InboxKind = "mixed" | "mentions" | "dms";
+import type { z } from "zod";
+import type * as contracts from "./api-contracts";
+import type { FollowDirection, InboxKind, ResourceKind } from "./api-enums";
+
+export type { FollowDirection, InboxKind, ResourceKind } from "./api-enums";
 
 export type ReplyFilter = "all" | "replied" | "unreplied";
 export type TimelineQualityFilter = "all" | "summary";
 
-export interface AccountRecord {
-	id: string;
-	name: string;
-	handle: string;
-	externalUserId?: string | null;
-	profileId?: string;
-	avatarHue?: number;
-	avatarUrl?: string;
-	transport: string;
-	isDefault: number;
-	createdAt: string;
-}
+export type AccountRecord = z.infer<typeof contracts.accountRecordSchema>;
 
-export interface ProfileRecord {
-	id: string;
-	handle: string;
-	displayName: string;
-	bio: string;
-	followersCount: number;
-	followingCount?: number;
-	avatarHue: number;
-	avatarUrl?: string;
-	location?: string;
-	url?: string;
-	verifiedType?: string;
-	entities?: Record<string, unknown>;
-	affiliations?: ProfileAffiliation[];
-	primaryAffiliation?: ProfileAffiliation;
-	createdAt: string;
-}
+export type ProfileRecord = z.infer<typeof contracts.profileRecordSchema>;
 
-export interface ProfileAffiliation {
-	organizationProfileId: string;
-	organizationName?: string;
-	organizationHandle?: string;
-	badgeUrl?: string | null;
-	url?: string | null;
-	label?: string | null;
-	source: string;
-	firstSeenAt: string;
-	lastSeenAt: string;
-	isActive: boolean;
-}
+export type ProfileAffiliation = z.infer<
+	typeof contracts.profileAffiliationSchema
+>;
 
 export interface ProfileSnapshot {
 	profileId: string;
@@ -75,137 +42,37 @@ export interface ProfileBioEntity {
 	isActive: boolean;
 }
 
-export interface TweetMentionEntity {
-	username: string;
-	id?: string;
-	start: number;
-	end: number;
-	profile?: ProfileRecord;
-}
+export type TweetMentionEntity = NonNullable<TweetEntities["mentions"]>[number];
 
-export interface TweetUrlEntity {
-	url: string;
-	expandedUrl: string;
-	displayUrl: string;
-	start: number;
-	end: number;
-	title?: string;
-	description?: string | null;
-	imageUrl?: string | null;
-	siteName?: string | null;
-}
+export type TweetUrlEntity = NonNullable<TweetEntities["urls"]>[number];
 
-export interface TweetHashtagEntity {
-	tag: string;
-	start: number;
-	end: number;
-}
+export type TweetHashtagEntity = NonNullable<TweetEntities["hashtags"]>[number];
 
-export interface TweetEntities {
-	mentions?: TweetMentionEntity[];
-	urls?: TweetUrlEntity[];
-	hashtags?: TweetHashtagEntity[];
-}
+export type TweetArticle = NonNullable<TweetEntities["article"]>;
 
-export interface TweetMediaItem {
-	url: string;
-	type: "image" | "video" | "gif" | "unknown";
-	altText?: string;
-	width?: number;
-	height?: number;
-	thumbnailUrl?: string;
-	durationMs?: number;
-	variants?: Array<{
-		url: string;
-		contentType?: string;
-		bitRate?: number;
-	}>;
-}
+export type TweetEntities = z.infer<typeof contracts.tweetEntitiesSchema>;
 
-export interface EmbeddedTweet {
-	id: string;
-	text: string;
-	createdAt: string;
-	replyToId?: string | null;
-	isReplied?: boolean;
-	likeCount?: number;
-	mediaCount?: number;
-	bookmarked?: boolean;
-	liked?: boolean;
-	author: ProfileRecord;
-	entities: TweetEntities;
-	media: TweetMediaItem[];
-}
+export type NoteTweet = z.infer<typeof contracts.noteTweetSchema>;
 
-export interface TweetConversationResponse {
+export type TweetMediaItem = z.infer<typeof contracts.tweetMediaSchema>;
+
+export type EmbeddedTweet = z.infer<typeof contracts.embeddedTweetSchema>;
+
+export interface TweetConversation {
 	anchorId: string;
 	items: EmbeddedTweet[];
+	truncated: boolean;
 }
 
-export interface BlockItem {
-	accountId: string;
-	accountHandle: string;
-	source: string;
-	blockedAt: string;
-	profile: ProfileRecord;
-}
+export type BlockItem = z.infer<typeof contracts.blockItemSchema>;
 
-export interface BlockSearchItem {
-	profile: ProfileRecord;
-	isBlocked: boolean;
-	blockedAt?: string;
-}
+export type BlockSearchItem = z.infer<typeof contracts.blockSearchItemSchema>;
 
-export interface BlockListResponse {
-	items: BlockItem[];
-	matches: BlockSearchItem[];
-}
+export type TimelineItem = z.infer<typeof contracts.timelineItemSchema>;
 
-export interface TimelineItem {
-	id: string;
-	accountId: string;
-	accountHandle: string;
-	kind: "home" | "mention" | "authored" | "search" | "like" | "bookmark";
-	text: string;
-	searchSnippet?: string;
-	createdAt: string;
-	replyToId?: string | null;
-	isReplied: boolean;
-	likeCount: number;
-	mediaCount: number;
-	bookmarked: boolean;
-	liked: boolean;
-	author: ProfileRecord;
-	entities: TweetEntities;
-	media: TweetMediaItem[];
-	replyToTweet?: EmbeddedTweet | null;
-	quotedTweet?: EmbeddedTweet | null;
-	retweetedTweet?: EmbeddedTweet | null;
-	qualityReason?: string | null;
-}
+export type DmMessageItem = z.infer<typeof contracts.dmMessageSchema>;
 
-export interface DmMessageItem {
-	id: string;
-	conversationId: string;
-	text: string;
-	createdAt: string;
-	direction: "inbound" | "outbound";
-	isReplied: boolean;
-	mediaCount: number;
-	sender: ProfileRecord;
-}
-
-export interface UrlExpansionItem {
-	url: string;
-	expandedUrl: string;
-	finalUrl: string;
-	status: "hit" | "miss" | "error";
-	source: "cache" | "network";
-	title?: string;
-	description?: string | null;
-	error?: string;
-	updatedAt: string;
-}
+export type UrlExpansionItem = z.infer<typeof contracts.urlExpansionSchema>;
 
 export interface LinkOccurrenceItem {
 	sourceKind: "dm" | "tweet";
@@ -248,54 +115,11 @@ export type LinkInsightRange = "today" | "week" | "month" | "year" | "all";
 export type LinkInsightSort = "rank" | "recent" | "comments";
 export type LinkInsightSource = "all" | "tweet" | "dm";
 
-export interface LinkInsightMention {
-	id: string;
-	sourceKind: "dm" | "tweet";
-	sourceId: string;
-	sourceUrl?: string | null;
-	sourceLabel: string;
-	shortUrl: string;
-	conversationId?: string | null;
-	createdAt: string;
-	text: string;
-	rawText: string;
-	commentText: string;
-	sharedContentText?: string | null;
-	hasComment: boolean;
-	isPureShare: boolean;
-	timelineTweetId?: string | null;
-	contentTweetId?: string | null;
-	contentTweetUrl?: string | null;
-	contentAuthor?: ProfileRecord | null;
-	media: TweetMediaItem[];
-	direction?: string | null;
-	accountHandle?: string | null;
-	sharedBy?: ProfileRecord | null;
-	participant?: ProfileRecord | null;
-}
+export type LinkInsightMention = z.infer<
+	typeof contracts.linkInsightMentionSchema
+>;
 
-export interface LinkInsightItem {
-	id: string;
-	kind: LinkInsightKind;
-	url: string;
-	canonicalKey: string;
-	displayUrl: string;
-	host: string;
-	title?: string | null;
-	description?: string | null;
-	shareCount: number;
-	uniqueSharers: number;
-	totalInfluence: number;
-	mentionCount: number;
-	commentCount: number;
-	pureShareCount: number;
-	hiddenMentionCount: number;
-	firstSeenAt: string;
-	lastSeenAt: string;
-	topSharer?: ProfileRecord | null;
-	sharers: ProfileRecord[];
-	mentions: LinkInsightMention[];
-}
+export type LinkInsightItem = z.infer<typeof contracts.linkInsightItemSchema>;
 
 export interface LinkInsightQuery {
 	account?: string;
@@ -310,48 +134,16 @@ export interface LinkInsightQuery {
 	now?: Date;
 }
 
-export interface LinkInsightResponse {
-	kind: LinkInsightKind;
-	range: LinkInsightRange;
-	sort: LinkInsightSort;
-	source: LinkInsightSource;
-	since: string | null;
-	until: string | null;
-	items: LinkInsightItem[];
-	stats: {
-		occurrences: number;
-		groups: number;
-	};
-}
+export type DmSearchMatchItem = z.infer<typeof contracts.dmSearchMatchSchema>;
 
-export interface DmSearchMatchItem {
-	message: DmMessageItem;
-	before: DmMessageItem[];
-	after: DmMessageItem[];
-	urlExpansions?: UrlExpansionItem[];
-}
-
-export interface DmConversationItem {
-	id: string;
-	accountId: string;
-	accountHandle: string;
-	title: string;
-	searchSnippet?: string;
-	inboxKind?: "accepted" | "request";
-	isMessageRequest?: boolean;
-	lastMessageAt: string;
-	lastMessagePreview: string;
-	unreadCount: number;
-	needsReply: boolean;
-	influenceScore: number;
-	influenceLabel: string;
-	participant: ProfileRecord;
-	matches?: DmSearchMatchItem[];
-}
+export type DmConversationItem = z.infer<typeof contracts.dmConversationSchema>;
 
 export interface TimelineQuery {
 	resource: Exclude<ResourceKind, "dms">;
 	account?: string;
+	listAccountId?: string;
+	listId?: string;
+	author?: string;
 	search?: string;
 	replyFilter?: ReplyFilter;
 	since?: string;
@@ -384,15 +176,24 @@ export interface DmQuery {
 	limit?: number;
 }
 
-export interface TransportStatus {
-	installed: boolean;
-	availableTransport: "xurl" | "local";
-	statusText: string;
-	rawStatus?: string;
-}
+export type TransportStatus = z.infer<typeof contracts.transportStatusSchema>;
+
+export type LiveDataSourceKind = "birdclaw" | "bird" | "xurl";
+
+export type LiveDataSourceAccount = z.infer<
+	typeof contracts.liveDataSourceAccountSchema
+>;
+
+export type LiveDataSourceStatus = z.infer<
+	typeof contracts.liveDataSourceStatusSchema
+>;
+
+export type LiveDataSourceCapability = z.infer<
+	typeof contracts.liveDataSourceCapabilitySchema
+>;
 
 export type ModerationAction = "block" | "unblock" | "mute" | "unmute";
-export type ModerationTransportKind = "bird" | "xurl" | "x-web";
+export type ModerationTransportKind = "bird" | "xurl";
 
 export interface ModerationActionTransportResult {
 	ok: boolean;
@@ -400,54 +201,9 @@ export interface ModerationActionTransportResult {
 	transport: ModerationTransportKind;
 }
 
-export interface ArchiveCandidate {
-	path: string;
-	name: string;
-	size: number;
-	sizeFormatted: string;
-	modifiedTime: string;
-	dateFormatted: string;
-}
+export type ArchiveCandidate = z.infer<typeof contracts.archiveCandidateSchema>;
 
-export interface QueryEnvelope {
-	accounts: AccountRecord[];
-	archives: ArchiveCandidate[];
-	transport: TransportStatus;
-	stats: {
-		home: number;
-		mentions: number;
-		dms: number;
-		needsReply: number;
-		inbox: number;
-	};
-}
-
-export interface QueryResponse {
-	resource: ResourceKind;
-	items: TimelineItem[] | DmConversationItem[];
-	selectedConversation?: {
-		conversation: DmConversationItem;
-		messages: DmMessageItem[];
-	} | null;
-}
-
-export interface InboxItem {
-	id: string;
-	entityId: string;
-	entityKind: "mention" | "dm";
-	accountId: string;
-	accountHandle: string;
-	title: string;
-	text: string;
-	createdAt: string;
-	needsReply: boolean;
-	influenceScore: number;
-	participant: ProfileRecord;
-	source: "heuristic" | "openai";
-	score: number;
-	summary: string;
-	reasoning: string;
-}
+export type InboxItem = z.infer<typeof contracts.inboxItemSchema>;
 
 export interface InboxQuery {
 	kind?: InboxKind;
@@ -455,15 +211,6 @@ export interface InboxQuery {
 	minScore?: number;
 	hideLowSignal?: boolean;
 	limit?: number;
-}
-
-export interface InboxResponse {
-	items: InboxItem[];
-	stats: {
-		total: number;
-		openai: number;
-		heuristic: number;
-	};
 }
 
 export interface XurlPublicMetrics {
@@ -496,42 +243,25 @@ export interface XurlMentionUser {
 	protected?: boolean;
 }
 
-export interface XurlMentionData {
-	id: string;
-	author_id: string;
-	text: string;
-	created_at: string;
-	conversation_id?: string;
-	in_reply_to_user_id?: string;
-	attachments?: XurlTweetAttachments;
-	entities?: Record<string, unknown>;
-	referenced_tweets?: XurlReferencedTweet[];
-	public_metrics?: XurlPublicMetrics;
-	edit_history_tweet_ids?: string[];
-}
+export type XurlMentionData = XurlTweetData;
 
 export interface XurlReferencedTweet {
 	type: string;
 	id: string;
 }
 
-export interface XurlUserTweet {
-	id: string;
+export interface XurlUserTweet extends Omit<
+	XurlTweetData,
+	"author_id" | "in_reply_to_user_id"
+> {
 	author_id?: string;
-	text: string;
-	created_at: string;
-	conversation_id?: string;
-	attachments?: XurlTweetAttachments;
-	entities?: Record<string, unknown>;
-	referenced_tweets?: XurlReferencedTweet[];
-	public_metrics?: XurlPublicMetrics;
-	edit_history_tweet_ids?: string[];
 }
 
 export interface XurlTweetData {
 	id: string;
 	author_id: string;
 	text: string;
+	note_tweet?: XurlNoteTweet;
 	created_at: string;
 	conversation_id?: string;
 	in_reply_to_user_id?: string;
@@ -540,6 +270,11 @@ export interface XurlTweetData {
 	referenced_tweets?: XurlReferencedTweet[];
 	public_metrics?: XurlPublicMetrics;
 	edit_history_tweet_ids?: string[];
+}
+
+export interface XurlNoteTweet {
+	text: string;
+	entities?: Record<string, unknown>;
 }
 
 export interface XurlTweetAttachments {
@@ -603,14 +338,7 @@ export interface ProfileRepliesResponse {
 	};
 }
 
-export interface XurlMentionsResponse {
-	data: XurlMentionData[];
-	includes?: {
-		users?: XurlMentionUser[];
-		media?: XurlMediaItem[];
-	};
-	meta?: Record<string, unknown>;
-}
+export type XurlMentionsResponse = XurlTweetsResponse;
 
 export interface XurlDmEvent {
 	id: string;
@@ -635,18 +363,35 @@ export interface XurlDmEventsResponse {
 
 export interface XurlTweetsResponse {
 	data: XurlTweetData[];
-	includes?: {
-		users?: XurlMentionUser[];
-		media?: XurlMediaItem[];
-	};
+	includes?: XurlTweetIncludes;
 	meta?: Record<string, unknown>;
 }
-
-export type FollowDirection = "followers" | "following";
 
 export interface XurlFollowUsersResponse {
 	data: XurlMentionUser[];
 	meta?: Record<string, unknown>;
+}
+
+export interface XListRecord {
+	id: string;
+	name: string;
+	description?: string;
+	memberCount?: number;
+	followerCount?: number;
+	isPrivate?: boolean;
+	ownerId?: string;
+	ownerUsername?: string;
+	ownerName?: string;
+	createdAt?: string;
+	raw?: Record<string, unknown>;
+}
+
+export interface XListPage {
+	data: XListRecord[];
+	meta: {
+		result_count: number;
+		next_token?: string | null;
+	};
 }
 
 export interface FollowGraphProfile {

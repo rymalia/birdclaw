@@ -13,18 +13,19 @@ const mocks = vi.hoisted(() => ({
 	listFollowUsersViaXurl: vi.fn(),
 }));
 
-vi.mock("./bird", () => ({
-	listFollowUsersViaBird: mocks.listFollowUsersViaBird,
-	listFollowUsersViaBirdEffect: (options: unknown) =>
-		Effect.tryPromise({
-			try: () => mocks.listFollowUsersViaBird(options),
-			catch: (error) => error,
-		}),
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return {
+		listFollowUsersViaBirdEffect: effectFromMock(mocks.listFollowUsersViaBird),
+	};
+});
 
-vi.mock("./xurl", () => ({
-	listFollowUsersViaXurl: mocks.listFollowUsersViaXurl,
-}));
+vi.mock("./xurl", async () => {
+	const { effectFromMock } = await import("../test/effect-mocks");
+	return {
+		listFollowUsersViaXurlEffect: effectFromMock(mocks.listFollowUsersViaXurl),
+	};
+});
 
 const tempRoots: string[] = [];
 
@@ -57,6 +58,7 @@ function user(
 }
 
 afterEach(() => {
+	delete process.env.BIRDCLAW_PREFERRED_TRANSPORT;
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
 	delete process.env.BIRDCLAW_HOME;
@@ -68,6 +70,17 @@ afterEach(() => {
 });
 
 describe("follow graph sync and cache-only queries", () => {
+	it("uses the global xurl preference before the usual Bird graph transport", async () => {
+		setupTempHome();
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT = "xurl";
+		mocks.listFollowUsersViaXurl.mockResolvedValue({ data: [], meta: {} });
+		const { syncFollowGraph } = await import("./follow-graph");
+		await expect(
+			syncFollowGraph({ direction: "followers", mode: "auto", yes: true }),
+		).resolves.toMatchObject({ source: "xurl" });
+		expect(mocks.listFollowUsersViaBird).not.toHaveBeenCalled();
+	});
+
 	it("defaults to dry-run and does not call xurl", async () => {
 		setupTempHome();
 		const { syncFollowGraph } = await import("./follow-graph");
@@ -220,6 +233,54 @@ describe("follow graph sync and cache-only queries", () => {
 		});
 	});
 
+	it("rejects negative and non-finite limits instead of returning every row", async () => {
+		setupTempHome();
+		mocks.listFollowUsersViaXurl.mockResolvedValueOnce({
+			data: [user("1", "alice", 100), user("2", "bob", 500)],
+			meta: { result_count: 2 },
+		});
+		const { listTopFollowers, syncFollowGraph } =
+			await import("./follow-graph");
+
+		await syncFollowGraph({
+			direction: "followers",
+			yes: true,
+			refresh: true,
+		});
+
+		expect(
+			listTopFollowers({ limit: 1 }).items.map((item) => item.handle),
+		).toEqual(["bob"]);
+		// A negative limit is "no limit" in SQLite, so an unvalidated value
+		// silently returns the whole table instead of respecting --limit.
+		expect(() => listTopFollowers({ limit: -1 })).toThrow(
+			"--limit must be a non-negative integer",
+		);
+		expect(listTopFollowers({ limit: 0 }).items).toEqual([]);
+		expect(() => listTopFollowers({ limit: Number.NaN })).toThrow(
+			"--limit must be a non-negative integer",
+		);
+		// A fractional limit used to be silently floored (1.9 -> 1) instead of
+		// being treated as invalid input.
+		expect(() => listTopFollowers({ limit: 1.9 })).toThrow(
+			"--limit must be a non-negative integer",
+		);
+	});
+
+	it("applies shared account selection to graph reads", async () => {
+		setupTempHome();
+		const { listTopFollowers } = await import("./follow-graph");
+
+		for (const selector of ["acct_primary", "@STEIPETE", "steipete"]) {
+			expect(listTopFollowers({ account: selector })).toMatchObject({
+				accountId: "acct_primary",
+			});
+		}
+		expect(() => listTopFollowers({ account: "missing" })).toThrow(
+			"Unknown account: missing",
+		);
+	});
+
 	it("reuses fresh cache for duplicate sync requests instead of calling xurl again", async () => {
 		setupTempHome();
 		mocks.listFollowUsersViaXurl.mockResolvedValueOnce({
@@ -281,6 +342,9 @@ describe("follow graph sync and cache-only queries", () => {
 		await expect(
 			syncFollowGraph({ direction: "followers", account: "missing" }),
 		).rejects.toThrow("Unknown account: missing");
+		await expect(
+			syncFollowGraph({ direction: "followers", mode: "invalid" as never }),
+		).rejects.toThrow("--mode");
 		expect(mocks.listFollowUsersViaXurl).not.toHaveBeenCalled();
 	});
 
@@ -413,6 +477,46 @@ describe("follow graph sync and cache-only queries", () => {
 			page_count: 1,
 			truncated_by_max_resources: true,
 		});
+	});
+
+	it("keeps token-bearing Bird snapshots incomplete without ending edges", async () => {
+		setupTempHome();
+		mocks.listFollowUsersViaXurl.mockResolvedValueOnce({
+			data: [user("1", "alice", 100), user("2", "bob", 500)],
+			meta: { pagination_known_complete: true },
+		});
+		const { listTopFollowers, listUnfollowedSince, syncFollowGraph } =
+			await import("./follow-graph");
+		await syncFollowGraph({
+			direction: "followers",
+			mode: "xurl",
+			yes: true,
+			refresh: true,
+		});
+
+		mocks.listFollowUsersViaBird.mockReset();
+		mocks.listFollowUsersViaBird.mockResolvedValueOnce({
+			data: [user("1", "alice", 100)],
+			meta: {
+				result_count: 1,
+				page_count: 1,
+				next_token: "page-two",
+			},
+		});
+		const capped = await syncFollowGraph({
+			direction: "followers",
+			mode: "bird",
+			limit: 1,
+			yes: true,
+			refresh: true,
+		});
+
+		expect(capped).toMatchObject({ status: "incomplete", partial: true });
+		expect(listTopFollowers().items.map((item) => item.handle)).toEqual([
+			"bob",
+			"alice",
+		]);
+		expect(listUnfollowedSince({ date: "2026-01-01" }).items).toEqual([]);
 	});
 
 	it("supports handle sorting and ISO timestamp filters for cache-only queries", async () => {

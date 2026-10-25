@@ -1,13 +1,14 @@
+import { cachedJsonResponse } from "#/lib/cached-json-response";
 import { createFileRoute } from "@tanstack/react-router";
 import { Effect } from "effect";
-import { maybeAutoUpdateBackupEffect } from "#/lib/backup";
+import { inboxResponseSchema } from "#/lib/api-contracts";
+import { requestBackupAutoUpdate } from "#/lib/backup";
 import {
-	jsonResponse,
 	runRouteEffect,
 	sensitiveRequestErrorResponse,
 } from "#/lib/http-effect";
 import { listInboxItems } from "#/lib/inbox";
-import type { InboxKind } from "#/lib/types";
+import type { InboxKind, InboxQuery } from "#/lib/types";
 
 function parseNumber(value: string | null) {
 	if (!value) return undefined;
@@ -20,21 +21,22 @@ export const Route = createFileRoute("/api/inbox")({
 		handlers: {
 			GET: ({ request }) =>
 				runRouteEffect(
-					Effect.gen(function* () {
+					Effect.sync(() => {
 						const denied = sensitiveRequestErrorResponse(request);
 						if (denied) return denied;
 
-						yield* maybeAutoUpdateBackupEffect();
+						requestBackupAutoUpdate();
 						const url = new URL(request.url);
 						const kind = (url.searchParams.get("kind") ?? "mixed") as InboxKind;
-						return jsonResponse(
-							listInboxItems({
-								kind: kind === "mentions" || kind === "dms" ? kind : "mixed",
-								account: url.searchParams.get("account") ?? undefined,
-								minScore: parseNumber(url.searchParams.get("minScore")),
-								hideLowSignal: url.searchParams.get("hideLowSignal") === "1",
-								limit: parseNumber(url.searchParams.get("limit")) ?? 20,
-							}),
+						const query = {
+							kind: kind === "mentions" || kind === "dms" ? kind : "mixed",
+							account: url.searchParams.get("account") ?? undefined,
+							minScore: parseNumber(url.searchParams.get("minScore")),
+							hideLowSignal: url.searchParams.get("hideLowSignal") === "1",
+							limit: parseNumber(url.searchParams.get("limit")) ?? 20,
+						} satisfies InboxQuery;
+						return cachedJsonResponse(["inbox", query], () =>
+							inboxResponseSchema.parse(listInboxItems(query)),
 						);
 					}),
 				),

@@ -1,20 +1,205 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { LinkPreviewCard } from "./LinkPreviewCard";
+import {
+	createTestQueryClient,
+	renderWithQueryClient as render,
+} from "#/test/render";
+import { LinkPreviewCard, linkPreviewQueryOptions } from "./LinkPreviewCard";
 
 afterEach(() => {
 	cleanup();
 	vi.useRealTimers();
 	vi.restoreAllMocks();
+	vi.unstubAllGlobals();
 });
 
 describe("LinkPreviewCard", () => {
+	it("shows a refreshed image after the archived thumbnail fails", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue({
+				ok: true,
+				json: async () => ({
+					ok: true,
+					preview: {
+						url: "https://example.com/article",
+						title: "Updated preview",
+						description: "Fresh metadata",
+						siteName: "Example",
+						imageUrl: "https://pbs.twimg.com/media/new.jpg",
+					},
+				}),
+			}),
+		);
+		render(
+			<LinkPreviewCard
+				index={0}
+				entry={{
+					url: "https://example.com/article",
+					expandedUrl: "https://example.com/article",
+					displayUrl: "example.com/article",
+					title: "Archived title",
+					imageUrl: "https://pbs.twimg.com/media/old.jpg",
+					start: 0,
+					end: 20,
+				}}
+			/>,
+		);
+		fireEvent.error(screen.getByRole("img"));
+		expect(screen.queryByRole("img")).toBeNull();
+		expect(
+			await screen.findByRole("img", { name: "Updated preview" }),
+		).toHaveAttribute("src", "https://pbs.twimg.com/media/new.jpg");
+	});
+	it("shows a bare domain once without reserving an empty thumbnail", () => {
+		const { container } = render(
+			<LinkPreviewCard
+				index={0}
+				entry={{
+					url: "https://example.com",
+					expandedUrl: "https://example.com",
+					displayUrl: "example.com",
+					title: "example.com",
+					description: "example.com",
+					siteName: "example.com",
+					start: 0,
+					end: 19,
+				}}
+			/>,
+		);
+		expect(screen.getAllByText("example.com", { exact: true })).toHaveLength(1);
+		expect(container.querySelector("img")).toBeNull();
+		expect(container.querySelector(".w-40")).toBeNull();
+	});
+
+	it("keeps a readable path for links without page metadata", () => {
+		render(
+			<LinkPreviewCard
+				index={0}
+				entry={{
+					url: "https://example.com/blog/a%20better%20preview?utm_source=feed",
+					expandedUrl:
+						"https://example.com/blog/a%20better%20preview?utm_source=feed",
+					displayUrl: "example.com/blog/a…",
+					title: "example.com/blog/a…",
+					start: 0,
+					end: 20,
+				}}
+			/>,
+		);
+		expect(
+			screen.getByText("example.com", { exact: true }),
+		).toBeInTheDocument();
+		expect(screen.getByText("/blog/a better preview")).toBeInTheDocument();
+		expect(screen.queryByText(/utm_source/)).toBeNull();
+	});
+
+	it("preserves a useful archived title when live hydration reports an error", async () => {
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				ok: true,
+				preview: {
+					url: "https://example.com/article",
+					title: "example.com",
+					description: null,
+					siteName: "example.com",
+					imageUrl: null,
+					error: "HTTP 403",
+				},
+			}),
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		render(
+			<LinkPreviewCard
+				index={0}
+				entry={{
+					url: "https://example.com/article",
+					expandedUrl: "https://example.com/article",
+					displayUrl: "example.com/article",
+					title: "A useful archived title",
+					start: 0,
+					end: 20,
+				}}
+			/>,
+		);
+		await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+		expect(screen.getByText("A useful archived title")).toBeInTheDocument();
+	});
+
+	it("discards queued previews on navigation and gives new previews the freed slots", async () => {
+		const fetchMock = vi.fn(
+			(_input: RequestInfo | URL, init?: RequestInit) =>
+				new Promise<Response>((_resolve, reject) => {
+					const signal = init?.signal;
+					if (signal?.aborted) reject(signal.reason);
+					else
+						signal?.addEventListener("abort", () => reject(signal.reason), {
+							once: true,
+						});
+				}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const queryClient = createTestQueryClient();
+		const oldPreviews = Array.from({ length: 32 }, (_, index) =>
+			queryClient
+				.fetchQuery(linkPreviewQueryOptions(`https://example.com/old/${index}`))
+				.catch(() => null),
+		);
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+		await queryClient.cancelQueries();
+		await Promise.all(oldPreviews);
+		const next = queryClient
+			.fetchQuery(linkPreviewQueryOptions("https://example.com/new"))
+			.catch(() => null);
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+		expect(String(fetchMock.mock.calls[2]?.[0])).toContain(
+			encodeURIComponent("https://example.com/new"),
+		);
+		expect(
+			fetchMock.mock.calls
+				.slice(0, 2)
+				.every(([, init]) => init?.signal?.aborted),
+		).toBe(true);
+		await queryClient.cancelQueries();
+		await next;
+		queryClient.clear();
+	});
+
+	it("releases queue slots after failures and completed responses", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockRejectedValueOnce(new Error("offline"))
+			.mockResolvedValue({
+				ok: true,
+				json: () =>
+					Promise.resolve({
+						ok: true,
+						preview: {
+							url: "https://example.com",
+							title: null,
+							description: null,
+							imageUrl: null,
+							siteName: null,
+						},
+					}),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+		const queryClient = createTestQueryClient();
+		const results = await Promise.allSettled(
+			Array.from({ length: 6 }, (_, index) =>
+				queryClient.fetchQuery(
+					linkPreviewQueryOptions(`https://example.com/complete/${index}`),
+				),
+			),
+		);
+		expect(fetchMock).toHaveBeenCalledTimes(6);
+		expect(
+			results.filter((result) => result.status === "fulfilled"),
+		).toHaveLength(5);
+		queryClient.clear();
+	});
+
 	it("can rerender from a safe URL to an unsafe URL without changing hooks", () => {
 		const { container, rerender } = render(
 			<LinkPreviewCard
@@ -74,7 +259,7 @@ describe("LinkPreviewCard", () => {
 		expect(document.querySelector("svg")).toBeInTheDocument();
 	});
 
-	it("does not render preview images from arbitrary hosts", () => {
+	it("proxies external preview images through the local cache", () => {
 		render(
 			<LinkPreviewCard
 				entry={{
@@ -92,8 +277,10 @@ describe("LinkPreviewCard", () => {
 			/>,
 		);
 
-		expect(screen.queryByRole("img")).toBeNull();
-		expect(document.querySelector("svg")).toBeInTheDocument();
+		expect(screen.getByRole("img")).toHaveAttribute(
+			"src",
+			"/api/link-preview?imageUrl=https%3A%2F%2Fexample.com%2Fpreview.png",
+		);
 	});
 
 	it("hydrates missing metadata when the card becomes eligible", async () => {
@@ -134,6 +321,7 @@ describe("LinkPreviewCard", () => {
 		);
 		expect(fetchMock).toHaveBeenCalledWith(
 			"/api/link-preview?url=https%3A%2F%2Fexample.com%2Fhydrate-card",
+			{ signal: expect.any(AbortSignal) },
 		);
 	});
 
@@ -159,9 +347,55 @@ describe("LinkPreviewCard", () => {
 
 		await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-		expect(screen.getAllByText("example.com/fail-card").length).toBeGreaterThan(
-			0,
+		expect(
+			screen.getByText("example.com", { exact: true }),
+		).toBeInTheDocument();
+		expect(screen.getByText("/fail-card")).toBeInTheDocument();
+	});
+
+	it("retries a failed preview when the card mounts again", async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValueOnce({
+				ok: false,
+				json: () => Promise.resolve({ ok: false }),
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () =>
+					Promise.resolve({
+						ok: true,
+						preview: {
+							url: "https://example.com/retry",
+							title: "Retry succeeded",
+							description: null,
+							imageUrl: null,
+							siteName: "Example",
+						},
+					}),
+			});
+		vi.stubGlobal("fetch", fetchMock);
+		const queryClient = createTestQueryClient();
+		const card = (
+			<LinkPreviewCard
+				entry={{
+					url: "https://t.co/retry-card",
+					expandedUrl: "https://example.com/retry-card",
+					displayUrl: "example.com/retry-card",
+					start: 0,
+					end: 23,
+				}}
+				index={0}
+			/>
 		);
+
+		const first = render(card, { queryClient });
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+		first.unmount();
+		render(card, { queryClient });
+
+		expect(await screen.findByText("Retry succeeded")).toBeInTheDocument();
+		expect(fetchMock).toHaveBeenCalledTimes(2);
 	});
 
 	it("waits for intersection before hydrating previews", async () => {

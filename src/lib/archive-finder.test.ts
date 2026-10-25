@@ -34,7 +34,12 @@ vi.mock("node:os", () => ({
 	homedir: mocks.homedir,
 }));
 
-import { findArchives, findArchivesEffect } from "./archive-finder";
+import {
+	clearArchiveFinderCacheForTests,
+	findArchives,
+	findArchivesCachedEffect,
+	findArchivesEffect,
+} from "./archive-finder";
 
 const originalPlatform = process.platform;
 
@@ -53,6 +58,7 @@ describe("archive finder", () => {
 	});
 
 	afterEach(() => {
+		clearArchiveFinderCacheForTests();
 		Object.defineProperty(process, "platform", {
 			configurable: true,
 			value: originalPlatform,
@@ -179,6 +185,18 @@ describe("archive finder", () => {
 		expect(mocks.readdir).not.toHaveBeenCalled();
 	});
 
+	it("skips downloads when readdir fails (e.g. EPERM from macOS TCC)", async () => {
+		mocks.existsSync.mockReturnValue(true);
+		const err = Object.assign(
+			new Error("EPERM: operation not permitted, scandir '/Users/x/Downloads'"),
+			{ code: "EPERM" },
+		);
+		mocks.readdir.mockRejectedValue(err);
+		mocks.execAsync.mockResolvedValue({ stdout: "" });
+
+		await expect(findArchives()).resolves.toEqual([]);
+	});
+
 	it("returns empty on non-darwin hosts", async () => {
 		Object.defineProperty(process, "platform", {
 			configurable: true,
@@ -199,5 +217,19 @@ describe("archive finder", () => {
 		expect(mocks.existsSync).not.toHaveBeenCalled();
 		expect(mocks.execAsync).not.toHaveBeenCalled();
 		await expect(Effect.runPromise(effect)).resolves.toEqual([]);
+	});
+
+	it("reuses cached archive discovery for status reads", async () => {
+		mocks.existsSync.mockReturnValue(false);
+		mocks.execAsync.mockResolvedValue({ stdout: "" });
+
+		await expect(
+			Effect.runPromise(findArchivesCachedEffect()),
+		).resolves.toEqual([]);
+		await expect(
+			Effect.runPromise(findArchivesCachedEffect()),
+		).resolves.toEqual([]);
+
+		expect(mocks.execAsync).toHaveBeenCalledTimes(3);
 	});
 });

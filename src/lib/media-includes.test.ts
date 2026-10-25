@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { __test__ as birdTest } from "./bird";
-import { buildMediaJsonFromIncludes, countTweetMedia } from "./media-includes";
+import { buildTweetMedia, indexMediaIncludes } from "./media-includes";
 import type { XurlMediaItem } from "./types";
 
 const photo: XurlMediaItem = {
@@ -45,7 +45,10 @@ const gif: XurlMediaItem = {
 
 function media(keys: string[], includes: XurlMediaItem[]) {
 	return JSON.parse(
-		buildMediaJsonFromIncludes({ attachments: { media_keys: keys } }, includes),
+		buildTweetMedia(
+			{ attachments: { media_keys: keys } },
+			indexMediaIncludes(includes),
+		).json,
 	);
 }
 
@@ -71,9 +74,38 @@ describe("media includes mapping", () => {
 			variants: [
 				{ url: "https://video.twimg.com/high.mp4", bitRate: 2176000 },
 				{ url: "https://video.twimg.com/low.mp4", bitRate: 832000 },
+				{
+					url: "https://video.twimg.com/playlist.m3u8",
+					contentType: "application/x-mpegURL",
+				},
 			],
 		});
 	});
+
+	it.each(["video/webm", "application/x-mpegURL"])(
+		"preserves %s-only variants with a poster",
+		(contentType) => {
+			expect(
+				media(
+					["video_1"],
+					[
+						{
+							...video,
+							variants: [
+								{
+									url: "https://video.twimg.com/stream",
+									content_type: contentType,
+								},
+							],
+						},
+					],
+				)[0],
+			).toMatchObject({
+				thumbnailUrl: video.preview_image_url,
+				variants: [{ url: "https://video.twimg.com/stream", contentType }],
+			});
+		},
+	);
 
 	it("serializes animated gifs as local gif media with mp4 variants", () => {
 		expect(media(["gif_1"], [gif])[0]).toMatchObject({
@@ -112,14 +144,14 @@ describe("media includes mapping", () => {
 	});
 
 	it("returns empty JSON when there are no media keys", () => {
-		expect(buildMediaJsonFromIncludes({}, [])).toBe("[]");
-		expect(countTweetMedia({})).toBe(0);
+		expect(buildTweetMedia({}, indexMediaIncludes([])).json).toBe("[]");
+		expect(buildTweetMedia({}, indexMediaIncludes()).count).toBe(0);
 	});
 
 	it("skips dangling media keys but still counts them as tweet media", () => {
 		const tweet = { attachments: { media_keys: ["missing"] } };
-		expect(buildMediaJsonFromIncludes(tweet, [])).toBe("[]");
-		expect(countTweetMedia(tweet)).toBe(1);
+		expect(buildTweetMedia(tweet, indexMediaIncludes([])).json).toBe("[]");
+		expect(buildTweetMedia(tweet, indexMediaIncludes()).count).toBe(1);
 	});
 
 	it("rejects shortlink and non-media entity fallback urls", () => {
@@ -139,8 +171,8 @@ describe("media includes mapping", () => {
 			},
 		};
 
-		expect(countTweetMedia(tweet)).toBe(1);
-		expect(buildMediaJsonFromIncludes(tweet, [])).toBe("[]");
+		expect(buildTweetMedia(tweet, indexMediaIncludes()).count).toBe(1);
+		expect(buildTweetMedia(tweet, indexMediaIncludes([])).json).toBe("[]");
 	});
 
 	it("rejects non-https and malformed entity fallback urls", () => {
@@ -156,13 +188,13 @@ describe("media includes mapping", () => {
 			},
 		};
 
-		expect(buildMediaJsonFromIncludes(tweet, [])).toBe("[]");
+		expect(buildTweetMedia(tweet, indexMediaIncludes([])).json).toBe("[]");
 	});
 
 	it("accepts known media CDN entity fallback urls", () => {
 		expect(
 			JSON.parse(
-				buildMediaJsonFromIncludes(
+				buildTweetMedia(
 					{
 						entities: {
 							urls: [
@@ -174,8 +206,8 @@ describe("media includes mapping", () => {
 							],
 						},
 					},
-					[],
-				),
+					indexMediaIncludes([]),
+				).json,
 			),
 		).toEqual([
 			{
@@ -185,7 +217,7 @@ describe("media includes mapping", () => {
 		]);
 		expect(
 			JSON.parse(
-				buildMediaJsonFromIncludes(
+				buildTweetMedia(
 					{
 						entities: {
 							urls: [
@@ -201,8 +233,8 @@ describe("media includes mapping", () => {
 							],
 						},
 					},
-					[],
-				),
+					indexMediaIncludes([]),
+				).json,
 			),
 		).toEqual([
 			{
@@ -222,8 +254,10 @@ describe("media includes mapping", () => {
 			},
 		]).data[0];
 
-		expect(countTweetMedia(tweet)).toBe(1);
-		expect(JSON.parse(buildMediaJsonFromIncludes(tweet, []))).toEqual([
+		expect(buildTweetMedia(tweet, indexMediaIncludes()).count).toBe(1);
+		expect(
+			JSON.parse(buildTweetMedia(tweet, indexMediaIncludes([])).json),
+		).toEqual([
 			{
 				url: "https://pbs.twimg.com/media/bird_photo.jpg",
 				type: "image",

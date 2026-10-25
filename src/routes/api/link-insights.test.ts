@@ -1,34 +1,26 @@
 // @vitest-environment node
-import { Effect } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getRouteHandler } from "#/test/route-handlers";
 
 const getLinkInsightsMock = vi.fn();
-const getNativeDbMock = vi.fn();
 const maybeAutoUpdateBackupMock = vi.fn();
 
 vi.mock("#/lib/link-insights", () => ({
 	getLinkInsights: (...args: unknown[]) => getLinkInsightsMock(...args),
 }));
 vi.mock("#/lib/backup", () => ({
-	maybeAutoUpdateBackup: () => maybeAutoUpdateBackupMock(),
-	maybeAutoUpdateBackupEffect: () =>
-		Effect.promise(() => Promise.resolve(maybeAutoUpdateBackupMock())),
-}));
-vi.mock("#/lib/db", () => ({
-	getNativeDb: () => getNativeDbMock(),
+	requestBackupAutoUpdate: () => maybeAutoUpdateBackupMock(),
 }));
 
 import { Route } from "./link-insights";
 
 const GET = getRouteHandler(Route, "GET");
+afterEach(() => vi.unstubAllEnvs());
 
 describe("api link insights route", () => {
 	beforeEach(() => {
 		getLinkInsightsMock.mockReset();
-		getNativeDbMock.mockReset();
 		maybeAutoUpdateBackupMock.mockReset();
-		getNativeDbMock.mockReturnValue({ kind: "test-db" });
 		maybeAutoUpdateBackupMock.mockResolvedValue({ skipped: true });
 		getLinkInsightsMock.mockReturnValue({
 			kind: "links",
@@ -60,7 +52,6 @@ describe("api link insights route", () => {
 			commentsLimit: 3,
 		});
 		expect(maybeAutoUpdateBackupMock).toHaveBeenCalledWith();
-		expect(getNativeDbMock).toHaveBeenCalledOnce();
 		expect(response.status).toBe(200);
 	});
 
@@ -80,5 +71,27 @@ describe("api link insights route", () => {
 				limit: undefined,
 			}),
 		);
+	});
+	it("recalculates rolling windows on repeated read-only requests", async () => {
+		vi.stubEnv("BIRDCLAW_DEPLOYMENT_READ_ONLY", "1");
+		let calls = 0;
+		getLinkInsightsMock.mockImplementation(() => ({
+			kind: "links",
+			range: "week",
+			sort: "rank",
+			source: "all",
+			since: null,
+			until: `2026-09-13T00:00:0${calls++}.000Z`,
+			items: [],
+			stats: { occurrences: 0, groups: 0 },
+		}));
+		const request = () =>
+			GET({
+				request: new Request("http://localhost/api/link-insights?range=week"),
+			});
+		const first = await (await request()).json();
+		const second = await (await request()).json();
+		expect(first.until).not.toBe(second.until);
+		expect(getLinkInsightsMock).toHaveBeenCalledTimes(2);
 	});
 });

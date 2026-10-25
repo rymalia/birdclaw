@@ -1,25 +1,24 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { Effect } from "effect";
-import { runEffectPromise } from "./effect-runtime";
+import { Data, Duration, Effect, Schedule } from "effect";
+import { runSubprocessEffect, SubprocessError } from "./subprocess";
 import type {
 	FollowDirection,
+	LiveDataSourceAccount,
 	TransportStatus,
 	XurlDmEventsResponse,
-	XurlFollowUsersResponse,
 	XurlMentionsResponse,
 	XurlMentionUser,
 	XurlTweetsResponse,
 	XurlUserTweet,
 	XurlUserTweetsResponse,
+	XListPage,
+	XListRecord,
 } from "./types";
 
-const execFileAsync = promisify(execFile);
 const TRANSPORT_STATUS_TTL_MS = 5 * 60_000;
 const AUTHENTICATED_USER_TTL_MS = 60_000;
 const JSON_RETRY_LIMIT = 6;
 const MEDIA_EXPANSION = "attachments.media_keys";
-const AUTHOR_MEDIA_EXPANSIONS = `author_id,${MEDIA_EXPANSION}`;
+const AUTHOR_MEDIA_EXPANSIONS = `author_id,${MEDIA_EXPANSION},referenced_tweets.id,referenced_tweets.id.author_id`;
 const MEDIA_FIELDS =
 	"variants,preview_image_url,url,duration_ms,alt_text,type,width,height,public_metrics";
 const RICH_USER_FIELDS =
@@ -27,7 +26,7 @@ const RICH_USER_FIELDS =
 const DM_EVENT_FIELDS =
 	"attachments,created_at,dm_conversation_id,entities,event_type,id,participant_ids,referenced_tweets,sender_id,text";
 const THREAD_TWEET_FIELDS =
-	"created_at,conversation_id,entities,public_metrics,referenced_tweets,in_reply_to_user_id,attachments";
+	"created_at,conversation_id,entities,note_tweet,public_metrics,referenced_tweets,in_reply_to_user_id,attachments";
 // X bookmarks pagination truncates above 90 until this bug is fixed:
 // https://devcommunity.x.com/t/bookmarks-api-v2-stops-paginating-after-3-pages-no-next-token-returned/257339
 const BOOKMARKS_MAX_RESULTS_CAP = 90;
@@ -36,26 +35,39 @@ type TimelineCollectionEndpoint = "liked_tweets" | "bookmarks";
 type JsonCommandOptions = {
 	timeoutMs?: number;
 	deadlineMs?: number;
+	signal?: AbortSignal;
+	onAttempt?: (attempt: XurlJsonCommandAttempt) => void;
 };
+export interface XurlJsonCommandAttempt {
+	args: readonly string[];
+	attempt: number;
+	status: "ok" | "rate_limited" | "error";
+	error?: Error;
+}
 type OAuth2UsernameCandidate = {
 	app?: string;
-	username: string;
+	username?: string;
 };
 
-let transportStatusCache:
-	| {
-			expiresAt: number;
-			pending?: Promise<TransportStatus>;
-			value?: TransportStatus;
-	  }
-	| undefined;
-let authenticatedUserCache:
-	| {
-			expiresAt: number;
-			pending?: Promise<Record<string, unknown> | null>;
-			value?: Record<string, unknown> | null;
-	  }
-	| undefined;
+// Module-level memoized effects: concurrent callers share one in-flight
+// computation and successes are cached for the TTL. `Effect.suspend` defers
+// the lookups so these consts can be built before the functions they call.
+const cachedTransportStatus = Effect.runSync(
+	Effect.cachedWithTTL(
+		Effect.suspend(() => readTransportStatusEffect()),
+		Duration.millis(TRANSPORT_STATUS_TTL_MS),
+	),
+);
+const [cachedAuthenticatedUser, invalidateAuthenticatedUser] = Effect.runSync(
+	Effect.cachedInvalidateWithTTL(
+		Effect.suspend(() => lookupAuthenticatedUserUnscopedFreshEffect()),
+		Duration.millis(AUTHENTICATED_USER_TTL_MS),
+	),
+);
+const oauth2CandidateCache = new Map<
+	string,
+	{ expiresAt: number; value: OAuth2UsernameCandidate }
+>();
 
 function liveWritesDisabled() {
 	return process.env.BIRDCLAW_DISABLE_LIVE_WRITES === "1";
@@ -102,8 +114,21 @@ function formatExecError(error: unknown, fallback: string) {
 	return parts.join("\n");
 }
 
-function formatXurlCommandError(error: unknown, args: string[]) {
-	return new Error(formatExecError(error, `xurl ${args.join(" ")} failed`));
+export class XurlCommandError extends Data.TaggedError("XurlCommandError")<{
+	readonly message: string;
+	readonly commandArgs: readonly string[];
+	readonly rateLimited: boolean;
+	readonly cause: unknown;
+}> {}
+
+function toXurlCommandError(cause: unknown, args: string[]) {
+	if (cause instanceof XurlCommandError) return cause;
+	return new XurlCommandError({
+		message: formatExecError(cause, `xurl ${args.join(" ")} failed`),
+		commandArgs: args,
+		rateLimited: isRateLimitedFailure(cause),
+		cause,
+	});
 }
 
 function normalizeError(error: unknown) {
@@ -132,15 +157,23 @@ function parseErrorPayload(error: unknown) {
 	}
 }
 
-function getRetryDelayMs(error: unknown, attempt: number) {
-	const payload = parseErrorPayload(error);
-	const status = Number(payload?.status ?? 0);
-	if (status !== 429) {
-		return null;
-	}
+function isRateLimitedFailure(error: unknown) {
+	return Number(parseErrorPayload(error)?.status ?? 0) === 429;
+}
 
-	const baseDelay = getJsonRetryBaseDelayMs();
-	return Math.min(baseDelay * 2 ** attempt, 30_000);
+function jsonRetryDelayMs(retries: number) {
+	return Math.min(getJsonRetryBaseDelayMs() * 2 ** retries, 30_000);
+}
+
+function emitJsonCommandAttempt(
+	options: JsonCommandOptions,
+	attempt: XurlJsonCommandAttempt,
+) {
+	try {
+		options.onAttempt?.(attempt);
+	} catch {
+		// Telemetry observers must not affect xurl command behavior.
+	}
 }
 
 function capTimelineCollectionMaxResults(
@@ -153,19 +186,13 @@ function capTimelineCollectionMaxResults(
 		: maxResults;
 }
 
-export function resetTransportStatusCache() {
-	transportStatusCache = undefined;
-}
-
 export function resetAuthenticatedUserCache() {
-	authenticatedUserCache = undefined;
+	Effect.runSync(invalidateAuthenticatedUser);
+	oauth2CandidateCache.clear();
 }
 
 function hasXurlEffect() {
-	return Effect.tryPromise({
-		try: () => execFileAsync("xurl", ["version"]),
-		catch: normalizeError,
-	}).pipe(
+	return runSubprocessEffect({ command: "xurl", args: ["version"] }).pipe(
 		Effect.as(true),
 		Effect.catchAll(() => Effect.succeed(false)),
 	);
@@ -177,20 +204,20 @@ function isUnauthenticatedXurlStatus(status: string) {
 	);
 }
 
-function readTransportStatusEffect(): Effect.Effect<TransportStatus, never> {
-	return Effect.gen(function* () {
+const readTransportStatusEffect = Effect.fn("xurl.readTransportStatus")(
+	function* () {
 		const installed = yield* hasXurlEffect();
 		if (!installed) {
 			return {
 				installed: false,
 				availableTransport: "local" as const,
-				statusText: "xurl not installed. local mode active.",
+				statusText: "xurl not installed. local/archive mode active.",
 			};
 		}
 
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", ["auth", "status"]),
-			catch: (cause) => cause,
+		return yield* runSubprocessEffect({
+			command: "xurl",
+			args: ["auth", "status"],
 		}).pipe(
 			Effect.map(({ stdout }) => {
 				const rawStatus = stdout.trim();
@@ -200,7 +227,7 @@ function readTransportStatusEffect(): Effect.Effect<TransportStatus, never> {
 						installed: true,
 						availableTransport: "local" as const,
 						statusText:
-							"xurl installed but not authenticated. local (bird) mode active.",
+							"xurl installed but not authenticated. local/archive mode active.",
 						rawStatus,
 					};
 				}
@@ -217,117 +244,61 @@ function readTransportStatusEffect(): Effect.Effect<TransportStatus, never> {
 					installed: true,
 					availableTransport: "local" as const,
 					statusText: `xurl detected but auth unavailable: ${
-						error instanceof Error ? error.message : "unknown error"
-					}`,
+						error instanceof Error &&
+						!(error instanceof SubprocessError && !error.causeWasError)
+							? error.message
+							: "unknown error"
+					}. local/archive mode active.`,
 				}),
 			),
 		);
-	});
+	},
+);
+
+export function getTransportStatusEffect(): Effect.Effect<
+	TransportStatus,
+	never
+> {
+	return cachedTransportStatus;
 }
 
-export function getTransportStatusEffect() {
-	return Effect.gen(function* () {
-		const now = Date.now();
-		if (transportStatusCache?.value && transportStatusCache.expiresAt > now) {
-			return transportStatusCache.value;
+const runShortcutEffect = Effect.fn("xurl.runShortcut")(function* (
+	args: string[],
+) {
+	if (liveWritesDisabled()) {
+		if (e2eFakeLiveWritesEnabled()) {
+			return { ok: true, output: "e2e fake live write" };
 		}
+		return { ok: false, output: "live writes disabled" };
+	}
 
-		if (transportStatusCache?.pending) {
-			const status = yield* Effect.tryPromise({
-				try: () => transportStatusCache?.pending ?? Promise.resolve(undefined),
-				catch: normalizeError,
-			});
-			if (status) return status;
-		}
-
-		const pending = runEffectPromise(readTransportStatusEffect());
-
-		transportStatusCache = {
-			expiresAt: 0,
-			pending,
-		};
-
-		const status = yield* Effect.tryPromise({
-			try: () => pending,
-			catch: normalizeError,
-		}).pipe(
-			Effect.catchAll((error) =>
-				Effect.sync(() => {
-					transportStatusCache = undefined;
-				}).pipe(Effect.flatMap(() => Effect.fail(error))),
-			),
-		);
-		transportStatusCache = {
-			expiresAt: Date.now() + TRANSPORT_STATUS_TTL_MS,
-			value: status,
-		};
-		return status;
-	});
-}
-
-export function getTransportStatus(): Promise<TransportStatus> {
-	return runEffectPromise(getTransportStatusEffect());
-}
-
-function runShortcutEffect(args: string[]) {
-	return Effect.gen(function* () {
-		if (liveWritesDisabled()) {
-			if (e2eFakeLiveWritesEnabled()) {
-				return { ok: true, output: "e2e fake live write" };
-			}
-			return { ok: false, output: "live writes disabled" };
-		}
-
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", args),
-			catch: normalizeError,
-		}).pipe(
-			Effect.map(({ stdout, stderr }) => ({
-				ok: true,
-				output: stdout || stderr,
-			})),
-			Effect.catchAll((error) =>
-				Effect.succeed({
-					ok: false,
-					output: formatExecError(error, "xurl execution failed"),
-				}),
-			),
-		);
-	});
-}
+	return yield* runSubprocessEffect({
+		command: "xurl",
+		args: [...configuredAccountGlobalArgs(), ...args],
+	}).pipe(
+		Effect.map(({ stdout, stderr }) => ({
+			ok: true,
+			output: stdout || stderr,
+		})),
+		Effect.catchAll((error) =>
+			Effect.succeed({
+				ok: false,
+				output: formatExecError(error, "xurl execution failed"),
+			}),
+		),
+	);
+});
 
 function execXurlJsonEffect(
 	args: string[],
 	timeoutMs?: number,
+	signal?: AbortSignal,
 ): Effect.Effect<{ stdout: string; stderr: string }, Error> {
-	return Effect.tryPromise({
-		try: () => {
-			const controller =
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs > 0
-					? new AbortController()
-					: undefined;
-			if (
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs <= 0
-			) {
-				throw new Error("xurl command timed out");
-			}
-			const timeout = controller
-				? setTimeout(() => controller.abort(), timeoutMs)
-				: undefined;
-			const result = controller
-				? execFileAsync("xurl", args, { signal: controller.signal })
-				: execFileAsync("xurl", args);
-			return result.finally(() => {
-				if (timeout) {
-					clearTimeout(timeout);
-				}
-			});
-		},
-		catch: normalizeError,
+	return runSubprocessEffect({
+		command: "xurl",
+		args,
+		timeoutMs,
+		signal,
 	});
 }
 
@@ -344,80 +315,87 @@ function execXurlTextEffect(
 	args: string[],
 	deadlineMs?: number,
 ): Effect.Effect<{ stdout: string; stderr: string }, Error> {
-	return Effect.tryPromise({
-		try: () => {
-			const timeoutMs = getRemainingTimeoutMs(deadlineMs);
-			const controller =
-				typeof timeoutMs === "number" &&
-				Number.isFinite(timeoutMs) &&
-				timeoutMs > 0
-					? new AbortController()
-					: undefined;
-			const timeout = controller
-				? setTimeout(() => controller.abort(), timeoutMs)
-				: undefined;
-			const result = controller
-				? execFileAsync("xurl", args, { signal: controller.signal })
-				: execFileAsync("xurl", args);
-			return result.finally(() => {
-				if (timeout) {
-					clearTimeout(timeout);
-				}
+	return Effect.suspend(() => {
+		try {
+			return runSubprocessEffect({
+				command: "xurl",
+				args,
+				timeoutMs: getRemainingTimeoutMs(deadlineMs),
 			});
-		},
-		catch: normalizeError,
+		} catch (error) {
+			return Effect.fail(normalizeError(error));
+		}
 	});
 }
 
 function parseJsonPayloadEffect(
 	stdout: string,
 	args: string[],
-): Effect.Effect<Record<string, unknown>, Error> {
+): Effect.Effect<Record<string, unknown>, XurlCommandError> {
 	return Effect.try({
 		try: () => JSON.parse(stdout) as Record<string, unknown>,
-		catch: (error) => formatXurlCommandError(error, args),
+		catch: (error) => toXurlCommandError(error, args),
 	});
 }
 
-function runJsonCommandEffect(
+const runJsonCommandEffect = Effect.fn("xurl.runJsonCommand")(function* (
 	args: string[],
 	options: JsonCommandOptions = {},
-	attempt = 0,
-): Effect.Effect<Record<string, unknown>, Error> {
-	return Effect.gen(function* () {
-		const deadlineMs =
-			options.deadlineMs ??
-			(typeof options.timeoutMs === "number" &&
-			Number.isFinite(options.timeoutMs) &&
-			options.timeoutMs > 0
-				? Date.now() + options.timeoutMs
-				: undefined);
-		const timeoutMs = deadlineMs
-			? Math.max(0, deadlineMs - Date.now())
-			: undefined;
-		return yield* execXurlJsonEffect(args, timeoutMs).pipe(
-			Effect.flatMap(({ stdout }) => parseJsonPayloadEffect(stdout, args)),
-			Effect.catchAll((error) => {
-				const retryDelayMs = getRetryDelayMs(error, attempt);
-				if (retryDelayMs === null || attempt >= JSON_RETRY_LIMIT - 1) {
-					return Effect.fail(formatXurlCommandError(error, args));
-				}
-				const remainingMs = deadlineMs
-					? Math.max(0, deadlineMs - Date.now())
-					: undefined;
-				if (remainingMs !== undefined && retryDelayMs >= remainingMs) {
-					return Effect.fail(formatXurlCommandError(error, args));
-				}
+) {
+	const deadlineMs =
+		options.deadlineMs ??
+		(typeof options.timeoutMs === "number" &&
+		Number.isFinite(options.timeoutMs) &&
+		options.timeoutMs > 0
+			? Date.now() + options.timeoutMs
+			: undefined);
+	let attempt = 0;
 
-				return Effect.sleep(retryDelayMs).pipe(
-					Effect.flatMap(() =>
-						runJsonCommandEffect(args, { ...options, deadlineMs }, attempt + 1),
-					),
-				);
+	const attemptCommand = Effect.suspend(() =>
+		execXurlJsonEffect(
+			args,
+			deadlineMs === undefined
+				? undefined
+				: Math.max(0, deadlineMs - Date.now()),
+			options.signal,
+		),
+	).pipe(
+		Effect.flatMap(({ stdout }) => parseJsonPayloadEffect(stdout, args)),
+		Effect.mapError((error) => toXurlCommandError(error, args)),
+		Effect.tap(() =>
+			Effect.sync(() =>
+				emitJsonCommandAttempt(options, { args, attempt, status: "ok" }),
+			),
+		),
+		Effect.tapError((error) =>
+			Effect.sync(() => {
+				emitJsonCommandAttempt(options, {
+					args,
+					attempt,
+					status: error.rateLimited ? "rate_limited" : "error",
+					error,
+				});
+				attempt += 1;
 			}),
-		);
-	});
-}
+		),
+	);
+
+	// Retry hidden 429s with capped exponential backoff, but never sleep past
+	// the caller's deadline or an external abort.
+	const rateLimitRetries = Schedule.recurs(JSON_RETRY_LIMIT - 1).pipe(
+		Schedule.whileInput(
+			(error: XurlCommandError) =>
+				error.rateLimited && options.signal?.aborted !== true,
+		),
+		Schedule.check((_error, retries) => {
+			if (deadlineMs === undefined) return true;
+			return jsonRetryDelayMs(retries) < Math.max(0, deadlineMs - Date.now());
+		}),
+		Schedule.addDelay((retries) => Duration.millis(jsonRetryDelayMs(retries))),
+	);
+
+	return yield* Effect.retry(attemptCommand, rateLimitRetries);
+});
 
 function cleanXurlUsernameLabel(username?: string) {
 	const label = username?.trim().replace(/^@/, "");
@@ -466,45 +444,58 @@ function parseOAuth2UsernamesFromStatus(rawStatus: string) {
 	return usernames;
 }
 
-function readOAuth2UsernameCandidatesEffect(
-	deadlineMs?: number,
-): Effect.Effect<OAuth2UsernameCandidate[], never> {
-	return execXurlTextEffect(["auth", "status"], deadlineMs).pipe(
+const readOAuth2UsernameCandidatesEffect = Effect.fn(
+	"xurl.readOAuth2UsernameCandidates",
+)((deadlineMs?: number): Effect.Effect<OAuth2UsernameCandidate[], never> =>
+	execXurlTextEffect(["auth", "status"], deadlineMs).pipe(
 		Effect.map(({ stdout }) => parseOAuth2UsernamesFromStatus(stdout)),
 		Effect.catchAll(() => Effect.succeed([])),
+	),
+);
+
+export function readXurlOAuth2AccountsEffect(): Effect.Effect<
+	LiveDataSourceAccount[],
+	never
+> {
+	return readOAuth2UsernameCandidatesEffect().pipe(
+		Effect.map((candidates) =>
+			candidates.map((candidate) => ({
+				...(candidate.app ? { app: candidate.app } : {}),
+				...(candidate.username ? { username: candidate.username } : {}),
+			})),
+		),
 	);
 }
 
-function lookupOAuth2UsernameForAccountEffect(
+const lookupOAuth2UsernameForAccountEffect = Effect.fn(
+	"xurl.lookupOAuth2UsernameForAccount",
+)(function* (
 	expectedUsername: string,
 	attemptedUsernames: Set<string>,
 	deadlineMs?: number,
 	knownCandidates?: OAuth2UsernameCandidate[],
 ) {
-	return Effect.gen(function* () {
-		const expected = comparableXurlUsername(expectedUsername);
-		if (!expected) return undefined;
+	const expected = comparableXurlUsername(expectedUsername);
+	if (!expected) return undefined;
 
-		const candidates =
-			knownCandidates ??
-			(yield* readOAuth2UsernameCandidatesEffect(deadlineMs));
-		for (const candidate of candidates) {
-			const candidateKey = `${candidate.app ?? "default"}:${candidate.username}`;
-			if (attemptedUsernames.has(candidateKey)) continue;
-			const payload = yield* runJsonCommandEffect(
-				oauth2ArgsForCandidate(candidate, ["/2/users/me"]),
-				{ deadlineMs },
-			).pipe(Effect.catchAll(() => Effect.succeed(null)));
-			const user = payload ? authenticatedUserFromPayload(payload) : null;
-			const actual = comparableXurlUsername(String(user?.username ?? ""));
-			if (actual === expected) {
-				return candidate;
-			}
+	const candidates =
+		knownCandidates ?? (yield* readOAuth2UsernameCandidatesEffect(deadlineMs));
+	for (const candidate of candidates) {
+		const candidateKey = `${candidate.app ?? "default"}:${candidate.username}`;
+		if (attemptedUsernames.has(candidateKey)) continue;
+		const payload = yield* runJsonCommandEffect(
+			oauth2ArgsForCandidate(candidate, ["/2/users/me"]),
+			{ deadlineMs },
+		).pipe(Effect.catchAll(() => Effect.succeed(null)));
+		const user = payload ? authenticatedUserFromPayload(payload) : null;
+		const actual = comparableXurlUsername(String(user?.username ?? ""));
+		if (actual === expected) {
+			return candidate;
 		}
+	}
 
-		return undefined;
-	});
-}
+	return undefined;
+});
 
 function oauth2ArgsForCandidate(
 	candidate: OAuth2UsernameCandidate | undefined,
@@ -519,17 +510,41 @@ function oauth2ArgsForCandidate(
 	];
 }
 
-function runOAuth2JsonCommandEffect({
-	args,
-	username,
-	options,
-}: {
-	args: string[];
-	username?: string;
-	options?: JsonCommandOptions;
-}) {
-	const primaryUsername = cleanXurlUsernameLabel(username);
-	return Effect.gen(function* () {
+function configuredOAuth2Candidate(primaryUsername: string | undefined) {
+	const app = cleanXurlAppLabel(process.env.BIRDCLAW_XURL_OAUTH2_APP);
+	const username = cleanXurlUsernameLabel(
+		process.env.BIRDCLAW_XURL_OAUTH2_USERNAME,
+	);
+	if (!app && !username) return undefined;
+	const effectiveUsername = username ?? primaryUsername;
+	if (!app && !effectiveUsername) return undefined;
+	return {
+		...(app ? { app } : {}),
+		...(effectiveUsername ? { username: effectiveUsername } : {}),
+	};
+}
+
+function configuredAccountGlobalArgs() {
+	const candidate = configuredOAuth2Candidate(undefined);
+	return [
+		...(candidate?.app ? ["--app", candidate.app] : []),
+		...(candidate?.username ? ["--username", candidate.username] : []),
+	];
+}
+
+const runOAuth2JsonCommandEffect = Effect.fn("xurl.runOAuth2JsonCommand")(
+	function* ({
+		args,
+		username,
+		options,
+		useConfiguredCandidate = true,
+	}: {
+		args: string[];
+		username?: string;
+		options?: JsonCommandOptions;
+		useConfiguredCandidate?: boolean;
+	}) {
+		const primaryUsername = cleanXurlUsernameLabel(username);
 		const deadlineMs =
 			options?.deadlineMs ??
 			(typeof options?.timeoutMs === "number" &&
@@ -541,36 +556,60 @@ function runOAuth2JsonCommandEffect({
 		let authCandidate: OAuth2UsernameCandidate | undefined = primaryUsername
 			? { username: primaryUsername }
 			: undefined;
-		if (primaryUsername) {
-			const candidates = yield* readOAuth2UsernameCandidatesEffect(deadlineMs);
-			const primaryCandidates = candidates.filter(
-				(candidate) => candidate.username === primaryUsername,
-			);
-			if (primaryCandidates.length === 1) {
-				authCandidate = primaryCandidates[0];
-			} else if (primaryCandidates.length > 1) {
-				const verifiedUsername = yield* lookupOAuth2UsernameForAccountEffect(
-					primaryUsername,
-					new Set(),
-					deadlineMs,
-					candidates,
-				);
-				authCandidate = verifiedUsername ?? { username: primaryUsername };
+		const configuredCandidate = useConfiguredCandidate
+			? configuredOAuth2Candidate(primaryUsername)
+			: undefined;
+		if (configuredCandidate) {
+			authCandidate = configuredCandidate;
+		} else if (primaryUsername) {
+			const cacheKey = primaryUsername.toLowerCase();
+			const cachedCandidate = oauth2CandidateCache.get(cacheKey);
+			if (cachedCandidate && cachedCandidate.expiresAt > Date.now()) {
+				authCandidate = cachedCandidate.value;
 			} else {
-				const fallbackUsername = yield* lookupOAuth2UsernameForAccountEffect(
-					primaryUsername,
-					new Set(),
-					deadlineMs,
-					candidates,
+				const candidates =
+					yield* readOAuth2UsernameCandidatesEffect(deadlineMs);
+				const primaryCandidates = candidates.filter(
+					(candidate) => candidate.username === primaryUsername,
 				);
-				if (fallbackUsername) {
-					authCandidate = fallbackUsername;
+				if (primaryCandidates.length === 1) {
+					authCandidate = primaryCandidates[0];
+				} else if (primaryCandidates.length > 1) {
+					const verifiedUsername = yield* lookupOAuth2UsernameForAccountEffect(
+						primaryUsername,
+						new Set(),
+						deadlineMs,
+						candidates,
+					);
+					authCandidate = verifiedUsername ??
+						primaryCandidates[0] ?? { username: primaryUsername };
+				} else {
+					const fallbackUsername = yield* lookupOAuth2UsernameForAccountEffect(
+						primaryUsername,
+						new Set(),
+						deadlineMs,
+						candidates,
+					);
+					if (fallbackUsername) {
+						authCandidate = fallbackUsername;
+					}
+				}
+				if (authCandidate) {
+					oauth2CandidateCache.set(cacheKey, {
+						expiresAt: Date.now() + AUTHENTICATED_USER_TTL_MS,
+						value: authCandidate,
+					});
 				}
 			}
 		}
 
 		if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
-			return yield* Effect.fail(new Error("xurl OAuth2 fallback timed out"));
+			return yield* new XurlCommandError({
+				message: "xurl OAuth2 fallback timed out",
+				commandArgs: args,
+				rateLimited: false,
+				cause: undefined,
+			});
 		}
 
 		return yield* runJsonCommandEffect(
@@ -581,6 +620,7 @@ function runOAuth2JsonCommandEffect({
 				if (!primaryUsername) {
 					return Effect.fail(error);
 				}
+				oauth2CandidateCache.delete(primaryUsername.toLowerCase());
 				const attempted = new Set([
 					authCandidate
 						? `${authCandidate.app ?? "default"}:${authCandidate.username}`
@@ -598,6 +638,10 @@ function runOAuth2JsonCommandEffect({
 						if (!fallbackUsername) {
 							return Effect.fail(error);
 						}
+						oauth2CandidateCache.set(primaryUsername.toLowerCase(), {
+							expiresAt: Date.now() + AUTHENTICATED_USER_TTL_MS,
+							value: fallbackUsername,
+						});
 						return runJsonCommandEffect(
 							oauth2ArgsForCandidate(fallbackUsername, args),
 							scopedOptions,
@@ -607,11 +651,11 @@ function runOAuth2JsonCommandEffect({
 				);
 			}),
 		);
-	});
-}
+	},
+);
 
-function runMutationCommandEffect(args: string[]) {
-	return Effect.gen(function* () {
+const runMutationCommandEffect = Effect.fn("xurl.runMutationCommand")(
+	function* (args: string[], field: "blocking" | "muting", expected: boolean) {
 		if (liveWritesDisabled()) {
 			if (e2eFakeLiveWritesEnabled()) {
 				return { ok: true, output: "e2e fake live write" };
@@ -619,14 +663,38 @@ function runMutationCommandEffect(args: string[]) {
 			return { ok: false, output: "live writes disabled" };
 		}
 
-		return yield* Effect.tryPromise({
-			try: () => execFileAsync("xurl", args),
-			catch: normalizeError,
+		const candidate = configuredOAuth2Candidate(undefined);
+		const commandArgs = candidate
+			? oauth2ArgsForCandidate(candidate, args)
+			: args;
+		return yield* runSubprocessEffect({
+			command: "xurl",
+			args: commandArgs,
 		}).pipe(
-			Effect.map(({ stdout, stderr }) => ({
-				ok: true,
-				output: stdout || stderr || "ok",
-			})),
+			Effect.map(({ stdout, stderr }) => {
+				const output = stdout || stderr || "empty response";
+				let confirmed: unknown;
+				try {
+					const payload = JSON.parse(stripAnsi(stdout));
+					const errors = payload?.errors;
+					if (errors != null && (!Array.isArray(errors) || errors.length > 0)) {
+						return { ok: false, output };
+					}
+					confirmed = payload?.data?.[field];
+				} catch {
+					// A successful subprocess exit alone does not prove an X mutation.
+				}
+				if (confirmed !== expected) {
+					return {
+						ok: false,
+						output: `${output}\nxurl response did not confirm ${field}=${String(expected)}`,
+					};
+				}
+				return {
+					ok: true,
+					output: `${output}\nverified ${field}=${String(expected)}`,
+				};
+			}),
 			Effect.catchAll((error) =>
 				Effect.succeed({
 					ok: false,
@@ -634,10 +702,13 @@ function runMutationCommandEffect(args: string[]) {
 				}),
 			),
 		);
-	});
-}
+	},
+);
 
-export function lookupUsersByIdsEffect(ids: string[]) {
+export const lookupUsersByIdsEffect = Effect.fn("xurl.lookupUsersByIds")((
+	ids: string[],
+	options: { username?: string } = {},
+): Effect.Effect<XurlMentionUser[], XurlCommandError> => {
 	if (ids.length === 0) {
 		return Effect.succeed([]);
 	}
@@ -647,18 +718,133 @@ export function lookupUsersByIdsEffect(ids: string[]) {
 		"user.fields":
 			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
 	});
-	return runJsonCommandEffect([`/2/users?${query.toString()}`]).pipe(
+	const args = [`/2/users?${query.toString()}`];
+	const command = options.username
+		? runOAuth2JsonCommandEffect({ args, username: options.username })
+		: runJsonCommandEffect(args);
+	return command.pipe(
 		Effect.map((payload) =>
 			Array.isArray(payload.data) ? (payload.data as XurlMentionUser[]) : [],
 		),
 	);
+});
+
+function normalizeXListPage(payload: Record<string, unknown>): XListPage {
+	const rawItems = Array.isArray(payload.data) ? payload.data : [];
+	const data = rawItems
+		.map((value): XListRecord | null => {
+			const item = value as Record<string, unknown>;
+			if (typeof item.id !== "string" || typeof item.name !== "string") {
+				return null;
+			}
+			return {
+				id: item.id,
+				name: item.name,
+				...(typeof item.description === "string"
+					? { description: item.description }
+					: {}),
+				...(typeof item.member_count === "number"
+					? { memberCount: item.member_count }
+					: {}),
+				...(typeof item.follower_count === "number"
+					? { followerCount: item.follower_count }
+					: {}),
+				...(typeof item.private === "boolean"
+					? { isPrivate: item.private }
+					: {}),
+				...(typeof item.owner_id === "string"
+					? { ownerId: item.owner_id }
+					: {}),
+				...(typeof item.created_at === "string"
+					? { createdAt: item.created_at }
+					: {}),
+				raw: item,
+			};
+		})
+		.filter((item): item is XListRecord => Boolean(item));
+	const meta =
+		payload.meta && typeof payload.meta === "object"
+			? (payload.meta as Record<string, unknown>)
+			: {};
+	return {
+		data,
+		meta: {
+			result_count: data.length,
+			...(typeof meta.next_token === "string"
+				? { next_token: meta.next_token }
+				: { next_token: null }),
+		},
+	};
 }
 
-export function lookupUsersByIds(ids: string[]) {
-	return runEffectPromise(lookupUsersByIdsEffect(ids));
-}
+export const listOwnedXListsViaXurlEffect = Effect.fn("xurl.listOwnedXLists")(({
+	userId,
+	username,
+	maxResults,
+	paginationToken,
+}: {
+	userId: string;
+	username?: string;
+	maxResults: number;
+	paginationToken?: string;
+}) => {
+	const query = new URLSearchParams({
+		max_results: String(maxResults),
+		"list.fields":
+			"created_at,description,follower_count,member_count,name,owner_id,private",
+	});
+	if (paginationToken) query.set("pagination_token", paginationToken);
+	return runOAuth2JsonCommandEffect({
+		args: [`/2/users/${userId}/owned_lists?${query.toString()}`],
+		username,
+	}).pipe(Effect.map(normalizeXListPage));
+});
 
-export function lookupUsersByHandlesEffect(handles: string[]) {
+export const listXListMembersViaXurlEffect = Effect.fn("xurl.listXListMembers")(
+	({
+		listId,
+		username,
+		maxResults,
+		paginationToken,
+	}: {
+		listId: string;
+		username?: string;
+		maxResults: number;
+		paginationToken?: string;
+	}) => {
+		const query = new URLSearchParams({
+			max_results: String(maxResults),
+			"user.fields": RICH_USER_FIELDS,
+		});
+		if (paginationToken) query.set("pagination_token", paginationToken);
+		return runOAuth2JsonCommandEffect({
+			args: [`/2/lists/${listId}/members?${query.toString()}`],
+			username,
+		}).pipe(
+			Effect.map((payload) => ({
+				data: Array.isArray(payload.data)
+					? (payload.data as XurlMentionUser[])
+					: [],
+				meta:
+					payload.meta && typeof payload.meta === "object"
+						? (payload.meta as Record<string, unknown>)
+						: {},
+			})),
+		);
+	},
+);
+
+export const lookupUsersByHandlesEffect = Effect.fn(
+	"xurl.lookupUsersByHandles",
+)((
+	handles: string[],
+	options: {
+		auth?: "oauth2";
+		username?: string;
+		signal?: AbortSignal;
+		useConfiguredCandidate?: boolean;
+	} = {},
+): Effect.Effect<XurlMentionUser[], XurlCommandError> => {
 	if (handles.length === 0) {
 		return Effect.succeed([]);
 	}
@@ -668,16 +854,22 @@ export function lookupUsersByHandlesEffect(handles: string[]) {
 		"user.fields":
 			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
 	});
-	return runJsonCommandEffect([`/2/users/by?${query.toString()}`]).pipe(
+	const args = [`/2/users/by?${query.toString()}`];
+	const command =
+		options.auth === "oauth2"
+			? runOAuth2JsonCommandEffect({
+					args,
+					username: options.username,
+					options: { signal: options.signal },
+					useConfiguredCandidate: options.useConfiguredCandidate,
+				})
+			: runJsonCommandEffect(args, { signal: options.signal });
+	return command.pipe(
 		Effect.map((payload) =>
 			Array.isArray(payload.data) ? (payload.data as XurlMentionUser[]) : [],
 		),
 	);
-}
-
-export function lookupUsersByHandles(handles: string[]) {
-	return runEffectPromise(lookupUsersByHandlesEffect(handles));
-}
+});
 
 function authenticatedUserFromPayload(payload: Record<string, unknown>) {
 	const data = payload.data;
@@ -686,743 +878,390 @@ function authenticatedUserFromPayload(payload: Record<string, unknown>) {
 		: null;
 }
 
-export function lookupAuthenticatedUserFreshEffect() {
+function lookupAuthenticatedUserUnscopedFreshEffect() {
 	return runJsonCommandEffect(["whoami"]).pipe(
 		Effect.map(authenticatedUserFromPayload),
 	);
 }
 
-export function lookupAuthenticatedOAuth2UserEffect(username?: string) {
-	return runOAuth2JsonCommandEffect({
+export const lookupAuthenticatedUserFreshEffect = Effect.fn(
+	"xurl.lookupAuthenticatedUserFresh",
+)(() => {
+	const username = cleanXurlUsernameLabel(
+		process.env.BIRDCLAW_XURL_OAUTH2_USERNAME,
+	);
+	if (!username) return lookupAuthenticatedUserUnscopedFreshEffect();
+	return runOAuth2JsonCommandEffect({ args: ["whoami"], username }).pipe(
+		Effect.map(authenticatedUserFromPayload),
+	);
+});
+
+export const lookupAuthenticatedOAuth2UserEffect = Effect.fn(
+	"xurl.lookupAuthenticatedOAuth2User",
+)((username?: string) =>
+	runOAuth2JsonCommandEffect({
 		args: ["whoami"],
 		username,
-	}).pipe(Effect.map(authenticatedUserFromPayload));
+	}).pipe(Effect.map(authenticatedUserFromPayload)),
+);
+
+export function lookupAuthenticatedUserUnscopedEffect() {
+	// Failures are not cached: invalidate so the next caller retries fresh.
+	return cachedAuthenticatedUser.pipe(
+		Effect.tapError(() => invalidateAuthenticatedUser),
+	);
 }
 
 export function lookupAuthenticatedUserEffect() {
-	return Effect.gen(function* () {
-		const now = Date.now();
-		if (
-			authenticatedUserCache &&
-			"value" in authenticatedUserCache &&
-			authenticatedUserCache.expiresAt > now
-		) {
-			return authenticatedUserCache.value ?? null;
-		}
-
-		if (authenticatedUserCache?.pending) {
-			return yield* Effect.tryPromise({
-				try: () => authenticatedUserCache?.pending ?? Promise.resolve(null),
-				catch: normalizeError,
-			});
-		}
-
-		const pending = runEffectPromise(lookupAuthenticatedUserFreshEffect());
-
-		authenticatedUserCache = {
-			expiresAt: 0,
-			pending,
-		};
-
-		const value = yield* Effect.tryPromise({
-			try: () => pending,
-			catch: normalizeError,
-		}).pipe(
-			Effect.catchAll((error) =>
-				Effect.sync(() => {
-					authenticatedUserCache = undefined;
-				}).pipe(Effect.flatMap(() => Effect.fail(error))),
-			),
-		);
-		authenticatedUserCache = {
-			expiresAt: Date.now() + AUTHENTICATED_USER_TTL_MS,
-			value,
-		};
-		return value;
-	});
+	const username = cleanXurlUsernameLabel(
+		process.env.BIRDCLAW_XURL_OAUTH2_USERNAME,
+	);
+	if (username) return lookupAuthenticatedOAuth2UserEffect(username);
+	return lookupAuthenticatedUserUnscopedEffect();
 }
 
-export function lookupAuthenticatedUser() {
-	return runEffectPromise(lookupAuthenticatedUserEffect());
-}
-
-export function lookupAuthenticatedUserFresh() {
-	return runEffectPromise(lookupAuthenticatedUserFreshEffect());
-}
-
-function resolveUserIdEffect({
+const resolveUserIdEffect = Effect.fn("xurl.resolveUserId")(function* ({
 	username,
 	userId,
 }: {
 	username?: string;
 	userId?: string;
 }) {
-	return Effect.gen(function* () {
-		if (userId) return userId;
-		if (username) {
-			const [user] = yield* lookupUsersByHandlesEffect([username]);
-			if (!user?.id) {
-				return yield* Effect.fail(
-					new Error(`Could not resolve Twitter user id for @${username}`),
-				);
-			}
-			return String(user.id);
-		}
-		const user = yield* lookupAuthenticatedUserEffect();
+	if (userId) return userId;
+	if (username) {
+		const [user] = yield* lookupUsersByHandlesEffect([username]);
 		if (!user?.id) {
 			return yield* Effect.fail(
-				new Error("Could not resolve authenticated Twitter user id"),
+				new Error(`Could not resolve Twitter user id for @${username}`),
 			);
 		}
 		return String(user.id);
-	});
-}
+	}
+	const user = yield* lookupAuthenticatedUserEffect();
+	if (!user?.id) {
+		return yield* Effect.fail(
+			new Error("Could not resolve authenticated Twitter user id"),
+		);
+	}
+	return String(user.id);
+});
 
-export function listMentionsViaXurlEffect({
-	maxResults,
-	username,
-	userId,
-	paginationToken,
-	sinceId,
-	startTime,
-}: {
+interface PageOptions {
 	maxResults: number;
 	username?: string;
 	userId?: string;
 	paginationToken?: string;
-	sinceId?: string;
-	startTime?: string;
-}): Effect.Effect<XurlMentionsResponse, Error> {
-	return Effect.gen(function* () {
-		const resolvedUserId = yield* resolveUserIdEffect({ username, userId });
-		const query = new URLSearchParams({
-			max_results: String(maxResults),
-			expansions: AUTHOR_MEDIA_EXPANSIONS,
-			"tweet.fields": "created_at,conversation_id,entities,public_metrics",
-			"media.fields": MEDIA_FIELDS,
-			"user.fields":
-				"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
-		});
-		if (paginationToken) {
-			query.set("pagination_token", paginationToken);
-		}
-		if (sinceId) {
-			query.set("since_id", sinceId);
-		}
-		if (startTime) {
-			query.set("start_time", startTime);
-		}
+}
+type QueryParams = Record<string, string | number | undefined>;
 
-		const payload = yield* runOAuth2JsonCommandEffect({
-			args: [`/2/users/${resolvedUserId}/mentions?${query.toString()}`],
-			username,
-		});
-		return toXurlMentionsResponse(payload);
-	});
+function queryArgs(endpoint: string, params: QueryParams) {
+	const query = new URLSearchParams();
+	for (const [key, value] of Object.entries(params)) {
+		if (value !== undefined) query.set(key, String(value));
+	}
+	return [`${endpoint}?${query}`];
 }
 
-export function listMentionsViaXurl(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-	sinceId?: string;
-	startTime?: string;
-}): Promise<XurlMentionsResponse> {
-	return runEffectPromise(listMentionsViaXurlEffect(options));
-}
-
-export function listHomeTimelineViaXurlEffect({
-	maxResults,
-	username,
-	userId,
-	paginationToken,
-	timeoutMs,
-}: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-	timeoutMs?: number;
-}): Effect.Effect<XurlMentionsResponse, Error> {
-	return Effect.gen(function* () {
-		const resolvedUserId = yield* resolveUserIdEffect({ username, userId });
-		const query = new URLSearchParams({
-			max_results: String(maxResults),
-			expansions: AUTHOR_MEDIA_EXPANSIONS,
-			"tweet.fields":
-				"created_at,conversation_id,entities,public_metrics,referenced_tweets",
-			"media.fields": MEDIA_FIELDS,
-			"user.fields": RICH_USER_FIELDS,
-		});
-		if (paginationToken) {
-			query.set("pagination_token", paginationToken);
-		}
-
-		const payload = yield* runOAuth2JsonCommandEffect({
-			args: [
-				`/2/users/${resolvedUserId}/timelines/reverse_chronological?${query.toString()}`,
-			],
-			username,
-			options: { timeoutMs },
-		});
-		return toXurlMentionsResponse(payload);
-	});
-}
-
-export function listHomeTimelineViaXurl(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-	timeoutMs?: number;
-}): Promise<XurlMentionsResponse> {
-	return runEffectPromise(listHomeTimelineViaXurlEffect(options));
-}
-
-function toXurlMentionsResponse(
-	payload: Record<string, unknown>,
-): XurlMentionsResponse {
+function tweetQuery(
+	params: QueryParams,
+	fields = "created_at,conversation_id,entities,note_tweet,public_metrics,referenced_tweets",
+): QueryParams {
 	return {
-		data: Array.isArray(payload.data)
-			? (payload.data as XurlMentionsResponse["data"])
-			: [],
-		includes:
-			payload.includes && typeof payload.includes === "object"
-				? (payload.includes as XurlMentionsResponse["includes"])
-				: undefined,
-		meta:
-			payload.meta && typeof payload.meta === "object"
-				? (payload.meta as XurlMentionsResponse["meta"])
-				: undefined,
+		...params,
+		expansions: AUTHOR_MEDIA_EXPANSIONS,
+		"tweet.fields": fields,
+		"media.fields": MEDIA_FIELDS,
+		"user.fields": RICH_USER_FIELDS,
 	};
 }
 
-function listTimelineCollectionViaXurlEffect({
-	collection,
-	maxResults,
-	username,
-	userId,
-	isPaginatedWalk = false,
-	paginationToken,
-}: {
-	collection: TimelineCollectionEndpoint;
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	isPaginatedWalk?: boolean;
-	paginationToken?: string;
-}): Effect.Effect<XurlMentionsResponse, Error> {
-	return Effect.gen(function* () {
-		const resolvedUserId = yield* resolveUserIdEffect({ username, userId });
-		const requestMaxResults = capTimelineCollectionMaxResults(
-			collection,
-			maxResults,
-			isPaginatedWalk,
-		);
-		const query = new URLSearchParams({
-			max_results: String(requestMaxResults),
-			expansions: AUTHOR_MEDIA_EXPANSIONS,
-			"tweet.fields":
-				"created_at,conversation_id,entities,public_metrics,referenced_tweets",
-			"media.fields": MEDIA_FIELDS,
-			"user.fields":
-				"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
-		});
-		if (paginationToken) {
-			query.set("pagination_token", paginationToken);
-		}
-
-		const payload = yield* runOAuth2JsonCommandEffect({
-			args: [`/2/users/${resolvedUserId}/${collection}?${query.toString()}`],
-			username,
-		});
-		return toXurlMentionsResponse(payload);
-	});
-}
-
-export function listLikedTweetsViaXurlEffect(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-}) {
-	return listTimelineCollectionViaXurlEffect({
-		...options,
-		collection: "liked_tweets",
-	});
-}
-
-export function listLikedTweetsViaXurl(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-}): Promise<XurlMentionsResponse> {
-	return runEffectPromise(listLikedTweetsViaXurlEffect(options));
-}
-
-export function listBookmarkedTweetsViaXurlEffect(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	isPaginatedWalk?: boolean;
-	paginationToken?: string;
-}) {
-	return listTimelineCollectionViaXurlEffect({
-		...options,
-		collection: "bookmarks",
-	});
-}
-
-export function listBookmarkedTweetsViaXurl(options: {
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	isPaginatedWalk?: boolean;
-	paginationToken?: string;
-}): Promise<XurlMentionsResponse> {
-	return runEffectPromise(listBookmarkedTweetsViaXurlEffect(options));
-}
-
-export function listDirectMessageEventsViaXurlEffect({
-	maxResults,
-	username,
-	paginationToken,
-}: {
-	maxResults: number;
-	username?: string;
-	paginationToken?: string;
-}): Effect.Effect<XurlDmEventsResponse, Error> {
-	const query = new URLSearchParams({
-		max_results: String(maxResults),
-		event_types: "MessageCreate",
-		"dm_event.fields": DM_EVENT_FIELDS,
-		expansions: "sender_id,participant_ids",
-		"user.fields": RICH_USER_FIELDS,
-	});
-	if (paginationToken) {
-		query.set("pagination_token", paginationToken);
-	}
-
-	return runOAuth2JsonCommandEffect({
-		args: [`/2/dm_events?${query.toString()}`],
-		username,
-	}).pipe(
-		Effect.map((payload) => ({
-			data: Array.isArray(payload.data)
-				? (payload.data as XurlDmEventsResponse["data"])
-				: [],
-			includes:
-				payload.includes && typeof payload.includes === "object"
-					? (payload.includes as XurlDmEventsResponse["includes"])
-					: undefined,
-			meta:
-				payload.meta && typeof payload.meta === "object"
-					? (payload.meta as Record<string, unknown>)
-					: undefined,
-		})),
-	);
-}
-
-export function listDirectMessageEventsViaXurl(options: {
-	maxResults: number;
-	username?: string;
-	paginationToken?: string;
-}): Promise<XurlDmEventsResponse> {
-	return runEffectPromise(listDirectMessageEventsViaXurlEffect(options));
-}
-
-export function listFollowUsersViaXurlEffect({
-	direction,
-	maxResults,
-	username,
-	userId,
-	paginationToken,
-}: {
-	direction: FollowDirection;
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-}): Effect.Effect<XurlFollowUsersResponse, Error> {
-	return Effect.gen(function* () {
-		const resolvedUserId = yield* resolveUserIdEffect({ username, userId });
-		const query = new URLSearchParams({
-			max_results: String(maxResults),
-			"user.fields":
-				"id,username,name,description,verified,protected,public_metrics,profile_image_url,created_at",
-		});
-		if (paginationToken) {
-			query.set("pagination_token", paginationToken);
-		}
-
-		const payload = yield* runOAuth2JsonCommandEffect({
-			args: [`/2/users/${resolvedUserId}/${direction}?${query.toString()}`],
-			username,
-		});
-		return {
-			data: Array.isArray(payload.data)
-				? (payload.data as XurlMentionUser[])
-				: [],
-			meta:
-				payload.meta && typeof payload.meta === "object"
-					? (payload.meta as Record<string, unknown>)
-					: undefined,
-		};
-	});
-}
-
-export function listFollowUsersViaXurl(options: {
-	direction: FollowDirection;
-	maxResults: number;
-	username?: string;
-	userId?: string;
-	paginationToken?: string;
-}): Promise<XurlFollowUsersResponse> {
-	return runEffectPromise(listFollowUsersViaXurlEffect(options));
-}
-
-export function listBlockedUsersEffect(
-	userId: string,
-	paginationToken?: string,
-) {
-	const query = new URLSearchParams({
-		max_results: "100",
-		"user.fields":
-			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
-	});
-	if (paginationToken) {
-		query.set("pagination_token", paginationToken);
-	}
-
-	return runJsonCommandEffect([`/2/users/${userId}/blocking?${query}`]).pipe(
-		Effect.map((payload) => {
-			const data = Array.isArray(payload.data)
-				? (payload.data as XurlMentionUser[])
-				: [];
-			const meta =
-				payload.meta && typeof payload.meta === "object"
-					? (payload.meta as Record<string, unknown>)
-					: null;
-
-			return {
-				items: data,
-				nextToken:
-					typeof meta?.next_token === "string" ? String(meta.next_token) : null,
-			};
-		}),
-	);
-}
-
-export function listBlockedUsers(userId: string, paginationToken?: string) {
-	return runEffectPromise(listBlockedUsersEffect(userId, paginationToken));
-}
-
-export function listUserTweetsEffect(
-	userId: string,
-	{
-		maxResults,
-		paginationToken,
-		excludeRetweets = true,
-		sinceId,
-		untilId,
-		tweetFields,
-		expansions,
-		userFields,
-		mediaFields,
-		auth,
-	}: {
-		maxResults: number;
-		paginationToken?: string;
-		excludeRetweets?: boolean;
-		sinceId?: string;
-		untilId?: string;
-		tweetFields?: string[];
-		expansions?: string[];
-		userFields?: string[];
-		mediaFields?: string[];
-		auth?: "oauth2";
-	},
-): Effect.Effect<XurlUserTweetsResponse, Error> {
-	const query = new URLSearchParams({
-		max_results: String(maxResults),
-		expansions: MEDIA_EXPANSION,
-		"tweet.fields":
-			tweetFields?.join(",") ??
-			"created_at,conversation_id,public_metrics,referenced_tweets",
-		"media.fields": MEDIA_FIELDS,
-	});
-	if (expansions && expansions.length > 0) {
-		query.set("expansions", expansions.join(","));
-	}
-	if (userFields && userFields.length > 0) {
-		query.set("user.fields", userFields.join(","));
-	}
-	if (mediaFields && mediaFields.length > 0) {
-		query.set("media.fields", mediaFields.join(","));
-	}
-	if (sinceId) {
-		query.set("since_id", sinceId);
-	}
-	if (untilId) {
-		query.set("until_id", untilId);
-	}
-	if (excludeRetweets) {
-		query.set("exclude", "retweets");
-	}
-	if (paginationToken) {
-		query.set("pagination_token", paginationToken);
-	}
-
-	const endpoint = `/2/users/${userId}/tweets?${query}`;
-	return runJsonCommandEffect(
-		auth === "oauth2" ? ["--auth", "oauth2", endpoint] : [endpoint],
-	).pipe(
-		Effect.map((payload) => {
-			const data = Array.isArray(payload.data)
-				? (payload.data as XurlUserTweet[])
-				: [];
-			const meta =
-				payload.meta && typeof payload.meta === "object"
-					? (payload.meta as Record<string, unknown>)
-					: null;
-			const includes =
-				payload.includes && typeof payload.includes === "object"
-					? (payload.includes as XurlUserTweetsResponse["includes"])
-					: undefined;
-
-			return {
-				items: data,
-				nextToken:
-					typeof meta?.next_token === "string" ? String(meta.next_token) : null,
-				...(includes ? { includes } : {}),
-			};
-		}),
-	);
-}
-
-export function listUserTweets(
-	userId: string,
-	options: {
-		maxResults: number;
-		paginationToken?: string;
-		excludeRetweets?: boolean;
-		sinceId?: string;
-		untilId?: string;
-		tweetFields?: string[];
-		expansions?: string[];
-		userFields?: string[];
-		mediaFields?: string[];
-		auth?: "oauth2";
-	},
-): Promise<XurlUserTweetsResponse> {
-	return runEffectPromise(listUserTweetsEffect(userId, options));
+function responsePage<T>(payload: Record<string, unknown>) {
+	return {
+		data: Array.isArray(payload.data) ? (payload.data as T[]) : [],
+		includes:
+			payload.includes && typeof payload.includes === "object"
+				? payload.includes
+				: undefined,
+		meta:
+			payload.meta && typeof payload.meta === "object"
+				? (payload.meta as Record<string, unknown>)
+				: undefined,
+	};
 }
 
 function toXurlTweetsResponse(
 	payload: Record<string, unknown>,
 ): XurlTweetsResponse {
-	return {
-		data: Array.isArray(payload.data)
-			? (payload.data as XurlTweetsResponse["data"])
-			: [],
-		includes:
-			payload.includes && typeof payload.includes === "object"
-				? (payload.includes as XurlTweetsResponse["includes"])
-				: undefined,
-		meta:
-			payload.meta && typeof payload.meta === "object"
-				? (payload.meta as XurlTweetsResponse["meta"])
-				: undefined,
-	};
+	return responsePage<XurlTweetsResponse["data"][number]>(payload);
 }
 
-export function lookupTweetsByIdsEffect(
-	ids: string[],
-): Effect.Effect<XurlTweetsResponse, Error> {
-	if (ids.length === 0) {
-		return Effect.succeed({ data: [] });
-	}
-
-	const query = new URLSearchParams({
-		ids: ids.join(","),
-		expansions: AUTHOR_MEDIA_EXPANSIONS,
-		"tweet.fields":
-			"created_at,conversation_id,entities,public_metrics,referenced_tweets",
-		"media.fields": MEDIA_FIELDS,
-		"user.fields":
-			"description,entities,location,public_metrics,profile_image_url,url,created_at,verified,verified_type",
+function userTweetPageEffect(
+	endpoint: string,
+	options: PageOptions & JsonCommandOptions,
+	params: QueryParams,
+) {
+	return Effect.gen(function* () {
+		const userId = yield* resolveUserIdEffect(options);
+		const payload = yield* runOAuth2JsonCommandEffect({
+			args: queryArgs(`/2/users/${userId}/${endpoint}`, params),
+			username: options.username,
+			options: { timeoutMs: options.timeoutMs },
+		});
+		return toXurlTweetsResponse(payload) as XurlMentionsResponse;
 	});
-
-	return runJsonCommandEffect([`/2/tweets?${query.toString()}`]).pipe(
-		Effect.map(toXurlTweetsResponse),
-	);
 }
 
-export function lookupTweetsByIds(ids: string[]): Promise<XurlTweetsResponse> {
-	return runEffectPromise(lookupTweetsByIdsEffect(ids));
-}
+export const listMentionsViaXurlEffect = Effect.fn("xurl.listMentions")(
+	(options: PageOptions & { sinceId?: string; startTime?: string }) =>
+		userTweetPageEffect("mentions", options, {
+			...tweetQuery(
+				{ max_results: options.maxResults },
+				"created_at,conversation_id,entities,note_tweet,public_metrics",
+			),
+			pagination_token: options.paginationToken || undefined,
+			since_id: options.sinceId || undefined,
+			start_time: options.startTime || undefined,
+		}),
+);
 
-export function searchRecentByConversationIdEffect(
-	conversationId: string,
-	{
-		maxResults,
-		paginationToken,
-		timeoutMs,
-	}: {
-		maxResults: number;
-		paginationToken?: string;
-		timeoutMs?: number;
-	},
-): Effect.Effect<XurlTweetsResponse, Error> {
-	const query = new URLSearchParams({
-		query: `conversation_id:${conversationId}`,
-		max_results: String(maxResults),
-		expansions: AUTHOR_MEDIA_EXPANSIONS,
-		"tweet.fields": THREAD_TWEET_FIELDS,
-		"media.fields": MEDIA_FIELDS,
-		"user.fields": RICH_USER_FIELDS,
+export const listHomeTimelineViaXurlEffect = Effect.fn("xurl.listHomeTimeline")(
+	(options: PageOptions & { timeoutMs?: number }) =>
+		userTweetPageEffect("timelines/reverse_chronological", options, {
+			...tweetQuery({ max_results: options.maxResults }),
+			pagination_token: options.paginationToken || undefined,
+		}),
+);
+
+function listTimelineCollectionViaXurlEffect(
+	collection: TimelineCollectionEndpoint,
+	options: PageOptions & { isPaginatedWalk?: boolean },
+) {
+	return userTweetPageEffect(collection, options, {
+		...tweetQuery({
+			max_results: capTimelineCollectionMaxResults(
+				collection,
+				options.maxResults,
+				options.isPaginatedWalk ?? false,
+			),
+		}),
+		pagination_token: options.paginationToken || undefined,
 	});
-	if (paginationToken) {
-		query.set("pagination_token", paginationToken);
-	}
-
-	return runJsonCommandEffect([`/2/tweets/search/recent?${query.toString()}`], {
-		timeoutMs,
-	}).pipe(Effect.map(toXurlTweetsResponse));
 }
 
-export function searchRecentByConversationId(
-	conversationId: string,
-	options: {
-		maxResults: number;
-		paginationToken?: string;
-		timeoutMs?: number;
-	},
-): Promise<XurlTweetsResponse> {
-	return runEffectPromise(
-		searchRecentByConversationIdEffect(conversationId, options),
-	);
+export function listLikedTweetsViaXurlEffect(options: PageOptions) {
+	return listTimelineCollectionViaXurlEffect("liked_tweets", options);
 }
 
-export function searchRecentTweetsEffect(
-	searchQuery: string,
-	{
-		maxResults,
-		paginationToken,
-		startTime,
-		endTime,
-		username,
-		timeoutMs,
-	}: {
-		maxResults: number;
-		paginationToken?: string;
-		startTime?: string;
-		endTime?: string;
-		username?: string;
-		timeoutMs?: number;
-	},
-): Effect.Effect<XurlTweetsResponse, Error> {
-	const query = new URLSearchParams({
-		query: searchQuery,
-		max_results: String(maxResults),
-		expansions: AUTHOR_MEDIA_EXPANSIONS,
-		"tweet.fields": THREAD_TWEET_FIELDS,
-		"media.fields": MEDIA_FIELDS,
-		"user.fields": RICH_USER_FIELDS,
-	});
-	if (paginationToken) {
-		query.set("pagination_token", paginationToken);
-	}
-	if (startTime) {
-		query.set("start_time", startTime);
-	}
-	if (endTime) {
-		query.set("end_time", endTime);
-	}
+export function listBookmarkedTweetsViaXurlEffect(
+	options: PageOptions & { isPaginatedWalk?: boolean },
+) {
+	return listTimelineCollectionViaXurlEffect("bookmarks", options);
+}
 
+export function listDirectMessageEventsViaXurlEffect(
+	options: PageOptions,
+): Effect.Effect<XurlDmEventsResponse, Error> {
 	return runOAuth2JsonCommandEffect({
-		args: [`/2/tweets/search/recent?${query.toString()}`],
-		username,
-		options: { timeoutMs },
-	}).pipe(Effect.map(toXurlTweetsResponse));
+		args: queryArgs("/2/dm_events", {
+			max_results: options.maxResults,
+			event_types: "MessageCreate",
+			"dm_event.fields": DM_EVENT_FIELDS,
+			expansions: "sender_id,participant_ids",
+			"user.fields": RICH_USER_FIELDS,
+			pagination_token: options.paginationToken || undefined,
+		}),
+		username: options.username,
+	}).pipe(Effect.map(responsePage<XurlDmEventsResponse["data"][number]>));
 }
 
-export function searchRecentTweets(
-	searchQuery: string,
-	options: {
-		maxResults: number;
-		paginationToken?: string;
-		startTime?: string;
-		endTime?: string;
-		username?: string;
-		timeoutMs?: number;
+export const listFollowUsersViaXurlEffect = Effect.fn("xurl.listFollowUsers")(
+	function* (options: PageOptions & { direction: FollowDirection }) {
+		const userId = yield* resolveUserIdEffect(options);
+		const payload = yield* runOAuth2JsonCommandEffect({
+			args: queryArgs(`/2/users/${userId}/${options.direction}`, {
+				max_results: options.maxResults,
+				"user.fields":
+					"id,username,name,description,verified,protected,public_metrics,profile_image_url,created_at",
+				pagination_token: options.paginationToken || undefined,
+			}),
+			username: options.username,
+		});
+		const { data, meta } = responsePage<XurlMentionUser>(payload);
+		return { data, meta };
 	},
-): Promise<XurlTweetsResponse> {
-	return runEffectPromise(searchRecentTweetsEffect(searchQuery, options));
+);
+
+function nextToken(meta: Record<string, unknown> | undefined) {
+	return typeof meta?.next_token === "string" ? meta.next_token : null;
 }
 
-export function getTweetByIdEffect(
-	id: string,
-	{ timeoutMs }: { timeoutMs?: number } = {},
-): Effect.Effect<XurlTweetsResponse, Error> {
-	const query = new URLSearchParams({
-		expansions: AUTHOR_MEDIA_EXPANSIONS,
-		"tweet.fields": THREAD_TWEET_FIELDS,
-		"media.fields": MEDIA_FIELDS,
-		"user.fields": RICH_USER_FIELDS,
+export const listBlockedUsersEffect = Effect.fn("xurl.listBlockedUsers")(
+	(userId: string, paginationToken?: string) =>
+		runJsonCommandEffect(
+			queryArgs(`/2/users/${userId}/blocking`, {
+				max_results: "100",
+				"user.fields": RICH_USER_FIELDS,
+				pagination_token: paginationToken || undefined,
+			}),
+		).pipe(
+			Effect.map((payload) => {
+				const { data, meta } = responsePage<XurlMentionUser>(payload);
+				return { items: data, nextToken: nextToken(meta) };
+			}),
+		),
+);
+
+interface UserTweetsOptions extends PageOptions {
+	excludeRetweets?: boolean;
+	sinceId?: string;
+	untilId?: string;
+	tweetFields?: string[];
+	expansions?: string[];
+	userFields?: string[];
+	mediaFields?: string[];
+	auth?: "oauth2";
+	signal?: AbortSignal;
+	onAttempt?: JsonCommandOptions["onAttempt"];
+	useConfiguredCandidate?: boolean;
+}
+
+export const listUserTweetsEffect = Effect.fn("xurl.listUserTweets")((
+	userId: string,
+	options: UserTweetsOptions,
+): Effect.Effect<XurlUserTweetsResponse, Error> => {
+	const { signal, onAttempt } = options;
+	const args = queryArgs(`/2/users/${userId}/tweets`, {
+		max_results: options.maxResults,
+		expansions: options.expansions?.length
+			? options.expansions.join(",")
+			: MEDIA_EXPANSION,
+		"tweet.fields":
+			options.tweetFields?.join(",") ??
+			"created_at,conversation_id,note_tweet,public_metrics,referenced_tweets",
+		"media.fields": options.mediaFields?.length
+			? options.mediaFields.join(",")
+			: MEDIA_FIELDS,
+		"user.fields": options.userFields?.length
+			? options.userFields.join(",")
+			: undefined,
+		since_id: options.sinceId || undefined,
+		until_id: options.untilId || undefined,
+		exclude: (options.excludeRetweets ?? true) ? "retweets" : undefined,
+		pagination_token: options.paginationToken || undefined,
 	});
-
-	return runJsonCommandEffect([`/2/tweets/${id}?${query.toString()}`], {
-		timeoutMs,
-	}).pipe(
+	const command =
+		options.auth === "oauth2"
+			? runOAuth2JsonCommandEffect({
+					args,
+					username: options.username,
+					options: { signal, onAttempt },
+					useConfiguredCandidate: options.useConfiguredCandidate,
+				})
+			: runJsonCommandEffect(args, { signal, onAttempt });
+	return command.pipe(
 		Effect.map((payload) => {
-			const data =
-				payload.data &&
-				typeof payload.data === "object" &&
-				!Array.isArray(payload.data)
-					? [payload.data as XurlTweetsResponse["data"][number]]
-					: Array.isArray(payload.data)
-						? (payload.data as XurlTweetsResponse["data"])
-						: [];
-
+			const { data, meta, includes } = responsePage<XurlUserTweet>(payload);
 			return {
-				data,
-				includes:
-					payload.includes && typeof payload.includes === "object"
-						? (payload.includes as XurlTweetsResponse["includes"])
-						: undefined,
-				meta:
-					payload.meta && typeof payload.meta === "object"
-						? (payload.meta as XurlTweetsResponse["meta"])
-						: undefined,
+				items: data,
+				nextToken: nextToken(meta),
+				...(includes ? { includes } : {}),
 			};
 		}),
 	);
-}
+});
 
-export function getTweetById(
-	id: string,
-	options: { timeoutMs?: number } = {},
-): Promise<XurlTweetsResponse> {
-	return runEffectPromise(getTweetByIdEffect(id, options));
-}
+export const lookupTweetsByIdsEffect = Effect.fn("xurl.lookupTweetsByIds")(
+	(ids: string[]): Effect.Effect<XurlTweetsResponse, XurlCommandError> =>
+		ids.length === 0
+			? Effect.succeed({ data: [] })
+			: runJsonCommandEffect(
+					queryArgs("/2/tweets", tweetQuery({ ids: ids.join(",") })),
+				).pipe(Effect.map(toXurlTweetsResponse)),
+);
+
+export const searchRecentByConversationIdEffect = Effect.fn(
+	"xurl.searchRecentByConversationId",
+)((
+	conversationId: string,
+	options: PageOptions & JsonCommandOptions & { auth?: "oauth2" },
+): Effect.Effect<XurlTweetsResponse, Error> => {
+	const { timeoutMs, signal, onAttempt } = options;
+	const args = queryArgs("/2/tweets/search/recent", {
+		...tweetQuery(
+			{
+				query: `conversation_id:${conversationId}`,
+				max_results: options.maxResults,
+			},
+			THREAD_TWEET_FIELDS,
+		),
+		pagination_token: options.paginationToken || undefined,
+	});
+	const command =
+		options.auth === "oauth2"
+			? runOAuth2JsonCommandEffect({
+					args,
+					username: options.username,
+					options: { timeoutMs, signal, onAttempt },
+					useConfiguredCandidate: false,
+				})
+			: runJsonCommandEffect(args, { timeoutMs, signal, onAttempt });
+	return command.pipe(Effect.map(toXurlTweetsResponse));
+});
+
+export const searchRecentTweetsEffect = Effect.fn("xurl.searchRecentTweets")(
+	(
+		searchQuery: string,
+		options: PageOptions & {
+			startTime?: string;
+			endTime?: string;
+			timeoutMs?: number;
+		},
+	): Effect.Effect<XurlTweetsResponse, Error> =>
+		runOAuth2JsonCommandEffect({
+			args: queryArgs("/2/tweets/search/recent", {
+				...tweetQuery(
+					{ query: searchQuery, max_results: options.maxResults },
+					THREAD_TWEET_FIELDS,
+				),
+				pagination_token: options.paginationToken || undefined,
+				start_time: options.startTime || undefined,
+				end_time: options.endTime || undefined,
+			}),
+			username: options.username,
+			options: { timeoutMs: options.timeoutMs },
+			useConfiguredCandidate: false,
+		}).pipe(Effect.map(toXurlTweetsResponse)),
+);
+
+export const getTweetByIdEffect = Effect.fn("xurl.getTweetById")(
+	(
+		id: string,
+		{ timeoutMs }: { timeoutMs?: number } = {},
+	): Effect.Effect<XurlTweetsResponse, XurlCommandError> =>
+		runJsonCommandEffect(
+			queryArgs(`/2/tweets/${id}`, tweetQuery({}, THREAD_TWEET_FIELDS)),
+			{ timeoutMs },
+		).pipe(
+			Effect.map((payload) =>
+				toXurlTweetsResponse({
+					...payload,
+					data:
+						payload.data &&
+						typeof payload.data === "object" &&
+						!Array.isArray(payload.data)
+							? [payload.data]
+							: payload.data,
+				}),
+			),
+		),
+);
 
 export function postViaXurlEffect(text: string) {
 	return runShortcutEffect(["post", text]);
 }
 
-export function postViaXurl(text: string) {
-	return runEffectPromise(postViaXurlEffect(text));
-}
-
 export function replyViaXurlEffect(tweetId: string, text: string) {
 	return runShortcutEffect(["reply", tweetId, text]);
-}
-
-export function replyViaXurl(tweetId: string, text: string) {
-	return runEffectPromise(replyViaXurlEffect(tweetId, text));
 }
 
 export function dmViaXurlEffect(handle: string, text: string) {
@@ -1433,70 +1272,58 @@ export function dmViaXurlEffect(handle: string, text: string) {
 	]);
 }
 
-export function dmViaXurl(handle: string, text: string) {
-	return runEffectPromise(dmViaXurlEffect(handle, text));
-}
-
 export function blockUserViaXurlEffect(
 	sourceUserId: string,
 	targetUserId: string,
 ) {
-	return runMutationCommandEffect([
-		"-X",
-		"POST",
-		`/2/users/${sourceUserId}/blocking`,
-		"-d",
-		JSON.stringify({ target_user_id: targetUserId }),
-	]);
-}
-
-export function blockUserViaXurl(sourceUserId: string, targetUserId: string) {
-	return runEffectPromise(blockUserViaXurlEffect(sourceUserId, targetUserId));
+	return runMutationCommandEffect(
+		[
+			"-X",
+			"POST",
+			`/2/users/${sourceUserId}/blocking`,
+			"-d",
+			JSON.stringify({ target_user_id: targetUserId }),
+		],
+		"blocking",
+		true,
+	);
 }
 
 export function unblockUserViaXurlEffect(
 	sourceUserId: string,
 	targetUserId: string,
 ) {
-	return runMutationCommandEffect([
-		"-X",
-		"DELETE",
-		`/2/users/${sourceUserId}/blocking/${targetUserId}`,
-	]);
-}
-
-export function unblockUserViaXurl(sourceUserId: string, targetUserId: string) {
-	return runEffectPromise(unblockUserViaXurlEffect(sourceUserId, targetUserId));
+	return runMutationCommandEffect(
+		["-X", "DELETE", `/2/users/${sourceUserId}/blocking/${targetUserId}`],
+		"blocking",
+		false,
+	);
 }
 
 export function muteUserViaXurlEffect(
 	sourceUserId: string,
 	targetUserId: string,
 ) {
-	return runMutationCommandEffect([
-		"-X",
-		"POST",
-		`/2/users/${sourceUserId}/muting`,
-		"-d",
-		JSON.stringify({ target_user_id: targetUserId }),
-	]);
-}
-
-export function muteUserViaXurl(sourceUserId: string, targetUserId: string) {
-	return runEffectPromise(muteUserViaXurlEffect(sourceUserId, targetUserId));
+	return runMutationCommandEffect(
+		[
+			"-X",
+			"POST",
+			`/2/users/${sourceUserId}/muting`,
+			"-d",
+			JSON.stringify({ target_user_id: targetUserId }),
+		],
+		"muting",
+		true,
+	);
 }
 
 export function unmuteUserViaXurlEffect(
 	sourceUserId: string,
 	targetUserId: string,
 ) {
-	return runMutationCommandEffect([
-		"-X",
-		"DELETE",
-		`/2/users/${sourceUserId}/muting/${targetUserId}`,
-	]);
-}
-
-export function unmuteUserViaXurl(sourceUserId: string, targetUserId: string) {
-	return runEffectPromise(unmuteUserViaXurlEffect(sourceUserId, targetUserId));
+	return runMutationCommandEffect(
+		["-X", "DELETE", `/2/users/${sourceUserId}/muting/${targetUserId}`],
+		"muting",
+		false,
+	);
 }

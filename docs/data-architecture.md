@@ -1,5 +1,23 @@
 # Data And Architecture
 
+## Short-link expansion
+
+`birdclaw links backfill` indexes shared URLs and resolves missing or failed destinations. It requests HTTP redirects from `t.co` while preserving public-address validation at every hop. A destination still on `t.co` is unresolved even when the response is HTTP 200.
+
+Run ordinary `birdclaw links backfill` to repair older unresolved `t.co` rows incorrectly marked as hits; it also bypasses their stale success-cache entries. Valid entity-provided and resolved destinations stay cached. Use `--refresh-url-cache` only when intentionally refreshing all selected links.
+
+## Search storage
+
+Search persistence lives in `search-index.ts`. The derived `search_rows` table maps each canonical tweet or DM ID to an indexed integer FTS row ID. Its `INTEGER PRIMARY KEY` survives `VACUUM` and changes to canonical tables' implicit rowids. Inserts, updates, retention cleanup, and preview removal use indexed lookups instead of scanning the archive for unindexed string IDs. Small updates skip unchanged text; batches of at least 4,096 IDs replace the selected documents without probing each old FTS body. Processing retains at most 4,096 document rows at a time and finishes their reads before deleting and inserting index entries. JSON-bound bulk insertion preserves ascending FTS row order.
+
+Live sync, replies, archive imports, and backup merges share this writer. Each caller finishes its canonical merge before refreshing the touched search entries within the same transaction. Primary tweet payloads, richer Note Tweet content, deletion state, and repeated DM IDs therefore determine the final indexed text. Failed indexing rolls back the canonical batch. Full backup replacement clears the derived mapping; portable backups continue to store canonical records only.
+
+Schema 13 rebuilds search rows once from active canonical content, repairing legacy duplicate, orphan, deleted, and superseded entries. The FTS column names, query syntax, and snippets remain unchanged. Stop older writers before writable startup applies the migration; all subsequent writers must maintain the derived mapping. Read-only deployments require an upgraded snapshot.
+
+Schema 14 adds a singleton `network_map_revision` table and SQLite triggers for map inputs. Changes to profile identity, names, follower counts, locations, current graph membership, or consumed geocode fields advance the index revision. Avatar, following-count, and verification updates advance a separate display revision. Identical map fields and unrelated tweet, DM, profile-history, and sync timestamp writes leave these revisions unchanged. Inserts and deletes conservatively advance the index revision, including SQLite REPLACE operations. The counters commit or roll back with canonical data and are not part of portable backups.
+
+Read-only map validation and hydration remain inside the owning reader's transaction. Index changes rebuild the map; display changes clear only the bounded profile cache. Local writes through an explicitly supplied writable connection remain conservatively tracked through `total_changes()` to prevent reuse of uncommitted, rolled-back versions. Suppressed geocodes also impose an expiry boundary. Upgrade through writable initialization before serving a schema-14 snapshot read-only; WAL and durability settings are unchanged.
+
 ## Effect Runtime Boundary
 
 Birdclaw's core I/O code should be written as Effect programs. Use `Effect.gen` for multi-step workflows, typed failures for expected errors, and `Effect.forEach` / `Effect.sleep` for concurrency, retry, timeout, and pacing logic.
@@ -9,6 +27,12 @@ Keep framework edges boring:
 - CLI command handlers may `await` Promise wrappers.
 - React components may call Promise wrappers from effects and event handlers.
 - route handlers may return normal `Response` values.
+
+The browser API adapter in `src/lib/api-client.ts` uses native Promises and
+`AbortSignal`, with schema validation and `ApiFetchError` at the HTTP boundary.
+React Query owns request cancellation, caching, and retries. Keeping this UI
+adapter independent of Effect avoids downloading the server workflow runtime
+for ordinary page reads; server and CLI core I/O retain their Effect programs.
 
 Inside `src/lib`, prefer exporting both forms when useful:
 
@@ -31,24 +55,24 @@ Use `runEffectPromise` from `src/lib/effect-runtime.ts` for Promise wrappers so 
 Current migrated surfaces:
 
 - typed Effect-to-Promise boundary handling in `src/lib/effect-runtime.ts`
-- web API client parsing and sync-job polling in `src/lib/api-client.ts`
 - `bird` command availability and execution in `src/lib/bird-command.ts`
 - `bird` JSON transport, large stdout capture, and temp-file cleanup in `src/lib/bird.ts`
 - `xurl` command execution, JSON parsing, retry delay, mutation helpers, and public adapter wrappers in `src/lib/xurl.ts`
 - backup export/import/validation, Git repo setup, pull, commit/push, stale auto-update, and auto-sync orchestration in `src/lib/backup.ts`
 - moderation action transport fallback and bird action/profile adapter helpers in `src/lib/actions-transport.ts` and `src/lib/bird-actions.ts`
-- moderation target resolution plus local blocks/mutes write helpers, remote block sync, and x-web block/unblock mutations in `src/lib/moderation-target.ts`, `src/lib/moderation-write.ts`, `src/lib/blocks-write.ts`, `src/lib/blocks.ts`, `src/lib/mutes-write.ts`, and `src/lib/x-web.ts`
+- moderation target resolution, shared local moderation state, thin block/mute wrappers, and remote block sync in `src/lib/moderation-target.ts`, `src/lib/moderation-state.ts`, `src/lib/blocks.ts`, and `src/lib/mutes.ts`
+- canonical profile database-row, prefixed-join, JSON-object, and handle codecs in `src/lib/profile-row.ts` and `src/lib/json-codec.ts`
 - batch blocklist file import in `src/lib/blocklist.ts`
 - authored, mentions, mention-thread sync including xurl recent-search and parent-walk fallback internals, conversation surface, home timeline, saved collection, DM live sync, profile hydration/resolution/affiliation, profile-reply inspection, shared tweet lookup, research and whois report generation, inbox scoring, and follow graph live sync cache/fetch/merge flows in `src/lib/authored-live.ts`, `src/lib/mentions-live.ts`, `src/lib/mention-threads-live.ts`, `src/lib/conversation-surface.ts`, `src/lib/timeline-live.ts`, `src/lib/timeline-collections-live.ts`, `src/lib/dms-live.ts`, `src/lib/profile-hydration.ts`, `src/lib/profile-affiliation-hydration.ts`, `src/lib/profile-resolver.ts`, `src/lib/profile-replies.ts`, `src/lib/tweet-lookup.ts`, `src/lib/research.ts`, `src/lib/whois.ts`, `src/lib/inbox.ts`, and `src/lib/follow-graph.ts`
 - link preview metadata fetches and link-index backfill concurrency in `src/lib/link-preview-metadata.ts` and `src/lib/link-index.ts`
 - `media fetch` archive reuse, HTTP download groups, pacing, and bounded concurrency in `src/lib/media-fetch.ts`
-- archive discovery and archive-import subprocess boundaries in `src/lib/archive-finder.ts` and `src/lib/archive-import.ts`
+- archive discovery plus separated archive reader, slice parser, profile/DM reconciliation, media extraction, and transactional apply boundaries in `src/lib/archive-finder.ts`, `src/lib/archive-import.ts`, and `src/lib/archive/`
 - avatar read-through caching and URL expansion cache/fetch flows in `src/lib/avatar-cache.ts` and `src/lib/url-expansion.ts`
 - OpenAI inbox scoring fetch/parse boundary in `src/lib/openai.ts`
 - scheduled bookmark sync audit logging, overlap locking, backup pass, and launchd install in `src/lib/bookmark-sync-job.ts`
 - web sync orchestration, plan runners, backup pass, and job polling in `src/lib/web-sync.ts`
 
-Production `src/lib` code should stay free of ad hoc `async`/`await` orchestration. Next migrations should target remaining CLI, React, and route edges only where an Effect boundary would simplify error handling, cancellation, retries, or concurrency; otherwise keep those framework adapters as small Promise wrappers over core Effect programs.
+Core production `src/lib` code should stay free of ad hoc `async`/`await` orchestration. The browser API adapter is a framework boundary, including its paced HTTP sync-job polling. Next migrations should target remaining CLI, React, and route edges only where an Effect boundary would simplify error handling, cancellation, retries, or concurrency; otherwise keep those framework adapters small.
 
 ## Transport Strategy
 
@@ -56,11 +80,6 @@ Support these adapters:
 
 - `xurl`
 - `bird`
-- official API
-
-Optional later:
-
-- lower-level `xweb`
 
 ### Recommendation
 
@@ -69,15 +88,12 @@ v1 transport priority:
 1. `archive`
 2. `xurl`
 3. `bird`
-4. official direct API
-5. optional lower-level `xweb`
 
 Reason:
 
 - working `xurl` already exists
 - users with `xurl` setup get zero-friction sync
 - `bird` can cover GraphQL/cookie-backed gaps if needed
-- official API adapter keeps long-term independence
 
 ### `xurl` compatibility
 
@@ -114,7 +130,7 @@ Treat `bird` the same way:
 import type { Effect } from "effect";
 
 type TransportTask<A, E = TransportError> = Effect.Effect<A, E>;
-type TransportKind = "archive" | "xurl" | "bird" | "official" | "xweb";
+type TransportKind = "archive" | "xurl" | "bird";
 
 interface BirdTransport {
 	kind: TransportKind;
@@ -125,6 +141,8 @@ interface BirdTransport {
 	listMentions(input: CursorInput): TransportTask<Page<TweetRecord>>;
 	listFollowers(input: CursorInput): TransportTask<Page<ProfileRecord>>;
 	listFollowing(input: CursorInput): TransportTask<Page<ProfileRecord>>;
+	listOwnedLists(input: CursorInput): TransportTask<Page<ListRecord>>;
+	listMembers(input: ListMembersInput): TransportTask<Page<ProfileRecord>>;
 	listUserTweets(input: UserTimelineInput): TransportTask<Page<TweetRecord>>;
 	listDmEvents(input: DmEventsInput): TransportTask<Page<DmEventRecord>>;
 	getTweet(id: string): TransportTask<TweetRecord | null>;
@@ -141,7 +159,7 @@ interface BirdTransport {
 
 Per account:
 
-- preferred transport: `auto | xurl | bird | official | xweb`
+- preferred transport: `auto | xurl | bird`
 - fallback chain
 - capability cache
 - auth status snapshot
@@ -150,12 +168,11 @@ Per account:
 
 - use `xurl` if available and healthy
 - else use `bird` if available and healthy
-- else use official auth if configured
 - else archive-only mode
 
 ## Data Model
 
-SQLite only. Kysely schema in code, migrations checked into repo.
+Native SQLite only. Transactional, append-only migrations define the schema; focused row codecs map repeated query records.
 
 ### Core tables
 
@@ -189,10 +206,14 @@ SQLite only. Kysely schema in code, migrations checked into repo.
 - `tweets`
   - canonical tweet rows
   - text, metrics, timestamps, references, author id
-  - raw JSON payload column
-- `tweet_media`
-- `tweet_urls`
-- `tweet_mentions`
+  - explicit deletion timestamp, source, and reason; absence from a later snapshot never sets them
+  - supersession timestamp and terminal revision ID keep older edit bodies lossless but inactive
+- `tweet_revisions`
+  - ordered revision identities from observable X edit history
+  - retains raw revision payloads only when the body was actually observed
+  - an explicit deletion on any revision tombstones every retained body in the chain
+- `tweet_subordinate_tombstones`
+  - media and quote-relation tombstones derived from explicitly deleted parent tweets
 - `follow_edges`
   - current complete directional graph for `followers` and `following`
 - `follow_snapshots`
@@ -242,6 +263,8 @@ No vector search required for MVP.
 
 ### Indexing
 
+Schema 12 extends the chronological tweet index to `(created_at desc, id desc)` so bounded candidate selection can read timestamp ties directly in page order. A partial covering index on `follow_edges(account_id, profile_id, direction) where current = 1` supplies map membership without a table lookup or grouping sort. The existing direction/last-seen index remains available for graph history queries. Writable startup applies the migration transactionally; read-only deployments require an upgraded snapshot. WAL, foreign-key enforcement, and durability settings are unchanged.
+
 Indexes from day 1:
 
 - tweet id unique
@@ -288,6 +311,11 @@ Principles:
   - append-only `started` / `ended`
   - references snapshot/run when available
   - idempotent per account
+- `x_lists`
+  - durable owned-List metadata, source, freshness, bounded-sync parameters, and `complete | inferred | partial | error` membership state
+- `x_list_members`
+  - primary key: `(account_id, list_id, profile_id)`
+  - current/ended membership edges; only cursor-proven complete syncs end unseen members
 
 ### Cache and cost guardrails
 
@@ -334,6 +362,7 @@ Principles:
 - direct messages
 - followers
 - following
+- owned Lists and List membership
 
 ### Import pipeline
 
@@ -348,10 +377,14 @@ Principles:
 
 - idempotent reruns
 - preserve richer existing data
-- raw source retained optionally
-- full import refreshes all supported archive slices together
-- selected import refreshes only requested slices and preserves unselected local data
-- selected import validates `acct_primary` identity before writing
+- merge destination-only rows by default; a record missing from a later archive is not a deletion
+- only explicit deleted-tweet records create source-attributed tombstones
+- hide tombstoned tweets and their subordinate media/quote relations from active indexes while retaining lossless archive state
+- retain observable edit-history identities and payloads without inventing unobserved revision bodies; superseded revisions are not active content
+- full import merges all supported archive slices together
+- selected import merges only requested slices and preserves unselected local data
+- explicit `--restore` replaces imported slices exactly
+- merge imports and selected restores validate `acct_primary` identity before writing; only a full restore may replace it
 - selected collection imports preserve live collection rows and local tweet ownership
 - selected DM imports are scoped to `acct_primary` and preserve other accounts
 
@@ -380,7 +413,6 @@ Streams:
 Future:
 
 - notifications
-- list timelines
 - graph analytics
 
 ### Sync behavior
@@ -448,9 +480,8 @@ Candidate ranking inputs:
 
 `birdclaw serve`
 
-- starts local server
-- starts background sync automatically by default
-- opens browser unless `--no-open`
+- starts the built local production server
+- serves SSR routes and compiled static assets
 - exposes sync health and recent job state in the UI
 
 ## Profiles / Accounts
@@ -478,71 +509,48 @@ Options by transport:
 - `bird`
   - birdclaw shells out to `bird` or wraps a narrow stable surface
   - useful for GraphQL/cookie-backed capabilities
-- `official`
-  - birdclaw stores tokens securely
-  - keychain if available, encrypted local store otherwise
-- `xweb`
-  - explicit low-level escape hatch if needed later
 
 ## Package Layout
 
+Birdclaw is one package with shared core modules, not a multi-package workspace:
+
 ```text
 birdclaw/
-  apps/
-    web/
-  packages/
-    archive/
-    cli/
-    core/
-    db/
-    server/
-    transport-bird/
-    transport-official/
-    transport-xurl/
-    transport-xweb/
-    ui/
-  docs/
-    spec.md
-    cli.md
-    data-architecture.md
+  bin/birdclaw.mjs       # installed CLI launcher
+  src/
+    cli.ts              # CLI entry and command context
+    cli/                # command registration by domain
+    components/         # React views and controllers
+    routes/             # TanStack pages and HTTP API handlers
+    lib/                # storage, query models, transports, sync, and analysis
+      archive/          # archive readers, slices, reconciliation, and apply
+    test/               # shared fixtures and test helpers
+  scripts/              # builds, toolchain verification, package and perf proof
+  playwright/           # production-server browser tests
+  docs/                 # user guides and architecture
 ```
 
-### Package responsibilities
+SQLite connection ownership lives in `src/lib/db.ts`; ordered schema definitions live in `src/lib/database-schema.ts`, and `src/lib/database-migrations.ts` applies them transactionally. `src/lib/backup-filesystem.ts` owns backup path safety and durable filesystem operations; `src/lib/backup.ts` coordinates export, import, recovery, and Git synchronization.
 
-- `core`
-  - domain types
-  - sync contracts
-  - ranking contracts
-- `archive`
-  - archive parsers and normalizers
-- `db`
-  - Kysely schema
-  - migrations
-  - repositories
-  - FTS helpers
-  - DM influence and replied/unreplied query helpers
-- `transport-xurl`
-  - `xurl` detection
-  - subprocess exec wrappers
-  - output parsing
-- `transport-bird`
-  - `bird` detection
-  - subprocess exec wrappers
-  - GraphQL-focused reads/actions
-- `transport-official`
-  - direct Twitter API client
-- `transport-xweb`
-  - optional cookie/graphql mode
-- `server`
-  - local app API
-  - background sync orchestration
-- `cli`
-  - command surface
-- `ui`
-  - React components, inbox, thread, DM views
-  - compact sender bio / influence surfaces for DM context
-- `apps/web`
-  - TanStack Start app shell
+Automatic backup updates and synchronization share configuration and state bookkeeping. Only the update path skips fresh checks; synchronization still exports local changes during that freshness window. Their repository operations, locking, and recovery policies remain separate. Profile URL entities use one parser in `profile-row.ts` for identity indexing, bio extraction, and `whois`, retaining each caller's choice of profile-URL or description entities.
+
+Portable backup tables declare their columns and merge policies once in `backup-table-codecs.ts`; export projections, insert bindings, and conflict assignments are derived from that declaration. Complex retention and revision rules stay explicit SQL expressions. API-facing domain types are inferred from the existing Zod output schemas in `api-contracts.ts`, with type-only imports keeping validation and server workflows out of consumers that need only types.
+
+`analysis-report.ts` owns the report lifecycle: model request construction, stream or complete-response delivery, cache serialization and validation, and completion events. Individual analyses supply their context, prompts, result schemas, and versioned cache identity. Digest input refresh, cited-tweet enrichment, and the latest-report cache remain digest policies; profile analysis retains its completed-response delivery. The report layer persists successful results before publishing completion, and failed requests never create cached reports. Browser event schemas share the report envelope while validating each context and its supported event variants separately.
+
+```mermaid
+flowchart LR
+  D[Digest / discussion / profile inputs] --> R[Shared report lifecycle]
+  R --> T[OpenAI request and stream runtime]
+  T --> R
+  R --> C[Validated report cache]
+  R --> E[Report events]
+  E --> B[Browser envelope and context validation]
+```
+
+CLI input parsers throw to the existing command error boundary instead of printing an error and returning a failure sentinel.
+
+Transport adapters shell out to `bird` and `xurl`; they do not own those tools' credentials or configuration. CLI and HTTP handlers share the canonical repositories and query models in `src/lib/`. The browser API boundary remains independent of the server's Effect workflows.
 
 ## Testing Plan
 
@@ -579,3 +587,45 @@ Primary:
 Secondary later:
 
 - standalone desktop wrapper if the web UX becomes primary
+
+## Read-only status bootstrap
+
+Single-account read-only deployments may include the status envelope in the
+initial HTML after the same authorization checks as `/api/status`. The browser
+seeds its status query from that envelope, so it can request account-scoped data
+without another status round trip. Multiple-account and writable deployments
+retain the existing client flow; server rendering cannot infer browser-local
+account selection. Bootstrap failures fall back to the normal client request.
+No archive discovery, live reads, or backup updates run in the bootstrap.
+Server query clients remain request-local and do not retain timed GC entries.
+
+### Read-only query response reuse
+
+After authorization and filter parsing, `/api/query` may reuse validated serialized JSON in read-only deployments. Entries are scoped to the reader connection and normalized resource/filter arguments, including account selection. Each lookup checks SQLite `data_version`; changed databases drop their prior entries. A second check avoids retaining a response across an external commit. The cache retains at most 100 entries and 4 MiB of encoded keys/values per reader, skips responses over 512 KiB and keys over 4 KiB, and evicts least-recently-used entries.
+
+Writable deployments bypass this cache. Exceptions are not retained, and response bodies remain independent. This is process-local reuse of deterministic reads, not an HTTP cache: authentication and HTTP cache policy remain unchanged.
+
+Links also has a bounded cache per read-only reader. Indexed probes find the last occurrence before each time bound. Results may be reused while those positions and the database version remain unchanged, even as a rolling window's displayed timestamps advance. The probes and result run within one read transaction on the cache's owning connection. Boundary crossings, external commits, account/filter changes, and pool replacement cause recomputation; returned objects are independent. Each reader retains at most 100 entries / 4 MiB, with the existing 512 KiB entry limit.
+
+Ordinary timeline reads materialize their limited membership before hydrating reply/quote profiles and collection metadata. Ordinary timeline selection retains account/author joins before the limit so malformed orphan rows cannot shorten a page. Saved-post reads keep their collection query plan. Search retains its existing bounded selection and join order, and recent-window fallback, account preference, filters, and keyset ordering remain unchanged.
+
+Recent-window candidate order includes tweet IDs so timestamp ties match the final page order. Account-scoped and literal-account callers retain their existing membership rules.
+
+## DM read views
+
+`GET /api/query?resource=dms` retains the combined list and selected-thread
+response used by existing clients. The web workspace bootstraps with the combined response, then requests `view=list` for
+conversation metadata and `view=conversation&conversationId=...&account=...`
+for a selected thread. The latter returns an empty `items` array and the
+account-scoped `selectedConversation`, or null when it is unavailable. List
+filters apply to the list; the thread view selects by conversation ID and account.
+
+The initial combined response seeds the thread cache without a second request.
+The browser caches thread responses by account and conversation separately from
+list filters. Sync and successful writes invalidate both caches. The browser requests the newest 100 messages (`messageLimit=100`) and loads older
+pages on demand through the returned `selectedConversation.nextCursor`. A cursor
+is passed as `before` with `view=conversation`, its exact `conversationId`, and
+`messageLimit`; malformed or cross-conversation cursors are rejected. Message
+pages are capped at 200 and use creation time plus message ID to handle ties.
+Calls without `messageLimit`, including existing combined/API and CLI full-thread
+reads, retain complete history. All messages remain accessible through pagination.

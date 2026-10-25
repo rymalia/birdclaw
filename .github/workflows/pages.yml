@@ -8,6 +8,9 @@ on:
       - "docs/**"
       - "scripts/build-docs-site.mjs"
       - "scripts/docs-site-assets.mjs"
+      - "scripts/bun-canary.sh"
+      - "scripts/install-bun-canary.sh"
+      - "toolchains/bun-canary.conf"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
 
@@ -22,29 +25,31 @@ concurrency:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  DO_NOT_TRACK: "1"
 
 jobs:
   deploy:
     name: Deploy docs
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Check out
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@ac6db6d3c1f721f886538a378a2d73e85697340a # v6
-
-      - name: Setup Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+      - name: Cache exact Bun canary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          node-version-file: .node-version
+          path: .toolchains/bun
+          key: bun-canary-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchains/bun-canary.conf') }}
+
+      - name: Install exact Bun canary
+        run: ./scripts/install-bun-canary.sh
 
       - name: Build docs site
-        run: node scripts/build-docs-site.mjs
+        run: ./scripts/bun-canary.sh scripts/build-docs-site.mjs
 
       - name: Configure Pages
         uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
@@ -56,4 +61,4 @@ jobs:
 
       - name: Deploy
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

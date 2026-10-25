@@ -2,13 +2,36 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
 import { getLinkInsights } from "./link-insights";
+import Database from "./sqlite";
 
 let homeDir = "";
 type TestDb = ReturnType<typeof getNativeDb>;
+
+function localDate(dayOffset = 0, hour = 12, minute = 0) {
+	return new Date(2026, 4, 11 + dayOffset, hour, minute, 0, 0);
+}
+
+function localIso(dayOffset = 0, hour = 12, minute = 0) {
+	return localDate(dayOffset, hour, minute).toISOString();
+}
+
+function withTimezone<T>(timezone: string, run: () => T) {
+	const previous = process.env.TZ;
+	process.env.TZ = timezone;
+	try {
+		return run();
+	} finally {
+		if (previous === undefined) {
+			delete process.env.TZ;
+		} else {
+			process.env.TZ = previous;
+		}
+	}
+}
 
 function insertAccountFixture() {
 	const db = getNativeDb({ seedDemoData: false });
@@ -71,26 +94,22 @@ function insertTweet(
 ) {
 	db.prepare(`
     insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at, is_replied,
-      reply_to_id, like_count, media_count, bookmarked, liked,
+      id, author_profile_id, text, created_at, is_replied,
+      reply_to_id, like_count, media_count,
       entities_json, media_json, quoted_tweet_id
-    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-		options.id,
+    ) values (?, ?, ?, ?, 0, null, 1, 0, '{}', '[]', null)
+  `).run(options.id, options.authorProfileId, options.text, options.createdAt);
+	db.prepare(`
+		insert into tweet_account_edges (
+			account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+			source, raw_json, updated_at
+		) values (?, ?, 'home', ?, ?, 1, 'test', '{}', ?)
+	`).run(
 		options.accountId ?? "acct_primary",
-		options.authorProfileId,
-		"home",
-		options.text,
+		options.id,
 		options.createdAt,
-		0,
-		null,
-		1,
-		0,
-		0,
-		0,
-		"{}",
-		"[]",
-		null,
+		options.createdAt,
+		options.createdAt,
 	);
 }
 
@@ -210,10 +229,232 @@ describe("link insights", () => {
 	});
 
 	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		resetDatabaseForTests();
 		resetBirdclawPathsForTests();
 		delete process.env.BIRDCLAW_HOME;
 		rmSync(homeDir, { recursive: true, force: true });
+	});
+
+	it("keeps every video host form while rejecting URLs that only contain a host hint", () => {
+		const db = insertAccountFixture();
+		const suffixes = [
+			"youtube.com",
+			"youtube-nocookie.com",
+			"youtubeeducation.com",
+			"youtubekids.com",
+			"vimeo.com",
+			"twitch.tv",
+			"tiktok.com",
+			"loom.com",
+		];
+		const exact = ["youtu.be", "clips.twitch.tv", "vm.tiktok.com"];
+		const accepted = [
+			...suffixes,
+			...suffixes.map((host) => `player.${host}`),
+			...exact,
+		].flatMap((host) => [`http://${host}`, `HTTPS://${host.toUpperCase()}`]);
+		const rejected = [
+			"https://example.com/youtu",
+			"https://notyoutube.com",
+			"https://youtube.com.example.com",
+			"https://player.youtu.be",
+			"https://example.com/vime/twit/tikt/loom",
+		];
+		for (const [index, base] of [...accepted, ...rejected].entries()) {
+			const id = `host_${index}`;
+			const shortUrl = `https://t.co/host${index}`;
+			const createdAt = "2026-05-10T10:00:00.000Z";
+			insertTweet(db, {
+				id,
+				authorProfileId: "profile_a",
+				text: shortUrl,
+				createdAt,
+			});
+			insertExpansion(db, { shortUrl, finalUrl: `${base}/watch/${index}` });
+			insertOccurrence(db, {
+				sourceKind: "tweet",
+				sourceId: id,
+				shortUrl,
+				createdAt,
+			});
+		}
+		const result = getLinkInsights({
+			kind: "videos",
+			range: "all",
+			limit: 100,
+		});
+		expect(result.stats).toEqual({
+			occurrences: accepted.length,
+			groups: accepted.length,
+		});
+		expect(result.items.map((item) => item.url).sort()).toEqual(
+			accepted
+				.map((base, index) => `${base.toLowerCase()}/watch/${index}`)
+				.sort(),
+		);
+	});
+
+	it("keeps boundary probes and cached results on one snapshot across a concurrent commit", () => {
+		insertAccountFixture();
+		const writer = getNativeDb();
+		insertTweet(writer, {
+			id: "concurrent",
+			authorProfileId: "profile_a",
+			text: "fixture",
+			createdAt: "2026-05-10T12:00:00Z",
+		});
+		insertExpansion(writer, {
+			shortUrl: "https://t.co/concurrent",
+			finalUrl: "https://example.com/concurrent",
+			title: "before",
+		});
+		insertOccurrence(writer, {
+			sourceKind: "tweet",
+			sourceId: "concurrent",
+			shortUrl: "https://t.co/concurrent",
+			createdAt: "2026-05-10T12:00:00Z",
+		});
+		vi.stubEnv("BIRDCLAW_DEPLOYMENT_READ_ONLY", "1");
+		const originalPrepare = Database.prototype.prepare;
+		let committed = false;
+		vi.spyOn(Database.prototype, "prepare").mockImplementation(function (
+			this: Database,
+			sql,
+		) {
+			if (!committed && sql.includes("o.rowid as occurrence_rowid")) {
+				committed = true;
+				writer.exec(
+					"update url_expansions set title='after' where short_url='https://t.co/concurrent'",
+				);
+			}
+			return originalPrepare.call(this, sql);
+		});
+		const read = () =>
+			getLinkInsights({ range: "week", now: new Date("2026-05-11T12:00:00Z") });
+		expect(read().items[0]?.title).toBe("before");
+		expect(read().items[0]?.title).toBe("after");
+		expect(read().items[0]?.title).toBe("after");
+	});
+
+	it("reuses rolling reads only while the occurrence set is unchanged and observes external commits", () => {
+		insertAccountFixture();
+		const writer = getNativeDb();
+		for (const [id, createdAt] of [
+			["lower", "2026-05-04T12:00:10.000Z"],
+			["middle", "2026-05-10T12:00:00.000Z"],
+			["upper", "2026-05-11T12:00:10.000Z"],
+		]) {
+			insertTweet(writer, {
+				id,
+				authorProfileId: "profile_a",
+				text: id,
+				createdAt,
+			});
+			insertExpansion(writer, {
+				shortUrl: `https://t.co/${id}`,
+				finalUrl: `https://example.com/${id}`,
+				title: id,
+			});
+			insertOccurrence(writer, {
+				sourceKind: "tweet",
+				sourceId: id,
+				shortUrl: `https://t.co/${id}`,
+				createdAt,
+			});
+		}
+		vi.stubEnv("BIRDCLAW_DEPLOYMENT_READ_ONLY", "1");
+		const prepare = vi.spyOn(Database.prototype, "prepare");
+		const now = Date.parse("2026-05-11T12:00:00.000Z");
+		const read = (offset: number) =>
+			getLinkInsights({
+				account: "acct_primary",
+				range: "week",
+				sort: "recent",
+				now: new Date(now + offset),
+			});
+		const first = read(0);
+		read(0); // Both pooled reader connections own their snapshots.
+		prepare.mockClear();
+		const warm = read(5000);
+		expect(warm.items).toEqual(first.items);
+		expect(warm.until).not.toBe(first.until);
+		expect(warm.since).not.toBe(first.since);
+		expect(
+			prepare.mock.calls.some(([sql]) =>
+				sql.includes("o.rowid as occurrence_rowid"),
+			),
+		).toBe(false);
+		warm.items[0]!.title = "caller mutation";
+		expect(read(5000).items[0]?.title).toBe("middle");
+		expect(read(10000).items.map((item) => item.title)).toEqual([
+			"middle",
+			"lower",
+		]);
+		expect(read(10001).items.map((item) => item.title)).toEqual([
+			"upper",
+			"middle",
+		]);
+		writer
+			.prepare("update url_expansions set title='updated' where short_url=?")
+			.run("https://t.co/upper");
+		expect(read(10002).items[0]?.title).toBe("updated");
+		writer
+			.prepare("delete from link_occurrences where source_id='upper'")
+			.run();
+		expect(read(10003).items.map((item) => item.title)).toEqual(["middle"]);
+		expect(
+			getLinkInsights({
+				account: "other",
+				range: "week",
+				now: new Date(now + 10003),
+			}).items,
+		).toEqual([]);
+		// Rewinding time must reintroduce the lower boundary, too.
+		expect(read(0).items.map((item) => item.title)).toEqual([
+			"middle",
+			"lower",
+		]);
+	});
+
+	it("normalizes repeated URLs once per read and observes later expansion changes", () => {
+		const db = insertAccountFixture();
+		const shortUrl = "https://t.co/repeated";
+		insertExpansion(db, {
+			shortUrl,
+			finalUrl: "https://example.com/shared?utm_source=test",
+		});
+		for (let i = 0; i < 20; i++) {
+			insertTweet(db, {
+				id: `repeated_${i}`,
+				authorProfileId: "profile_a",
+				text: "Shared link",
+				createdAt: localIso(),
+			});
+			insertOccurrence(db, {
+				sourceKind: "tweet",
+				sourceId: `repeated_${i}`,
+				shortUrl,
+				createdAt: localIso(),
+			});
+		}
+		const normalizations = vi.spyOn(URLSearchParams.prototype, "sort");
+		try {
+			const result = getLinkInsights({ range: "all" });
+			expect(result.items).toHaveLength(1);
+			expect(result.items[0]?.shareCount).toBe(20);
+			expect(normalizations).toHaveBeenCalledTimes(1);
+			db.prepare(
+				"update url_expansions set final_url = 'https://example.com/refreshed?utm_source=test' where short_url = ?",
+			).run(shortUrl);
+			expect(getLinkInsights({ range: "all" }).items[0]?.url).toBe(
+				"https://example.com/refreshed",
+			);
+			expect(normalizations).toHaveBeenCalledTimes(2);
+		} finally {
+			normalizations.mockRestore();
+		}
 	});
 
 	it("groups top links, strips shared URLs from comments, and splits videos", () => {
@@ -335,7 +576,7 @@ describe("link insights", () => {
 			id: "tweet_forum_event",
 			authorProfileId: "profile_a",
 			text: "Codex event https://t.co/forum",
-			createdAt: "2026-05-11T01:06:00.000Z",
+			createdAt: localIso(0, 1, 6),
 		});
 		insertExpansion(db, {
 			shortUrl: "https://t.co/forum",
@@ -346,12 +587,12 @@ describe("link insights", () => {
 			sourceKind: "tweet",
 			sourceId: "tweet_forum_event",
 			shortUrl: "https://t.co/forum",
-			createdAt: "2026-05-11T01:06:00.000Z",
+			createdAt: localIso(0, 1, 6),
 		});
 
 		const insights = getLinkInsights({
 			range: "today",
-			now: new Date("2026-05-11T12:00:00.000Z"),
+			now: localDate(),
 		});
 
 		expect(insights.items[0]).toMatchObject({
@@ -368,13 +609,13 @@ describe("link insights", () => {
 			id: "tweet_today",
 			authorProfileId: "profile_a",
 			text: "Today https://t.co/today",
-			createdAt: "2026-05-11T09:00:00.000Z",
+			createdAt: localIso(0, 9),
 		});
 		insertDmMessage(db, {
 			id: "dm_yesterday",
 			senderProfileId: "profile_b",
 			text: "Yesterday https://t.co/yesterday",
-			createdAt: "2026-05-10T22:00:00.000Z",
+			createdAt: localIso(-1, 22),
 		});
 		insertExpansion(db, {
 			shortUrl: "https://t.co/today",
@@ -388,26 +629,26 @@ describe("link insights", () => {
 			sourceKind: "tweet",
 			sourceId: "tweet_today",
 			shortUrl: "https://t.co/today",
-			createdAt: "2026-05-11T09:00:00.000Z",
+			createdAt: localIso(0, 9),
 		});
 		insertOccurrence(db, {
 			sourceKind: "dm",
 			sourceId: "dm_yesterday",
 			shortUrl: "https://t.co/yesterday",
-			createdAt: "2026-05-10T22:00:00.000Z",
+			createdAt: localIso(-1, 22),
 		});
 
 		const today = getLinkInsights({
 			range: "today",
 			source: "all",
-			now: new Date("2026-05-11T12:00:00.000Z"),
+			now: localDate(),
 		});
 		expect(today.items.map((item) => item.host)).toEqual(["today.example"]);
 
 		const dm = getLinkInsights({
 			range: "all",
 			source: "dm",
-			now: new Date("2026-05-11T12:00:00.000Z"),
+			now: localDate(),
 		});
 		expect(dm.items.map((item) => item.host)).toEqual(["yesterday.example"]);
 		expect(dm.items[0]?.mentions[0]).toMatchObject({
@@ -417,26 +658,71 @@ describe("link insights", () => {
 		});
 	});
 
+	it("anchors the today range to local midnight regardless of host timezone", () =>
+		withTimezone("America/New_York", () => {
+			// ISO timestamps store instants in UTC, but "today" is a local calendar
+			// concept. Build both sides of local midnight before converting to ISO.
+			const db = insertAccountFixture();
+			insertTweet(db, {
+				id: "tweet_after_local_midnight",
+				authorProfileId: "profile_a",
+				text: "Just after midnight https://t.co/after",
+				createdAt: localIso(0, 0, 30),
+			});
+			insertTweet(db, {
+				id: "tweet_before_local_midnight",
+				authorProfileId: "profile_b",
+				text: "Just before midnight https://t.co/before",
+				createdAt: localIso(-1, 23, 30),
+			});
+			insertExpansion(db, {
+				shortUrl: "https://t.co/after",
+				finalUrl: "https://after.example/post",
+			});
+			insertExpansion(db, {
+				shortUrl: "https://t.co/before",
+				finalUrl: "https://before.example/post",
+			});
+			insertOccurrence(db, {
+				sourceKind: "tweet",
+				sourceId: "tweet_after_local_midnight",
+				shortUrl: "https://t.co/after",
+				createdAt: localIso(0, 0, 30),
+			});
+			insertOccurrence(db, {
+				sourceKind: "tweet",
+				sourceId: "tweet_before_local_midnight",
+				shortUrl: "https://t.co/before",
+				createdAt: localIso(-1, 23, 30),
+			});
+
+			const today = getLinkInsights({
+				range: "today",
+				now: localDate(),
+			});
+			expect(today.items.map((item) => item.host)).toEqual(["after.example"]);
+		}));
+
 	it("scopes results to the selected account", () => {
 		const db = insertAccountFixture();
 		insertTweet(db, {
 			id: "tweet_primary",
 			authorProfileId: "profile_a",
 			text: "Primary link https://t.co/primary",
-			createdAt: "2026-05-11T09:00:00.000Z",
+			createdAt: localIso(0, 9),
 		});
 		insertTweet(db, {
 			id: "tweet_secondary",
 			accountId: "acct_secondary",
 			authorProfileId: "profile_b",
 			text: "Secondary link https://t.co/secondary",
-			createdAt: "2026-05-11T10:00:00.000Z",
+			createdAt: localIso(0, 10),
 		});
 		insertTweet(db, {
 			id: "tweet_shared",
 			authorProfileId: "profile_a",
 			text: "Shared edge link https://t.co/shared",
-			createdAt: "2026-05-11T11:00:00.000Z",
+			createdAt: localIso(0, 11),
 		});
 		insertExpansion(db, {
 			shortUrl: "https://t.co/primary",
@@ -454,27 +740,27 @@ describe("link insights", () => {
 			sourceKind: "tweet",
 			sourceId: "tweet_primary",
 			shortUrl: "https://t.co/primary",
-			createdAt: "2026-05-11T09:00:00.000Z",
+			createdAt: localIso(0, 9),
 		});
 		insertOccurrence(db, {
 			sourceKind: "tweet",
 			sourceId: "tweet_secondary",
 			shortUrl: "https://t.co/secondary",
 			accountId: "acct_secondary",
-			createdAt: "2026-05-11T10:00:00.000Z",
+			createdAt: localIso(0, 10),
 		});
 		insertOccurrence(db, {
 			sourceKind: "tweet",
 			sourceId: "tweet_shared",
 			shortUrl: "https://t.co/shared",
-			createdAt: "2026-05-11T11:00:00.000Z",
+			createdAt: localIso(0, 11),
 		});
 		insertTweetAccountEdge(db, {
 			accountId: "acct_secondary",
 			tweetId: "tweet_shared",
 		});
 
-		const now = new Date("2026-05-11T12:00:00.000Z");
+		const now = localDate();
 		expect(
 			getLinkInsights({
 				account: "acct_primary",
@@ -525,6 +811,89 @@ describe("link insights", () => {
 		).toBe("http://localhost:8080/dashboard");
 	});
 
+	it.each(["rank", "recent"] as const)(
+		"resolves %s ties before full hydration and uses the DM sender's influence",
+		(sort) => {
+			const db = insertAccountFixture();
+			const createdAt = "2026-05-10T10:00:00.000Z";
+			for (let i = 0; i < 40; i++) {
+				const id = `tie_${i}`;
+				const shortUrl = `https://t.co/tie${i}`;
+				insertTweet(db, {
+					id,
+					authorProfileId: i === 0 ? "profile_me" : "profile_b",
+					text: shortUrl,
+					createdAt,
+				});
+				insertExpansion(db, { shortUrl, finalUrl: `https://example.com/${i}` });
+				insertOccurrence(db, {
+					sourceKind: "tweet",
+					sourceId: id,
+					shortUrl,
+					createdAt,
+				});
+			}
+			insertDmMessage(db, {
+				id: "dm_tie",
+				senderProfileId: "profile_a",
+				text: "https://t.co/dm-tie",
+				createdAt,
+			});
+			insertExpansion(db, {
+				shortUrl: "https://t.co/dm-tie",
+				finalUrl: "https://example.com/dm",
+			});
+			insertOccurrence(db, {
+				sourceKind: "dm",
+				sourceId: "dm_tie",
+				shortUrl: "https://t.co/dm-tie",
+				createdAt,
+			});
+			insertExpansion(db, {
+				shortUrl: "https://t.co/missing",
+				finalUrl: "https://example.com/missing",
+			});
+			insertOccurrence(db, {
+				sourceKind: "tweet",
+				sourceId: "missing",
+				shortUrl: "https://t.co/missing",
+				createdAt,
+			});
+			const hydrated: number[] = [];
+			const original = db.prepare.bind(db);
+			const spy = vi.spyOn(db, "prepare").mockImplementation((sql) => {
+				const statement = original(sql);
+				if (sql.includes("source_media_json")) {
+					const all = statement.all.bind(statement);
+					statement.all = (...args) => {
+						const rows = all(...args);
+						hydrated.push(rows.length);
+						return rows;
+					};
+				}
+				return statement;
+			});
+			try {
+				const result = getLinkInsights({ range: "all", sort, limit: 3 });
+				expect(result.items).toHaveLength(3);
+				expect(result.items[0]).toMatchObject({
+					url: "https://example.com/dm",
+					topSharer: { id: "profile_a" },
+				});
+				expect(result.items[1]?.url).toBe("https://example.com/0");
+				expect(hydrated).toEqual([3]);
+				const all = getLinkInsights({ range: "all", sort, limit: 100 });
+				expect(all.items[0]?.url).toBe(result.items[0]?.url);
+				expect(all.items.at(-1)).toMatchObject({
+					url: "https://example.com/missing",
+					totalInfluence: 0,
+				});
+			} finally {
+				spy.mockRestore();
+			}
+		},
+	);
+
 	it("applies sort before limiting groups", () => {
 		const db = insertAccountFixture();
 		for (const id of ["rank_1", "rank_2", "rank_3"] as const) {
@@ -561,6 +930,22 @@ describe("link insights", () => {
 			shortUrl: "https://t.co/comments",
 			createdAt: "2026-05-09T10:00:00.000Z",
 		});
+		insertTweet(db, {
+			id: "recent_single",
+			authorProfileId: "profile_b",
+			text: "https://t.co/recent",
+			createdAt: "2026-05-11T10:00:00.000Z",
+		});
+		insertExpansion(db, {
+			shortUrl: "https://t.co/recent",
+			finalUrl: "https://recent.example/post",
+		});
+		insertOccurrence(db, {
+			sourceKind: "tweet",
+			sourceId: "recent_single",
+			shortUrl: "https://t.co/recent",
+			createdAt: "2026-05-11T10:00:00.000Z",
+		});
 
 		const now = new Date("2026-05-11T12:00:00.000Z");
 		expect(
@@ -571,5 +956,9 @@ describe("link insights", () => {
 			getLinkInsights({ range: "week", limit: 1, sort: "comments", now })
 				.items[0]?.host,
 		).toBe("comments.example");
+		expect(
+			getLinkInsights({ range: "week", limit: 1, sort: "recent", now }).items[0]
+				?.host,
+		).toBe("recent.example");
 	});
 });

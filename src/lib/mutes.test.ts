@@ -17,23 +17,39 @@ const mocks = vi.hoisted(() => ({
 	muteUserViaXurl: vi.fn(),
 	unmuteUserViaBird: vi.fn(),
 	unmuteUserViaXurl: vi.fn(),
+	getAuthenticatedBirdAccount: vi.fn(),
 }));
 
-vi.mock("./bird-actions", () => ({
-	lookupProfileViaBird: mocks.lookupProfileViaBird,
-	muteUserViaBird: mocks.muteUserViaBird,
-	readBirdStatusViaBird: mocks.readBirdStatusViaBird,
-	unmuteUserViaBird: mocks.unmuteUserViaBird,
-}));
+vi.mock("./bird", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		getAuthenticatedBirdAccountEffect: fromMock(
+			mocks.getAuthenticatedBirdAccount,
+		),
+	};
+});
 
-vi.mock("./xurl", () => ({
-	lookupAuthenticatedUser: mocks.lookupAuthenticatedUser,
-	lookupAuthenticatedUserFresh: mocks.lookupAuthenticatedUser,
-	lookupUsersByHandles: mocks.lookupUsersByHandles,
-	lookupUsersByIds: mocks.lookupUsersByIds,
-	muteUserViaXurl: mocks.muteUserViaXurl,
-	unmuteUserViaXurl: mocks.unmuteUserViaXurl,
-}));
+vi.mock("./bird-actions", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		lookupProfileViaBirdEffect: fromMock(mocks.lookupProfileViaBird),
+		muteUserViaBirdEffect: fromMock(mocks.muteUserViaBird),
+		readBirdStatusViaBirdEffect: fromMock(mocks.readBirdStatusViaBird),
+		unmuteUserViaBirdEffect: fromMock(mocks.unmuteUserViaBird),
+	};
+});
+
+vi.mock("./xurl", async () => {
+	const { effectFromMock: fromMock } = await import("../test/effect-mocks");
+	return {
+		lookupAuthenticatedUserEffect: fromMock(mocks.lookupAuthenticatedUser),
+		lookupAuthenticatedUserFreshEffect: fromMock(mocks.lookupAuthenticatedUser),
+		lookupUsersByHandlesEffect: fromMock(mocks.lookupUsersByHandles),
+		lookupUsersByIdsEffect: fromMock(mocks.lookupUsersByIds),
+		muteUserViaXurlEffect: fromMock(mocks.muteUserViaXurl),
+		unmuteUserViaXurlEffect: fromMock(mocks.unmuteUserViaXurl),
+	};
+});
 
 const tempDirs: string[] = [];
 
@@ -55,7 +71,12 @@ describe("mutes", () => {
 		mocks.muteUserViaXurl.mockReset();
 		mocks.unmuteUserViaBird.mockReset();
 		mocks.unmuteUserViaXurl.mockReset();
+		mocks.getAuthenticatedBirdAccount.mockReset();
 		mocks.lookupAuthenticatedUser.mockResolvedValue({
+			id: "25401953",
+			username: "steipete",
+		});
+		mocks.getAuthenticatedBirdAccount.mockResolvedValue({
 			id: "25401953",
 			username: "steipete",
 		});
@@ -88,7 +109,7 @@ describe("mutes", () => {
 		});
 		mocks.muteUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "muted via xurl",
+			output: "muted via xurl\nverified muting=true",
 		});
 		mocks.unmuteUserViaBird.mockResolvedValue({
 			ok: true,
@@ -96,7 +117,7 @@ describe("mutes", () => {
 		});
 		mocks.unmuteUserViaXurl.mockResolvedValue({
 			ok: true,
-			output: "unmuted via xurl",
+			output: "unmuted via xurl\nverified muting=false",
 		});
 	});
 
@@ -206,7 +227,7 @@ describe("mutes", () => {
 		).toEqual([
 			{
 				account_id: "acct_primary",
-				profile_id: "profile_amelia",
+				profile_id: "profile_user_7",
 				source: "manual",
 			},
 		]);

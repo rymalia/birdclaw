@@ -207,6 +207,7 @@ describe("bookmark sync job", () => {
 		resetBirdclawPathsForTests();
 		const launchAgentsDir = makeTempDir("birdclaw-launchagents-");
 		const agent = buildBookmarkSyncLaunchAgentPlist({
+			account: "acct_work",
 			program: "/opt/homebrew/bin/birdclaw",
 			intervalSeconds: 10_800,
 			maxPages: 5,
@@ -215,6 +216,7 @@ describe("bookmark sync job", () => {
 		expect(agent.plist).toContain("<key>StartInterval</key>");
 		expect(agent.plist).toContain("<integer>10800</integer>");
 		expect(agent.programArguments).toContain("sync-bookmarks");
+		expect(agent.programArguments).toContain("acct_work");
 		expect(agent.programArguments).toContain("--all");
 		expect(agent.programArguments).toContain("--max-pages");
 		expect(agent.programArguments).toContain("5");
@@ -229,6 +231,22 @@ describe("bookmark sync job", () => {
 		expect(existsSync(result.plistPath)).toBe(true);
 		expect(execFileAsyncMock).not.toHaveBeenCalled();
 		expect(getNativeDb({ seedDemoData: false })).toBeTruthy();
+	});
+
+	it("builds bookmark sync through an explicit Bun runtime", () => {
+		const agent = buildBookmarkSyncLaunchAgentPlist({
+			program: "/Users/test/Projects/birdclaw/bin/birdclaw.mjs",
+			runtime: "/Users/test/.local/share/birdclaw/bun/bin/bun",
+			runtimeArgs: ["--no-env-file"],
+		});
+
+		expect(agent.programArguments.slice(0, 4)).toEqual([
+			"/Users/test/.local/share/birdclaw/bun/bin/bun",
+			"--no-env-file",
+			"/Users/test/Projects/birdclaw/bin/birdclaw.mjs",
+			"--json",
+		]);
+		expect(agent.programArguments).toContain("sync-bookmarks");
 	});
 
 	it("builds launchd install effects lazily", async () => {

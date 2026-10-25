@@ -1,11 +1,11 @@
 ---
 title: Quickstart
-description: "Five minutes from a clean machine to a working birdclaw setup with one Twitter account."
+description: "Install birdclaw, import your X archive to establish account identity, connect live transports, and start the local web app."
 ---
 
 # Quickstart
 
-Five minutes from a clean machine to a local SQLite store full of your tweets, DMs, likes, and bookmarks — plus a working web UI.
+Set up a local SQLite workspace for your tweets, DMs, likes, and bookmarks, then connect live transports and start the web UI. Installation is quick; first-time account setup depends on having an X archive, which X may take a few days to prepare.
 
 ## 1. Install
 
@@ -24,13 +24,20 @@ birdclaw auth status --json
 birdclaw db stats --json
 ```
 
-`init` creates `~/.birdclaw/`, opens the shared SQLite database, writes a default config when none exists, and probes for `xurl` and `bird` on `PATH`.
+`init` creates `~/.birdclaw/`, opens an empty SQLite database, and writes a default config when none exists. To explore immediately with no archive, credentials, or network access, use the self-contained demo instead:
 
-`auth status` prints which transports are available and which account is active. Right after `init`, no account is configured yet — that comes in step 4.
+```bash
+birdclaw init --demo
+birdclaw serve
+```
+
+The demo includes sample tweets, DMs, profiles, and links. Its output also suggests useful read-only commands to try next.
+
+`auth status` runs Birdclaw's coarse xurl status probe. Verify xurl with `xurl whoami`. Existing private bird users can verify bird with `bird whoami`. If you want live sync, follow [Sign in](auth.md); skip it if you only need archive import.
 
 ## 3. Find and import an archive
 
-If you downloaded your Twitter/X archive from <https://x.com/settings/your_archive>, point birdclaw at it. On macOS, autodiscovery looks in `~/Downloads` and Spotlight first.
+If you downloaded your Twitter/X archive from <https://x.com/settings/download_your_data>, point birdclaw at it. On macOS, autodiscovery looks in `~/Downloads` and Spotlight first.
 
 ```bash
 birdclaw archive find --json
@@ -39,7 +46,7 @@ birdclaw import archive --json
 birdclaw import archive ~/Downloads/twitter-archive-2025.zip --json
 ```
 
-Optional profile hydration fills bios, follower counts, and avatars from live Twitter metadata using whichever transport is available. It can perform hundreds or thousands of live profile reads on large archives, so run it only when you are ready to spend those X API reads:
+Optional profile hydration through xurl fills bios, follower counts, and avatars from live Twitter metadata. It can perform hundreds or thousands of live profile reads on large archives, so run it only when you are ready to spend those X API reads. With an existing private bird installation, the command can instead correct the seeded local account identity from `bird whoami` without bulk-hydrating imported profiles:
 
 ```bash
 birdclaw import hydrate-profiles --json
@@ -54,9 +61,11 @@ birdclaw import archive ~/Downloads/twitter-archive-2026.zip --select directMess
 
 Valid slices: `tweets`, `likes`, `bookmarks`, `profiles`, `directMessages`, `followers`, `following`. Use `dms` as a short alias for `directMessages`.
 
-No archive yet? Skip to step 4 — birdclaw is fully usable in live-only mode.
+No archive yet? Request one and wait for X to prepare it. Do not run live sync against an empty or demo database: `auth status` and `auth use` do not establish real account identity.
 
 ## 4. Sync live state
+
+Run this step only after archive import has established your account.
 
 `auto` tries `xurl` first, then falls back to `bird`. Use `bird` directly for surfaces where the API path is rate-limited.
 
@@ -67,7 +76,7 @@ birdclaw sync timeline --limit 100 --refresh --json
 birdclaw sync mention-threads --limit 30 --delay-ms 1500 --json
 ```
 
-Without `xurl` or `bird`, sync stays in archive-only mode and just verifies the local cache.
+Without `xurl` or `bird`, use the imported archive and local search/read workflows.
 
 ## 5. Start the web app
 
@@ -84,7 +93,18 @@ Open <http://localhost:3000>. The default lanes:
 - **Inbox** — let heuristics or OpenAI float likely-important items
 - **Blocks** — maintain a local-first account-scoped blocklist
 
-Use the Sync button in Home, Mentions, Likes, Bookmarks, or DMs when you want fresh live data. Browser reloads only reread local SQLite; explicit sync avoids surprise live reads and rate-limit spend.
+Click a feed card with a mouse or use its **Thread** action to read the archived conversation. On touchscreens, **Thread** opens the conversation; tapping plain text on any feed card dismisses the open thread without opening another. Links and text selection keep their normal behavior. If the lookup finds no other posts, the card shows **no threads** instead of an empty panel.
+
+Use **Permalink** on a post, quoted post, or individual reply to open
+`/tweets/<tweet-id>`. This URL loads the saved conversation directly and scrolls
+to the highlighted post, including after reload or when opened in a new tab.
+**Copy link** copies its full URL for sharing. Standalone posts work too; missing
+or deleted posts show a clear not-found message. Conversation context remains
+bounded to cached posts, and the page indicates when some context is omitted.
+Permalinks work in read-only archives and retain the archive's existing access
+controls. They never initiate a live X lookup.
+
+Use the Sync button in Home, Mentions, Likes, Bookmarks, or DMs when you want fresh live data. Browser reloads only reread local SQLite; explicit sync avoids surprise live reads and rate-limit spend. Home and Mentions can optionally auto-sync per account at 5m, 10m, 15m, 30m, or 1h intervals. The setting stays in this browser, skips hidden-page runs, prevents overlap, and backs off after failures. Use [`birdclaw jobs`](jobs.md) instead when refresh must continue after the page closes.
 
 ## 6. Run real CLI workflows
 

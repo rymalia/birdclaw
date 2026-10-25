@@ -1,26 +1,39 @@
 ---
 title: Sync
-description: "Sync authored tweets, likes, bookmarks, home timeline, mentions, and mention threads into local SQLite via xurl or bird."
+description: "Sync authored tweets, Lists, likes, bookmarks, home timeline, mentions, and mention threads into local SQLite via xurl or bird."
 ---
 
 # Sync
 
+Tweet ingestion reconciles each unique author once within a payload, including
+referenced posts. The cache is discarded with the transaction, so later payloads
+still update profile identity, metadata, and history normally.
+
 `birdclaw sync` mirrors the live Twitter surfaces you actually use into the local SQLite store. Every sync command:
 
-- pulls from the best live transport for the surface; authored sync uses `xurl`, follow graph sync prefers `bird`, and likes/bookmarks still try `xurl` before `bird`
+- supports `bird` and `xurl` on each live sync surface, with `transport.preferred` controlling eligible auto choices
 - writes into the same canonical tables that archive import uses
 - refreshes the FTS5 index incrementally
 - saves cursors so the next run resumes where the last one stopped
 - caches results on cache-backed surfaces so repeat reads do not keep spending the API budget
 
+On a fresh database, import your X archive before the first live sync. The archive establishes real account identity; transport authentication alone does not perform that binding, and `init --demo` contains only synthetic sample data.
+
+## Web auto-sync
+
+The Home and Mentions lanes keep manual sync as the default and offer an opt-in `Auto sync` control. The interval is stored per sync kind and account in local browser storage, with choices from 5 minutes to 1 hour. Runs use the same `/api/sync` job path as the manual button, never overlap, skip while the page is hidden, show the latest result, and back off exponentially after failures.
+
+Web auto-sync runs only while the page is mounted. For durable unattended refresh with lock files and audit logs, use [`birdclaw jobs`](jobs.md).
+
 ## Common flags
 
 Most `sync *` commands accept:
 
-- `--mode auto|xurl|bird` — transport selection; `auto` chooses the preferred transport for that command and falls back when possible
+- `--mode auto|xurl|bird` — transport selection; `auto` uses `transport.preferred` from config, or the command's usual order, and falls back when possible
 - `--limit <n>` — page size in `xurl` mode, total in single-page modes
 - `--all` — keep paginating until the retrievable window is exhausted
 - `--max-pages <n>` — cap a paged scan; implies `--all`
+- `--pagination-token <token>` — on `sync likes` and `sync bookmarks` in `xurl` mode, resume from a previous response's `payload.meta.next_token`
 - `--early-stop` — on `sync likes` and `sync bookmarks`, stop paging once a fetched page is 100% already local (dedupe saturation); without `--all` or `--max-pages`, caps at 10 pages
 - `--refresh` — bypass the cache and force a live fetch
 - `--cache-ttl <seconds>` — tune freshness without forcing a full refresh
@@ -29,11 +42,11 @@ Most `sync *` commands accept:
 - `--dry-run` — read but do not write
 - `--json` — stable machine-readable output
 
-`sync authored` is intentionally narrower: `--mode xurl`, `--limit`, `--max-pages`, `--since-id`, `--until-id`, `--account`, and `--json`.
+`sync authored` is intentionally narrower: `--mode auto|bird|xurl`, `--limit`, `--max-pages`, `--since-id`, `--until-id`, `--account`, and `--json`.
 
 ## sync authored
 
-Mirror the authenticated user's authored timeline through `xurl`. Retweets are included and stored with their X `referenced_tweets` marker intact. The command resumes from a stored `since_id`; it does not audit old rows or detect deletes.
+Mirror the authenticated user's authored posts through `xurl` or Bird search (`from:<handle> include:nativeretweets`, including replies). Auto mode tries the configured preferred transport first, defaulting to xurl, and falls back when the first read fails. Retweets are included and stored with their X `referenced_tweets` marker intact. The command resumes from a stored `since_id`; it does not audit old rows or detect deletes.
 
 On a first run with no authored cursor, Birdclaw seeds `since_id` from the newest local archive-backed tweet authored by that account when one exists. Fresh installs with no local baseline full-scan from X and print a stderr cost hint. Pass `--since-id <id>` to override the archive seed deliberately.
 
@@ -41,6 +54,16 @@ On a first run with no authored cursor, Birdclaw seeds `since_id` from the newes
 birdclaw sync authored --mode xurl --limit 100 --json
 birdclaw sync authored --account acct_primary --mode xurl --limit 100 --json
 ```
+
+```bash
+birdclaw sync authored --mode bird --max-pages 5 --json
+```
+
+Bird uses X's retrievable search window, which can be less complete than the API
+user timeline. Each Bird invocation fetches one search page (Bird controls its page
+size); `--max-pages` bounds the number of invocations. Both transports keep separate,
+account-scoped continuation cursors and only advance `since_id` after the scan
+completes. `--until-id` backfills leave the forward watermark unchanged.
 
 Authored tweets land in the canonical `tweets` table and get an `authored` account edge, so shared tweets can also remain home, mention, liked, or bookmarked rows for the same or another account.
 
@@ -52,11 +75,14 @@ Mirror the authenticated user's Likes feed:
 birdclaw sync likes --mode auto --limit 100 --refresh --json
 birdclaw sync likes --mode bird --all --max-pages 5 --refresh --json
 birdclaw sync likes --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
+birdclaw sync likes --mode xurl --limit 100 --max-pages 70 --pagination-token "$NEXT_TOKEN" --refresh --json
 ```
 
 Liked tweets land in the same `tweets` table as archive imports and can be queried with `birdclaw search tweets --liked`.
 
 `--early-stop` halts pagination as soon as one fetched page is 100% already in the local store. Pair it with `--max-pages` on a cron loop: the first run after a long absence walks back as far as `--max-pages` allows, every subsequent run stops at the first saturated page and spends one X API page read instead of `--max-pages` of them. If neither `--all` nor `--max-pages` is present, Birdclaw applies a 10-page cap.
+
+For a bounded backfill, copy `payload.meta.next_token` from one run into `--pagination-token` on the next. The token is an opaque X cursor and starts the first request at that point; the new response carries the following token. Use `--mode xurl` explicitly when resuming.
 
 ## sync bookmarks
 
@@ -66,6 +92,7 @@ Mirror Bookmarks:
 birdclaw sync bookmarks --mode auto --limit 100 --refresh --json
 birdclaw sync bookmarks --mode bird --all --max-pages 5 --limit 100 --refresh --json
 birdclaw sync bookmarks --mode auto --limit 100 --max-pages 5 --early-stop --refresh --json
+birdclaw sync bookmarks --mode xurl --limit 100 --max-pages 70 --pagination-token "$NEXT_TOKEN" --refresh --json
 ```
 
 Bookmarks are queried via `birdclaw search tweets --bookmarked` and drive the [research](research.md) workflow.
@@ -74,13 +101,31 @@ Bookmarks are queried via `birdclaw search tweets --bookmarked` and drive the [r
 
 ## sync timeline
 
-Pull the chronological Following timeline through `bird`:
+Pull the chronological Following timeline through `auto` (configured preference first, xurl first when unset), or select `--mode xurl` explicitly:
 
 ```bash
 birdclaw sync timeline --limit 100 --refresh --json
 ```
 
 `sync timeline` defaults to the chronological feed, not the algorithmic For You. The home timeline is stored in the same `tweets` table so search, filters, and the web UI's `Home` lane all see one set of rows.
+
+## sync lists
+
+Read owned X Lists and bounded membership pages through the configured preferred transport (Bird first when unset), with fallback in `auto` mode:
+
+```bash
+birdclaw sync lists --mode auto --json
+birdclaw sync lists --mode bird --max-lists 20 --member-limit 100 --max-member-pages 3 --delay-ms 1500 --json
+```
+
+Safe defaults are 20 Lists, 20 members per List, one membership page, and a 1,000 ms delay between Lists. Widen the scan only with `--max-member-pages`; there is no unbounded paging flag. Each stored List reports source, List and member sync timestamps, member/page counts, the rate-limit parameters used, and membership state:
+
+- `complete` — the transport returned an exhausted cursor; missing members may be ended
+- `inferred` — returned count matches metadata or a short cursorless page; unseen members are preserved
+- `partial` — a next cursor or page cap remains; unseen members are preserved
+- `error` — latest membership attempt failed; existing edges remain
+
+`birdclaw lists list --json` and `birdclaw lists members <name> --json` inspect only local state. List sync is read-only and never creates or mutates X Lists.
 
 ## sync mentions
 
@@ -91,10 +136,33 @@ birdclaw sync mentions --mode xurl --limit 100 --max-pages 3 --refresh --json
 birdclaw sync mentions --mode bird --limit 50 --json
 ```
 
+Use `--latest` for current mentions while a historical scan is still pending,
+then `--resume` to consume saved continuation pages without losing that history:
+
+```bash
+birdclaw sync mentions --mode xurl --latest --limit 100 --max-pages 1 --json
+birdclaw sync mentions --mode xurl --resume --limit 100 --max-pages 1 --json
+```
+
+`--latest` always makes a live newest-page read, independently of existing
+pagination cursors. It preserves any remaining pages for `--resume`, which
+prioritizes pending explicit scans before the older automatic scan. With no
+pending cursor, `--resume` starts the next incremental scan. Account and page-size
+boundaries remain isolated. The default command retains its existing automatic
+cursor behavior.
+
+The flags are mutually exclusive and cannot be combined with `--since-id` or
+`--start-time`. Explicit `bird` mode supports `--latest`, but resumable pagination
+requires `xurl`. The JSON result includes `intent`, `position` (`head` or
+`continuation`), and `checkedAt`; `partial` continues to describe remaining pages,
+not whether the newest page was checked. A cached default read retains the cache
+timestamp instead of claiming a new live check. Web and scheduled account mention
+refreshes use the newest-page intent.
+
 Flags:
 
 - `--account <accountId>` — pick the account when multiple are configured
-- `--mode bird|xurl` — transport; defaults to `xurl`
+- `--mode auto|bird|xurl` — transport; defaults to `auto`
 - `--limit <n>` — page size
 - `--max-pages <n>` — cap a paged scan; partial truncation exits with code `5`
 - `--since-id <id>` — explicitly fetch mentions newer than a known tweet ID
@@ -117,7 +185,7 @@ birdclaw sync mention-threads --mode xurl --limit 30 --json
 
 Flags:
 
-- `--mode bird|xurl` — transport; defaults to `bird`
+- `--mode auto|bird|xurl` — transport; defaults to `auto`
 - `--delay-ms <ms>` — delay between thread fetches; raise this when X starts rate-limiting (bird mode)
 - `--timeout-ms <ms>` — per-thread network timeout
 - `--all`, `--max-pages <n>` — paged thread retrieval
@@ -139,7 +207,7 @@ birdclaw sync followers --yes --json
 birdclaw sync following --yes --json
 ```
 
-The first two commands are dry runs. Live fetches require `--yes`; pass `--refresh` only when you intentionally want to bypass the 24-hour follow-graph cache. `auto` prefers `bird` for followers/following because the browser-cookie GraphQL path works when OAuth2 follow reads are unavailable.
+The first two commands are dry runs. Live fetches require `--yes`; pass `--refresh` only when you intentionally want to bypass the 24-hour follow-graph cache. `auto` uses the configured preference, defaulting to `bird` for followers/following because the browser-cookie GraphQL path works when OAuth2 follow reads are unavailable.
 
 After the first run, `birdclaw graph events` shows the diff log and `birdclaw graph mutuals` lists current mutuals.
 
@@ -154,11 +222,12 @@ birdclaw sync all --transport auto
 
 ## DMs sync
 
-DMs sit on a separate command. `bird` is still the default and required for message-request state; `xurl` can import recent OAuth2 DM events for accepted conversations:
+DMs sit on a separate command. The default `auto` mode honors `transport.preferred` and supports account-scoped xurl reads and native cookie-backed `web` access. Native web access preserves message-request state without bird; xurl can import recent OAuth2 DM events for accepted conversations:
 
 ```bash
 birdclaw dms sync --limit 50 --refresh --json
 birdclaw dms sync --mode auto --limit 50 --refresh --json
+birdclaw dms sync --mode web --inbox requests --limit 50 --refresh --json
 birdclaw dms list --refresh --limit 10 --json
 ```
 

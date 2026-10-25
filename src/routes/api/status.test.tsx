@@ -8,12 +8,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("#/lib/backup", () => ({
-	maybeAutoUpdateBackup: mocks.maybeAutoUpdateBackup,
-	maybeAutoUpdateBackupEffect: () =>
-		Effect.promise(() => Promise.resolve(mocks.maybeAutoUpdateBackup())),
+	requestBackupAutoUpdate: mocks.maybeAutoUpdateBackup,
 }));
 
-vi.mock("#/lib/queries", () => ({
+vi.mock("#/lib/query-status", () => ({
 	getQueryEnvelope: mocks.getQueryEnvelope,
 	getQueryEnvelopeEffect: () =>
 		Effect.promise(() => Promise.resolve(mocks.getQueryEnvelope())),
@@ -28,9 +26,31 @@ describe("status api route", () => {
 		mocks.maybeAutoUpdateBackup.mockResolvedValue(undefined);
 		mocks.getQueryEnvelope.mockResolvedValue({
 			stats: { home: 4, mentions: 2, dms: 4, needsReply: 2, inbox: 4 },
-			accounts: [{ id: "acct_primary" }],
-			archives: [{ path: "/tmp/archive.zip" }],
-			transport: { statusText: "xurl available" },
+			accounts: [
+				{
+					id: "acct_primary",
+					name: "Primary",
+					handle: "@primary",
+					transport: "xurl",
+					isDefault: 1,
+					createdAt: "2026-06-15T12:00:00.000Z",
+				},
+			],
+			archives: [
+				{
+					path: "/tmp/archive.zip",
+					name: "archive.zip",
+					size: 1024,
+					sizeFormatted: "1 KB",
+					modifiedTime: "2026-06-15T12:00:00.000Z",
+					dateFormatted: "Jun 15, 2026",
+				},
+			],
+			transport: {
+				installed: true,
+				availableTransport: "xurl",
+				statusText: "xurl available",
+			},
 		});
 
 		const response = await GET({
@@ -39,9 +59,31 @@ describe("status api route", () => {
 
 		await expect(response.json()).resolves.toEqual({
 			stats: { home: 4, mentions: 2, dms: 4, needsReply: 2, inbox: 4 },
-			accounts: [{ id: "acct_primary" }],
-			archives: [{ path: "/tmp/archive.zip" }],
-			transport: { statusText: "xurl available" },
+			accounts: [
+				{
+					id: "acct_primary",
+					name: "Primary",
+					handle: "@primary",
+					transport: "xurl",
+					isDefault: 1,
+					createdAt: "2026-06-15T12:00:00.000Z",
+				},
+			],
+			archives: [
+				{
+					path: "/tmp/archive.zip",
+					name: "archive.zip",
+					size: 1024,
+					sizeFormatted: "1 KB",
+					modifiedTime: "2026-06-15T12:00:00.000Z",
+					dateFormatted: "Jun 15, 2026",
+				},
+			],
+			transport: {
+				installed: true,
+				availableTransport: "xurl",
+				statusText: "xurl available",
+			},
 		});
 		expect(mocks.maybeAutoUpdateBackup).toHaveBeenCalledTimes(1);
 		expect(response.headers.get("content-type")).toBe("application/json");

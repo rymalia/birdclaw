@@ -1,15 +1,81 @@
 // @vitest-environment node
-import { mkdtempSync, rmSync } from "node:fs";
+import { type ChildProcess, spawn } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import NativeSqliteDatabase from "./sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
-import { getNativeDb, resetDatabaseForTests } from "./db";
+import {
+	getNativeDb,
+	getReadDb,
+	getStrictReadDb,
+	refreshReadDatabasePoolAfterBulkWrite,
+	resetDatabaseForTests,
+} from "./db";
+import { seedDemoData } from "./seed";
+import NativeSqliteDatabase, { SQLITE_BUSY_TIMEOUT_MS } from "./sqlite";
+import { upsertProfileFromXUser } from "./x-profile";
 
 const tempDirs: string[] = [];
 
+async function waitForOutput(child: ChildProcess, expected: string) {
+	await new Promise<void>((resolve, reject) => {
+		let output = "";
+		const onData = (chunk: Buffer) => {
+			output += chunk.toString();
+			if (output.includes(expected)) {
+				cleanup();
+				resolve();
+			}
+		};
+		const onExit = (code: number | null) => {
+			cleanup();
+			reject(new Error(`lock holder exited before ready (${code})`));
+		};
+		const cleanup = () => {
+			child.stdout?.off("data", onData);
+			child.off("exit", onExit);
+		};
+		child.stdout?.on("data", onData);
+		child.on("exit", onExit);
+	});
+}
+
+async function stopChild(child: ChildProcess) {
+	if (child.exitCode !== null) return;
+	await new Promise<void>((resolve) => {
+		child.once("exit", () => resolve());
+		child.kill();
+	});
+}
+
+function spawnWriteLockHolder(dbPath: string, holdMs: number) {
+	return spawn(
+		process.execPath,
+		[
+			"-e",
+			`
+        const { DatabaseSync } = require("node:sqlite");
+        const db = new DatabaseSync(process.argv[1], { timeout: 1000 });
+        db.exec("pragma journal_mode = wal; begin immediate");
+        db.prepare(
+          "insert or replace into sync_cache (cache_key, value_json, updated_at) values ('test:lock', '{}', '2026-06-15T00:00:00.000Z')"
+        ).run();
+        process.stdout.write("locked\\n");
+        setTimeout(() => {
+          db.exec("commit");
+          db.close();
+        }, Number(process.argv[2]));
+      `,
+			dbPath,
+			String(holdMs),
+		],
+		{ stdio: ["ignore", "pipe", "inherit"] },
+	);
+}
+
 afterEach(() => {
+	vi.restoreAllMocks();
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
 	delete process.env.BIRDCLAW_HOME;
@@ -20,17 +86,24 @@ afterEach(() => {
 });
 
 describe("database init", () => {
-	it("seeds demo data after an initial unseeded open", () => {
+	it("seeds demo data only after an explicit request", () => {
 		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-"));
 		tempDirs.push(tempDir);
 		process.env.BIRDCLAW_HOME = tempDir;
 
-		const unseededDb = getNativeDb({ seedDemoData: false });
+		const testSeedFlag = process.env.BIRDCLAW_TEST_SEED_DEMO_DATA;
+		delete process.env.BIRDCLAW_TEST_SEED_DEMO_DATA;
+		const unseededDb = getNativeDb();
+		if (testSeedFlag === undefined) {
+			delete process.env.BIRDCLAW_TEST_SEED_DEMO_DATA;
+		} else {
+			process.env.BIRDCLAW_TEST_SEED_DEMO_DATA = testSeedFlag;
+		}
 		expect(
 			unseededDb.prepare("select count(*) as count from accounts").get(),
 		).toEqual({ count: 0 });
 
-		const seededDb = getNativeDb();
+		const seededDb = getNativeDb({ seedDemoData: true });
 
 		expect(
 			seededDb.prepare("select count(*) as count from accounts").get(),
@@ -42,6 +115,31 @@ describe("database init", () => {
 				)
 				.get(),
 		).toEqual({ count: 3 });
+	});
+
+	it("refuses to mix demo data into a partially populated database", () => {
+		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-"));
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const db = getNativeDb({ seedDemoData: false });
+		db.prepare(`
+			insert into profiles (
+				id, handle, display_name, bio, followers_count, following_count,
+				avatar_hue, created_at
+			) values (?, ?, ?, '', 0, 0, 0, ?)
+		`).run("profile_real", "real", "Real profile", "2026-07-17T00:00:00Z");
+
+		expect(seedDemoData(db)).toEqual({
+			seeded: false,
+			reason: "database-not-empty",
+		});
+		expect(db.prepare("select count(*) as count from accounts").get()).toEqual({
+			count: 0,
+		});
+		expect(db.prepare("select count(*) as count from profiles").get()).toEqual({
+			count: 1,
+		});
 	});
 
 	it("migrates legacy tweet tables before creating quoted tweet indexes", () => {
@@ -67,6 +165,19 @@ describe("database init", () => {
         bookmarked integer not null default 0,
         liked integer not null default 0
       );
+			insert into tweets (
+				id, account_id, author_profile_id, kind, text, created_at,
+				bookmarked, liked
+			) values (
+				'legacy_saved_home', 'legacy_account', 'legacy_author', 'home',
+				'legacy tweet', '2026-01-01T00:00:00.000Z', 1, 1
+			), (
+				'legacy_authored', 'legacy_account', 'legacy_author', 'authored',
+				'legacy authored tweet', '2026-01-02T00:00:00.000Z', 0, 0
+			), (
+				'legacy_search', 'legacy_account', 'legacy_author', 'search',
+				'legacy search tweet', '2026-01-03T00:00:00.000Z', 0, 0
+			);
     `);
 		legacyDb.close();
 
@@ -80,8 +191,44 @@ describe("database init", () => {
 				"entities_json",
 				"media_json",
 				"quoted_tweet_id",
+				"deleted_at",
+				"deletion_source",
+				"deletion_reason",
+				"superseded_at",
+				"superseded_by_id",
 			]),
 		);
+		expect(columnNames.map((column) => column.name)).not.toEqual(
+			expect.arrayContaining(["account_id", "kind", "bookmarked", "liked"]),
+		);
+		expect(
+			db
+				.prepare(
+					"select account_id, tweet_id, kind from tweet_account_edges where tweet_id = ?",
+				)
+				.get("legacy_saved_home"),
+		).toEqual({
+			account_id: "legacy_account",
+			tweet_id: "legacy_saved_home",
+			kind: "home",
+		});
+		expect(
+			db
+				.prepare(
+					"select tweet_id, kind from tweet_account_edges where tweet_id in ('legacy_authored', 'legacy_search') order by tweet_id",
+				)
+				.all(),
+		).toEqual([
+			{ tweet_id: "legacy_authored", kind: "authored" },
+			{ tweet_id: "legacy_search", kind: "search" },
+		]);
+		expect(
+			db
+				.prepare(
+					"select kind from tweet_collections where tweet_id = ? order by kind",
+				)
+				.all("legacy_saved_home"),
+		).toEqual([{ kind: "bookmarks" }, { kind: "likes" }]);
 
 		const profileColumnNames = db
 			.prepare("pragma table_info(profiles)")
@@ -104,6 +251,26 @@ describe("database init", () => {
 		expect(quotedIndex).toEqual([
 			expect.objectContaining({ name: "quoted_tweet_id" }),
 		]);
+		const replyIndex = db
+			.prepare("pragma index_info(idx_tweets_reply_to)")
+			.all() as Array<{ name: string }>;
+		expect(replyIndex).toEqual([
+			expect.objectContaining({ name: "reply_to_id" }),
+		]);
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweet_revisions where revision_id in ('legacy_saved_home', 'legacy_authored', 'legacy_search')",
+				)
+				.get(),
+		).toEqual({ count: 3 });
+		expect(
+			db
+				.prepare(
+					"select count(*) as count from tweets where deleted_at is not null",
+				)
+				.get(),
+		).toEqual({ count: 0 });
 
 		const syncCacheColumnNames = db
 			.prepare("pragma table_info(sync_cache)")
@@ -139,6 +306,15 @@ describe("database init", () => {
 		}>;
 		expect(followSnapshotColumnNames.map((column) => column.name)).toEqual(
 			expect.arrayContaining(["id", "direction", "status", "result_count"]),
+		);
+
+		const geocodeColumnNames = db
+			.prepare("pragma table_info(geocoded_locations)")
+			.all() as Array<{
+			name: string;
+		}>;
+		expect(geocodeColumnNames.map((column) => column.name)).toEqual(
+			expect.arrayContaining(["normalized_key", "lat", "lng", "provider"]),
 		);
 
 		const collectionColumnNames = db
@@ -225,11 +401,387 @@ describe("database init", () => {
 				"created_at",
 			]),
 		);
+		expect(
+			db
+				.prepare(
+					"select name from sqlite_master where type = 'table' and name in ('x_lists', 'x_list_members') order by name",
+				)
+				.all(),
+		).toEqual([{ name: "x_list_members" }, { name: "x_lists" }]);
+		expect(
+			db
+				.prepare("pragma table_info(tweet_sources)")
+				.all()
+				.map((column) => (column as { name: string }).name),
+		).toEqual(["tweet_id", "source", "source_url", "observed_at"]);
 
 		const busyTimeout = db.pragma("busy_timeout", {
 			simple: true,
 		}) as number;
-		expect(busyTimeout).toBe(5000);
+		expect(busyTimeout).toBe(SQLITE_BUSY_TIMEOUT_MS);
+		expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+		expect(
+			db
+				.prepare(
+					"select name from sqlite_master where type = 'table' and name in ('fxtwitter_fetches', 'fxtwitter_observations') order by name",
+				)
+				.all(),
+		).toEqual([
+			{ name: "fxtwitter_fetches" },
+			{ name: "fxtwitter_observations" },
+		]);
+		expect(db.pragma("user_version", { simple: true })).toBe(14);
+	});
+
+	it("adds revision edges without rewriting v6 revision rows", () => {
+		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-"));
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const db = getNativeDb({ seedDemoData: false });
+		db.exec(`
+			insert into tweet_revisions (
+				root_tweet_id, revision_id, revision_index, payload_json, source, observed_at
+			) values
+				('legacy-root', 'legacy-root', 0, null, 'migration', '2026-01-01T00:00:00.000Z'),
+				('legacy-root', 'legacy-left', 1, null, 'migration', '2026-01-02T00:00:00.000Z'),
+				('legacy-root', 'legacy-right', 1, null, 'migration', '2026-01-02T00:00:00.000Z'),
+				('legacy-root', 'legacy-final', 2, null, 'migration', '2026-01-03T00:00:00.000Z');
+			drop table tweet_revision_edges;
+			pragma user_version = 6;
+		`);
+		resetDatabaseForTests();
+
+		const migrated = getNativeDb({ seedDemoData: false });
+		expect(migrated.pragma("user_version", { simple: true })).toBe(14);
+		expect(
+			migrated
+				.prepare(
+					"select revision_id, revision_index from tweet_revisions where root_tweet_id = 'legacy-root' order by revision_index, revision_id",
+				)
+				.all(),
+		).toEqual([
+			{ revision_id: "legacy-root", revision_index: 0 },
+			{ revision_id: "legacy-left", revision_index: 1 },
+			{ revision_id: "legacy-right", revision_index: 1 },
+			{ revision_id: "legacy-final", revision_index: 2 },
+		]);
+		expect(
+			migrated
+				.prepare(
+					"select older_revision_id, newer_revision_id from tweet_revision_edges order by older_revision_id, newer_revision_id",
+				)
+				.all(),
+		).toEqual([
+			{ older_revision_id: "legacy-left", newer_revision_id: "legacy-final" },
+			{ older_revision_id: "legacy-root", newer_revision_id: "legacy-left" },
+			{ older_revision_id: "legacy-root", newer_revision_id: "legacy-right" },
+		]);
+	});
+
+	it("does not request a write lock for completed startup backfills", async () => {
+		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-lock-"));
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		getNativeDb();
+		resetDatabaseForTests();
+
+		const dbPath = path.join(tempDir, "birdclaw.sqlite");
+		const holder = spawnWriteLockHolder(dbPath, 1500);
+		await waitForOutput(holder, "locked");
+
+		const startedAt = Date.now();
+		try {
+			const reopened = getNativeDb({ seedDemoData: false });
+			expect(Date.now() - startedAt).toBeLessThan(900);
+			expect(reopened.pragma("foreign_keys", { simple: true })).toBe(1);
+			expect(reopened.pragma("busy_timeout", { simple: true })).toBe(
+				SQLITE_BUSY_TIMEOUT_MS,
+			);
+		} finally {
+			await stopChild(holder);
+		}
+	});
+
+	it("uses independent query-only connections for reads", () => {
+		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-read-"));
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const writer = getNativeDb({ seedDemoData: false });
+		writer.exec("create table read_probe (value text)");
+		writer.prepare("insert into read_probe (value) values ('committed')").run();
+		const reader = getReadDb({ seedDemoData: false });
+
+		writer.exec("begin immediate");
+		try {
+			writer.prepare("insert into read_probe (value) values ('pending')").run();
+			expect(
+				reader.prepare("select value from read_probe order by value").all(),
+			).toEqual([{ value: "committed" }]);
+			expect(() =>
+				reader
+					.prepare("insert into read_probe (value) values ('blocked')")
+					.run(),
+			).toThrow(/read.?only|write/i);
+		} finally {
+			writer.exec("rollback");
+		}
+	});
+
+	it("refreshes managed readers after a bulk write without closing the writer", () => {
+		const tempDir = mkdtempSync(path.join(os.tmpdir(), "birdclaw-db-refresh-"));
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const writer = getNativeDb({ seedDemoData: false });
+		writer.exec("create table refresh_probe (value text)");
+		const firstReader = getReadDb({ seedDemoData: false });
+		const secondReader = getReadDb({ seedDemoData: false });
+		const closeSpy = vi.spyOn(NativeSqliteDatabase.prototype, "close");
+
+		writer.prepare("insert into refresh_probe (value) values ('ready')").run();
+		expect(refreshReadDatabasePoolAfterBulkWrite(writer)).toBe(true);
+		expect(closeSpy).toHaveBeenCalledTimes(2);
+		expect(new Set(closeSpy.mock.instances)).toEqual(
+			new Set([firstReader, secondReader]),
+		);
+		expect(writer.prepare("select value from refresh_probe").get()).toEqual({
+			value: "ready",
+		});
+
+		const refreshedReader = getReadDb({ seedDemoData: false });
+		expect(refreshedReader === firstReader).toBe(false);
+		expect(refreshedReader === secondReader).toBe(false);
+		expect(refreshedReader.pragma("query_only", { simple: true })).toBe(1);
+		expect(
+			refreshedReader.prepare("select value from refresh_probe").get(),
+		).toEqual({ value: "ready" });
+	});
+
+	it("ignores reader refresh for an unmanaged writer", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-refresh-other-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		getNativeDb({ seedDemoData: false });
+		const reader = getReadDb({ seedDemoData: false });
+		const other = new NativeSqliteDatabase(path.join(tempDir, "other.sqlite"));
+		try {
+			expect(refreshReadDatabasePoolAfterBulkWrite(other)).toBe(false);
+			expect(reader.pragma("query_only", { simple: true })).toBe(1);
+		} finally {
+			other.close();
+		}
+	});
+
+	it("keeps imports successful when the passive checkpoint is unavailable", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-refresh-checkpoint-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const writer = getNativeDb({ seedDemoData: false });
+		getReadDb({ seedDemoData: false });
+		const originalExec = writer.exec.bind(writer);
+		const execSpy = vi.spyOn(writer, "exec").mockImplementation((sql) => {
+			if (sql.includes("wal_checkpoint")) throw new Error("checkpoint busy");
+			return originalExec(sql);
+		});
+
+		expect(refreshReadDatabasePoolAfterBulkWrite(writer)).toBe(true);
+		expect(execSpy).toHaveBeenCalledWith("pragma wal_checkpoint(passive)");
+		expect(getReadDb().pragma("query_only", { simple: true })).toBe(1);
+	});
+
+	it("opens strict readers without initialization and rejects writes", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-strict-read-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const writer = getNativeDb({ seedDemoData: false });
+		writer.exec("create table strict_read_probe (value text)");
+		writer
+			.prepare("insert into strict_read_probe (value) values ('committed')")
+			.run();
+		resetDatabaseForTests();
+
+		const reader = getStrictReadDb();
+		expect(reader.prepare("select value from strict_read_probe").all()).toEqual(
+			[{ value: "committed" }],
+		);
+		expect(reader.pragma("query_only", { simple: true })).toBe(1);
+		expect(() =>
+			reader
+				.prepare("insert into strict_read_probe (value) values ('blocked')")
+				.run(),
+		).toThrow(/read.?only|write/i);
+		expect(() =>
+			reader.exec("create table strict_ddl_probe (value text)"),
+		).toThrow(/read.?only|write/i);
+	});
+
+	it("preserves v9 snapshots until writable upgrade adds indexes and Note Tweet storage", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-v9-indexes-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+		const db = getNativeDb({ seedDemoData: false });
+		db.exec(`
+      insert into follow_snapshot_members values ('fixture','profile_user_42','incorrect',0);
+      insert into follow_snapshot_members values ('fixture','profile_user_43','43',1);
+      drop index idx_follow_snapshot_members_profile;
+      drop index idx_follow_events_profile;
+      drop index idx_x_lists_owner_profile;
+      alter table tweets drop column note_tweet_json;
+      pragma user_version=9;
+    `);
+		resetDatabaseForTests();
+		const filename = path.join(tempDir, "birdclaw.sqlite");
+		const before = readFileSync(filename);
+		expect(() => getStrictReadDb()).toThrow(
+			/schema 9 is not ready for version 14/,
+		);
+		resetDatabaseForTests();
+		expect(readFileSync(filename)).toEqual(before);
+		const upgraded = getNativeDb({ seedDemoData: false });
+		expect(upgraded.pragma("user_version", { simple: true })).toBe(14);
+		for (const [table, column, index] of [
+			[
+				"follow_snapshot_members",
+				"profile_id",
+				"idx_follow_snapshot_members_profile",
+			],
+			["follow_events", "profile_id", "idx_follow_events_profile"],
+			["x_lists", "owner_profile_id", "idx_x_lists_owner_profile"],
+		]) {
+			const plan = upgraded
+				.prepare(`explain query plan select * from ${table} where ${column}=?`)
+				.all("profile_user_42");
+			expect(JSON.stringify(plan)).toContain(`USING INDEX ${index}`);
+		}
+		upsertProfileFromXUser(upgraded, {
+			id: "42",
+			username: "fixture",
+			name: "Fixture",
+		});
+		expect(
+			upgraded
+				.prepare(
+					"select profile_id,external_user_id from follow_snapshot_members order by profile_id",
+				)
+				.all(),
+		).toEqual([
+			{ profile_id: "profile_user_42", external_user_id: "42" },
+			{ profile_id: "profile_user_43", external_user_id: "43" },
+		]);
+	});
+
+	it.each([
+		{ kind: "stale", version: 4 },
+		{ kind: "future", version: 15 },
+	])(
+		"rejects a $kind schema and closes its provisional reader",
+		({ version }) => {
+			const tempDir = mkdtempSync(
+				path.join(os.tmpdir(), "birdclaw-db-strict-schema-"),
+			);
+			tempDirs.push(tempDir);
+			process.env.BIRDCLAW_HOME = tempDir;
+
+			getNativeDb({ seedDemoData: false });
+			resetDatabaseForTests();
+			const schemaDb = new NativeSqliteDatabase(
+				path.join(tempDir, "birdclaw.sqlite"),
+			);
+			schemaDb.pragma(`user_version = ${String(version)}`);
+			schemaDb.close();
+
+			const closeSpy = vi.spyOn(NativeSqliteDatabase.prototype, "close");
+			expect(() => getStrictReadDb()).toThrow(
+				new RegExp(`schema ${String(version)} is not ready`),
+			);
+			expect(closeSpy).toHaveBeenCalledTimes(1);
+		},
+	);
+
+	it("validates the schema before reusing a general read pool", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-strict-reuse-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		const writer = getNativeDb({ seedDemoData: false });
+		getReadDb({ seedDemoData: false });
+		writer.pragma("user_version = 15");
+
+		expect(() => getStrictReadDb()).toThrow(
+			/schema 15 is not ready for version 14/,
+		);
+	});
+
+	it("closes a read connection when its setup pragmas fail", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-read-pragma-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		getNativeDb({ seedDemoData: false });
+		resetDatabaseForTests();
+
+		const closeSpy = vi.spyOn(NativeSqliteDatabase.prototype, "close");
+		const execSpy = vi
+			.spyOn(NativeSqliteDatabase.prototype, "exec")
+			.mockImplementationOnce(() => {
+				throw new Error("read pragma failed");
+			});
+
+		expect(() => getStrictReadDb()).toThrow("read pragma failed");
+		expect(closeSpy).toHaveBeenCalledTimes(1);
+		expect(closeSpy.mock.instances[0]).toBe(execSpy.mock.instances[0]);
+	});
+
+	it("closes both provisional readers when the second pool open fails", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-db-read-pool-"),
+		);
+		tempDirs.push(tempDir);
+		process.env.BIRDCLAW_HOME = tempDir;
+
+		getNativeDb({ seedDemoData: false });
+		resetDatabaseForTests();
+
+		const originalExec = NativeSqliteDatabase.prototype.exec;
+		const closeSpy = vi.spyOn(NativeSqliteDatabase.prototype, "close");
+		let readSetupCalls = 0;
+		const execSpy = vi
+			.spyOn(NativeSqliteDatabase.prototype, "exec")
+			.mockImplementation(function (this: NativeSqliteDatabase, sql) {
+				if (sql.includes("pragma query_only")) {
+					readSetupCalls += 1;
+					if (readSetupCalls === 2) {
+						throw new Error("second read open failed");
+					}
+				}
+				return originalExec.call(this, sql);
+			});
+
+		expect(() => getStrictReadDb()).toThrow("second read open failed");
+		expect(closeSpy).toHaveBeenCalledTimes(2);
+		expect(new Set(closeSpy.mock.instances).size).toBe(2);
+
+		execSpy.mockRestore();
+		closeSpy.mockRestore();
+		expect(getStrictReadDb().pragma("query_only", { simple: true })).toBe(1);
 	});
 });
 
@@ -238,9 +790,49 @@ describe("native sqlite compatibility wrapper", () => {
 		const db = new NativeSqliteDatabase(":memory:");
 
 		try {
-			expect(db.pragma("busy_timeout", { simple: true })).toBe(5000);
+			expect(db.pragma("busy_timeout", { simple: true })).toBe(
+				SQLITE_BUSY_TIMEOUT_MS,
+			);
 		} finally {
 			db.close();
+		}
+	});
+
+	it("waits for the writer slot before a transaction reads and writes", async () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-sqlite-lock-"),
+		);
+		tempDirs.push(tempDir);
+		const dbPath = path.join(tempDir, "database.sqlite");
+		const setupDb = new NativeSqliteDatabase(dbPath);
+		setupDb.exec(`
+      pragma journal_mode = wal;
+      create table sync_cache (
+        cache_key text primary key,
+        value_json text not null,
+        updated_at text not null
+      );
+      create table events (name text);
+    `);
+		setupDb.close();
+
+		const holder = spawnWriteLockHolder(dbPath, 500);
+		await waitForOutput(holder, "locked");
+		const contender = new NativeSqliteDatabase(dbPath, { timeout: 2000 });
+		const startedAt = Date.now();
+
+		try {
+			contender.transaction(() => {
+				contender.prepare("select count(*) from events").get();
+				contender.prepare("insert into events (name) values (?)").run("waited");
+			})();
+			expect(Date.now() - startedAt).toBeGreaterThanOrEqual(250);
+			expect(contender.prepare("select name from events").all()).toEqual([
+				{ name: "waited" },
+			]);
+		} finally {
+			contender.close();
+			await stopChild(holder);
 		}
 	});
 
@@ -274,6 +866,34 @@ describe("native sqlite compatibility wrapper", () => {
 		expect(() => db.close()).not.toThrow();
 	});
 
+	it("keeps dangerous column names as own data and rows independent", () => {
+		const db = new NativeSqliteDatabase(":memory:");
+		const statement = db.prepare(
+			'select ? as "__proto__", ? as "constructor", ? as data',
+		);
+		const first = statement.get(
+			"literal",
+			"value",
+			Buffer.from([1, 2, 3]),
+		) as Record<string, unknown>;
+		expect(Object.getPrototypeOf(first)).toBe(Object.prototype);
+		expect(Object.hasOwn(first, "__proto__")).toBe(true);
+		expect(first.__proto__).toBe("literal");
+		expect(first.constructor).toBe("value");
+		expect(first.data).toEqual(Buffer.from([1, 2, 3]));
+		first.__proto__ = "changed";
+		const second = statement.all(
+			"fresh",
+			"other",
+			Buffer.from([4]),
+		)[0] as Record<string, unknown>;
+		expect(second.__proto__).toBe("fresh");
+		expect(Object.getPrototypeOf(second)).toBe(Object.prototype);
+		expect(second.data).toEqual(Buffer.from([4]));
+		expect(first.__proto__).toBe("changed");
+		db.close();
+	});
+
 	it("commits, rolls back, and nests transactions with savepoints", () => {
 		const db = new NativeSqliteDatabase(":memory:");
 		db.exec("create table events (name text)");
@@ -304,5 +924,51 @@ describe("native sqlite compatibility wrapper", () => {
 			.all() as Array<{ name: string }>;
 		expect(names).toEqual([{ name: "committed" }]);
 		db.close();
+	});
+
+	it("holds one WAL snapshot in a deferred read transaction", () => {
+		const tempDir = mkdtempSync(
+			path.join(os.tmpdir(), "birdclaw-sqlite-read-tx-"),
+		);
+		tempDirs.push(tempDir);
+		const dbPath = path.join(tempDir, "database.sqlite");
+		const writer = new NativeSqliteDatabase(dbPath);
+		writer.exec(`
+			pragma journal_mode = wal;
+			create table events (name text);
+			insert into events (name) values ('first');
+		`);
+
+		const reader = new NativeSqliteDatabase(dbPath, { readonly: true });
+		reader.exec("pragma query_only = on");
+
+		try {
+			const counts = reader.readTransaction(() => {
+				const before = reader
+					.prepare("select count(*) as count from events")
+					.get() as { count: number };
+				writer.prepare("insert into events (name) values ('second')").run();
+				const afterWrite = reader
+					.prepare("select count(*) as count from events")
+					.get() as { count: number };
+				return [before.count, afterWrite.count];
+			})();
+
+			expect(counts).toEqual([1, 1]);
+			expect(
+				reader.prepare("select count(*) as count from events").get(),
+			).toEqual({ count: 2 });
+			expect(() =>
+				reader.readTransaction(() => {
+					throw new Error("read failed");
+				})(),
+			).toThrow("read failed");
+			expect(
+				reader.prepare("select count(*) as count from events").get(),
+			).toEqual({ count: 2 });
+		} finally {
+			reader.close();
+			writer.close();
+		}
 	});
 });

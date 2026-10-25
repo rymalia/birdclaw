@@ -1,19 +1,15 @@
-import {
-	cleanup,
-	fireEvent,
-	render,
-	screen,
-	waitFor,
-} from "@testing-library/react";
-import { Effect } from "effect";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+	conversationQueryOptions,
 	ConversationSurfaceScope,
-	loadConversationEffect,
-	resetConversationSurface,
 	useConversationSurface,
 } from "./conversation-surface";
 import type { EmbeddedTweet } from "./types";
+import {
+	createTestQueryClient,
+	renderWithQueryClient as render,
+} from "../test/render";
 
 interface ConversationResponse {
 	json: () => Promise<{ items: EmbeddedTweet[]; ok: true }>;
@@ -60,6 +56,9 @@ function Probe({
 			<button onClick={surface.toggle} type="button">
 				toggle {tweetId}
 			</button>
+			<button onClick={surface.closeAny} type="button">
+				close {tweetId}
+			</button>
 		</div>
 	);
 }
@@ -67,7 +66,6 @@ function Probe({
 describe("conversation surface", () => {
 	afterEach(() => {
 		cleanup();
-		resetConversationSurface();
 		vi.unstubAllGlobals();
 	});
 
@@ -153,24 +151,62 @@ describe("conversation surface", () => {
 		await waitFor(() => {
 			expect(screen.getByTestId("row_a-status")).toHaveTextContent("ready");
 		});
-		expect(screen.getByTestId("row_b-status")).toHaveTextContent("idle");
+		expect(screen.getByTestId("row_b-status")).toHaveTextContent("ready");
 	});
 
-	it("exposes conversation loading as a lazy Effect program", async () => {
+	it("exposes a lazy React Query definition", async () => {
 		const fetchMock = vi.fn().mockResolvedValue({
 			ok: true,
 			json: async () => ({ items: [tweet], ok: true }),
 		});
 		vi.stubGlobal("fetch", fetchMock);
 
-		const effect = loadConversationEffect("tweet_1");
+		const options = conversationQueryOptions("tweet_1");
+		const queryClient = createTestQueryClient();
 
 		expect(fetchMock).not.toHaveBeenCalled();
-		await expect(Effect.runPromise(effect)).resolves.toBeUndefined();
+		await expect(queryClient.fetchQuery(options)).resolves.toEqual({
+			ok: true,
+			anchorId: "",
+			items: [tweet],
+			truncated: false,
+		});
 		expect(fetchMock).toHaveBeenCalledWith("/api/conversation?tweetId=tweet_1");
 	});
 
-	it("stores load errors and ignores results after reset", async () => {
+	it("dismisses only its own scope and supports standalone cards", () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue({
+				ok: true,
+				json: async () => ({ ok: true, items: [tweet] }),
+			}),
+		);
+		render(
+			<>
+				<ConversationSurfaceScope>
+					<Probe tweetId="row_a" />
+					<Probe tweetId="row_b" />
+				</ConversationSurfaceScope>
+				<ConversationSurfaceScope>
+					<Probe tweetId="other_scope" />
+				</ConversationSurfaceScope>
+				<Probe tweetId="standalone" />
+			</>,
+		);
+		for (const id of ["row_a", "other_scope", "standalone"]) {
+			fireEvent.click(screen.getByRole("button", { name: `toggle ${id}` }));
+		}
+		fireEvent.click(screen.getByRole("button", { name: "close row_b" }));
+		fireEvent.click(screen.getByRole("button", { name: "close row_b" }));
+		expect(screen.getByTestId("row_a-open")).toHaveTextContent("closed");
+		expect(screen.getByTestId("other_scope-open")).toHaveTextContent("open");
+		expect(screen.getByTestId("standalone-open")).toHaveTextContent("open");
+		fireEvent.click(screen.getByRole("button", { name: "close standalone" }));
+		expect(screen.getByTestId("standalone-open")).toHaveTextContent("closed");
+	});
+
+	it("stores load errors and retries failed prefetches", async () => {
 		let resolveStale!: (value: ConversationResponse) => void;
 		const staleResponse = new Promise<ConversationResponse>((resolve) => {
 			resolveStale = resolve;
@@ -199,15 +235,18 @@ describe("conversation surface", () => {
 		);
 
 		fireEvent.click(screen.getByRole("button", { name: "prefetch tweet_404" }));
-		expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("loading");
-		resetConversationSurface();
+		await waitFor(() => {
+			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent(
+				"loading",
+			);
+		});
 		resolveStale({
 			ok: true,
 			json: async () => ({ items: [tweet], ok: true }),
 		});
 
 		await waitFor(() => {
-			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("idle");
+			expect(screen.getByTestId("tweet_404-status")).toHaveTextContent("ready");
 		});
 	});
 });

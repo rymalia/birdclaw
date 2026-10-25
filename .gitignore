@@ -1,5 +1,4 @@
 node_modules
-.pnpm-store
 .DS_Store
 dist
 dist-ssr
@@ -18,4 +17,7 @@ todos.json
 coverage
 playwright-report
 test-results
-.pnpm-store/
+.toolchains/
+
+# Reproducible application asset derivatives
+.generated/birdclaw-brand/

@@ -1,5 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { Effect } from "effect";
+import { webSyncJobSchema } from "#/lib/api-contracts";
 import {
 	jsonResponse,
 	requestJsonEffect,
@@ -72,7 +73,7 @@ export const Route = createFileRoute("/api/sync")({
 					);
 				}
 
-				return jsonResponse(job);
+				return jsonResponse(webSyncJobSchema.parse(job));
 			},
 			POST: ({ request }) =>
 				runRouteEffect(
@@ -97,7 +98,9 @@ export const Route = createFileRoute("/api/sync")({
 							parseAccountId(body.accountId),
 							parseSyncOptions(kind, body),
 						);
-						return jsonResponse(job, { status: job.inProgress ? 202 : 200 });
+						return jsonResponse(webSyncJobSchema.parse(job), {
+							status: job.inProgress ? 202 : 200,
+						});
 					}),
 				),
 		},

@@ -5,11 +5,21 @@ description: "birdclaw config files, env vars, transport precedence, and multi-a
 
 # Configuration
 
-birdclaw reads configuration from three layers, in this precedence:
+Archive reverse proxies must forward `/tweets/<tweet-id>` as well as the existing
+archive pages and `/api/conversation` to support post and reply permalinks.
 
-1. **CLI flags** — `--db`, `--profile`, `--config`, `--json`, `--plain`, etc.
-2. **Environment variables** — `BIRDCLAW_HOME`, `BIRDCLAW_DB`, `BIRDCLAW_PROFILE`, `BIRDCLAW_TRANSPORT`, `BIRDCLAW_LOG`, `NO_COLOR`.
-3. **Config files** — project-level `./.birdclawrc.json5`, then user-level `~/.birdclaw/config.json`.
+Database schema version 11 adds the optional Note Tweet marker column. Writable
+access migrates older databases automatically. Before serving an existing archive
+in read-only mode, prepare it with this build using `birdclaw init`; read-only
+access requires the current schema and never migrates the snapshot. Unknown
+future schema versions are rejected by read-only access. Portable backups remain
+at schema 8, as described in [Backup](backup.md#note-tweet-compatibility).
+
+birdclaw reads configuration from these layers:
+
+1. **Command flags** — for example `--account`, `--mode`, and `--transport`.
+2. **Environment variables** — global paths plus feature-specific overrides.
+3. **User config** — `~/.birdclaw/config.json`, or the file selected by `BIRDCLAW_CONFIG`.
 
 ## Storage root
 
@@ -40,6 +50,12 @@ The Playwright test home is `.playwright-home` in the repo, which is why CI neve
 
 ```json
 {
+	"accounts": {
+		"default": "steipete"
+	},
+	"transport": {
+		"preferred": "bird"
+	},
 	"actions": {
 		"transport": "auto"
 	},
@@ -56,17 +72,53 @@ The Playwright test home is `.playwright-home` in the repo, which is why CI neve
 }
 ```
 
+### `accounts.default`
+
+Set a Birdclaw account username (with or without `@`) or stored account ID. Commands with an `--account` option use this value when the flag is omitted. An explicit `--account` always wins.
+
+Selection is per operation. Birdclaw resolves the existing account row, routes xurl through that username for the command, then restores the process environment. It never creates an account, changes the database default, or binds a live credential to stored data.
+
+### `transport.preferred`
+
+Set `bird` or `xurl` to choose which eligible live transport auto mode tries first.
+Explicit `--mode`/`--transport` flags and feature-specific forced modes still win.
+Omit the preference to retain each operation's normal transport order.
+
+```bash
+birdclaw auth prefer bird
+birdclaw auth prefer xurl
+birdclaw auth prefer auto # remove the saved preference
+```
+
+The preference applies to live sync, web/account/bookmark refreshes, moderation,
+tweet and profile lookups, and unbounded live search. With a preference, auto
+search uses fallback instead of querying both transports. Digest refresh defaults
+to auto when a preference is configured; `BIRDCLAW_DIGEST_LIVE_MODE` and
+`--live-mode` remain explicit overrides. Local/cache-only reads stay local.
+
+Selection considers capability: mention `--resume`, `--since-id`, and
+`--start-time`, dated search, and xurl collection pagination tokens require xurl.
+Native `web` DM access remains available for requests. Non-default scheduled
+account jobs still require `--allow-bird-account` to permit Bird; live Bird
+collections verify the selected account against its cookie identity.
+
+Use `BIRDCLAW_PREFERRED_TRANSPORT=bird` or `xurl` for a process override. Invalid
+values fall back to the saved preference. Changing the preference selects a
+separate auto response cache; account and transport continuation cursors remain
+intact.
+
 ### `actions.transport`
 
-- `auto` — try `bird` first for block/unblock/mute, then fall back to `xurl`; xweb is not used automatically
+- `auto` — try `transport.preferred` first (Bird when unset), then fall back to the other verified transport
 - `bird` — force `bird`
-- `xurl` — force `xurl`; verifies through `bird status` before mutating SQLite
+- `xurl` — force `xurl`; verifies X's mutation-response boolean before mutating SQLite, without requiring bird
 
 Twitter still rejects pure OAuth2 block writes for many accounts, so `auto` is the safe default.
 
 ### `mentions.dataSource`
 
 - `birdclaw` — local cache only
+- `auto` — refresh through the preferred live transport, with fallback
 - `bird` — refresh through `bird mentions --json`, normalize, cache in SQLite
 - `xurl` — refresh through `xurl mentions`, cache the response shape
 
@@ -78,45 +130,93 @@ See [Backup](backup.md). When `autoSync` is enabled, read commands pull + merge 
 
 ## Environment variables
 
-| Variable                       | Purpose                                                                                                                                |
-| ------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `BIRDCLAW_HOME`                | Override the storage root (`~/.birdclaw` by default)                                                                                   |
-| `BIRDCLAW_DB`                  | Point at a custom SQLite file path                                                                                                     |
-| `BIRDCLAW_PROFILE`             | Pick a non-default profile/account                                                                                                     |
-| `BIRDCLAW_TRANSPORT`           | Force `auto`, `xurl`, `bird`, `official`, or `xweb` for one process                                                                    |
-| `BIRDCLAW_LOG`                 | Increase log verbosity                                                                                                                 |
-| `BIRDCLAW_ALLOWED_HOSTS`       | Comma-separated extra Vite dev-server hostnames for `birdclaw serve` behind a trusted reverse proxy                                    |
-| `BIRDCLAW_LOCAL_WEB`           | Internal `birdclaw serve` marker for direct local-only loopback web APIs; forwarded/proxied requests still require remote-token config |
-| `BIRDCLAW_WEB_TOKEN`           | Optional app-level token for remote web API access; send as `x-birdclaw-token` or `birdclaw_token`                                     |
-| `BIRDCLAW_ALLOW_REMOTE_WEB`    | Set to `1` to allow remote access through a trusted private proxy                                                                      |
-| `BIRDCLAW_DISABLE_LIVE_WRITES` | Set to `1` to block any live mutation (used by tests and CI)                                                                           |
-| `BIRDCLAW_BACKUP_AUTO_SYNC`    | Set to `0` to disable auto-sync for one process                                                                                        |
-| `NO_COLOR`                     | Disable ANSI color in human output                                                                                                     |
-| `OPENAI_API_KEY`               | Enable inbox scoring and low-signal filtering                                                                                          |
+| Variable                       | Purpose                                                                                                                                              |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BIRDCLAW_HOME`                | Override the storage root (`~/.birdclaw` by default)                                                                                                 |
+| `AUTH_TOKEN`, `CT0`            | Optional X session cookies for native DM request access (`--mode web`); store them in a protected environment, never command arguments               |
+| `BIRDCLAW_CONFIG`              | Read and write config at a non-default path                                                                                                          |
+| `BIRDCLAW_PREFERRED_TRANSPORT` | Override the global auto transport preference with `bird` or `xurl` |
+| `BIRDCLAW_ACTIONS_TRANSPORT`   | Override moderation action transport with `auto`, `xurl`, or `bird` for one process                                                                  |
+| `BIRDCLAW_BIRD_COMMAND`        | Override the `bird` executable used by live Bird transports                                                                                          |
+| `BIRDCLAW_DIGEST_LIVE_MODE`    | Default `today`/`digest` home-timeline transport (`auto`, `bird`, or `xurl`); `auto` with a transport preference, otherwise `xurl`, when unset or invalid. CLI `--live-mode` and API `liveSyncMode` override it |
+| `BIRDCLAW_BASH_COMMAND`        | Override the Git Bash executable used for Bird subprocess redirection on Windows                                                                     |
+| `BIRDCLAW_HOST`                | Host interface for the production `birdclaw serve` listener; defaults to `127.0.0.1`                                                                 |
+| `BIRDCLAW_PORT`                | Port for the production `birdclaw serve` listener; defaults to `3000`                                                                                |
+| `BIRDCLAW_ALLOWED_HOSTS`       | Comma-separated extra hostnames accepted by the source `./scripts/bun-canary.sh run --bun dev` server                                                                             |
+| `BIRDCLAW_LOCAL_WEB`           | Internal local-server mode; production derives local access from the peer socket, while forwarded/proxied requests still require remote-token config |
+| `BIRDCLAW_WEB_TOKEN`           | Optional app-level token for remote web API access; send as `x-birdclaw-token` or `birdclaw_token`                                                   |
+| `BIRDCLAW_ALLOW_REMOTE_WEB`    | Set to `1` to allow remote access through a trusted private proxy                                                                                    |
+| `BIRDCLAW_MCP_TOKEN`           | Dedicated 32+ byte bearer secret required by the read-only `/mcp` endpoint                                                                            |
+| `BIRDCLAW_MCP_PUBLIC_URL`      | Exact public MCP URL, including `/mcp`; enables strict Host/Origin checks but does not terminate TLS                                                   |
+| `BIRDCLAW_DISABLE_LIVE_WRITES` | Set to `1` to block any live mutation (used by tests and CI)                                                                                         |
+| `BIRDCLAW_DEPLOYMENT_READ_ONLY` | Set to `1` before starting an archive server to allow only cached reads, disable mutations and automatic sync, and use the existing database without initialization or migrations |
+| `BIRDCLAW_BACKUP_AUTO_SYNC`    | Set to `0` to disable auto-sync for one process                                                                                                      |
+| `NO_COLOR`                     | Disable ANSI color in human output                                                                                                                   |
+| `OPENAI_API_KEY`               | Enable inbox scoring and low-signal filtering                                                                                                        |
+| `BIRDCLAW_OPENAI_MODEL`        | Override the model used for inbox scoring (default `gpt-5.2`)                                                                                        |
+| `BIRDCLAW_OPENAI_BASE_URL`     | Point at an OpenAI-compatible server (e.g. Ollama `http://localhost:11434/v1`); takes precedence over the compatible `OPENAI_BASE_URL` fallback; default `https://api.openai.com/v1` |
+| `BIRDCLAW_DEBUG`               | Set to any value to log OpenAI request URLs, statuses, and error bodies to stderr                                                                   |
 
 `BIRDCLAW_DISABLE_LIVE_WRITES=1` is set automatically in CI and Playwright runs so test code can never publish a tweet, send a DM, or block an account.
 
 ## Multi-account
 
-birdclaw was built around multiple accounts in a single shared database from day one. Pass `--account <id>` on commands that need to disambiguate (`blocks`, `mutes`, `mentions export`, `dms`), or set:
+birdclaw was built around multiple accounts in a single shared database from day one. Pass `--account <username>` (or a stored account ID) on commands that support account selection, including moderation, profile hydration, profile reply inspection, mentions, DMs, live sync, and scheduled jobs.
 
 ```bash
-export BIRDCLAW_PROFILE=acct_primary
+birdclaw sync timeline --account steipete --mode xurl
+birdclaw import hydrate-profiles --account @steipete
+birdclaw compose post --account acct_primary "Ship it."
 ```
+
+For a recurring choice, set `accounts.default` in `config.json`. Explicit flags remain reversible one-command overrides. xurl can select a named OAuth2 account; Bird has one active cookie identity, so Bird-backed operations verify that identity matches the selected Birdclaw account before reading or writing.
 
 Per-account state — cursors, transport preferences, last-sync watermarks, OpenAI score caches — lives inside the same `birdclaw.sqlite`. There is no per-account directory tree.
 
-## Transport precedence
+## Transport selection
 
-1. **archive** — local archive zip / extracted folder (read-only)
-2. **xurl** — official-API live reads/writes
-3. **bird** — cookie-backed reads/writes (DMs, mentions, block fallback)
-4. **official** — direct API client (planned)
-5. **xweb** — experimental low-level web cookie session; not used by moderation `auto` writes
-
-`auto` mode walks this list in order. Force one transport for one command with `--mode <kind>` on `sync` / `mentions export`, or `--transport <kind>` on `ban` / `unban` / `mute` / `unmute`.
+`transport.preferred` supplies the global auto order; commands retain their
+surface-specific defaults when it is absent. Explicit flags and feature-specific
+forced settings take precedence. Capability and account restrictions still apply.
+Moderation resolves `--transport`, then `BIRDCLAW_ACTIONS_TRANSPORT`, then
+`actions.transport`, then `auto`. `birdclaw auth use <auto|bird|xurl>` changes only
+that moderation setting; `birdclaw auth prefer <bird|xurl|auto>` changes the global
+preference.
 
 ## Disabling live writes
+
+### Read-only archive deployments
+
+To serve an existing archive without changing it, set
+`BIRDCLAW_DEPLOYMENT_READ_ONLY=1` before starting the server:
+
+```bash
+BIRDCLAW_DEPLOYMENT_READ_ONLY=1 birdclaw serve
+```
+
+Initialize/import the database with the same Birdclaw version before starting
+this mode. The server requires an existing, current schema and never initializes,
+seeds, or migrates it. Database reads use strict query-only connections. Automatic
+backup updates, sync jobs, live transport subprocesses, configuration writes, and web mutation
+requests are disabled. Cached tweets, threads, DMs, saved posts, links, blocklists,
+and network maps remain readable. Missing avatar, link-preview, and geocoding
+cache entries are left missing instead of being fetched or saved. Read-only status
+counts are cached per database connection and refreshed when SQLite reports an
+external data commit; normal writable deployments continue to read fresh counts.
+
+The status API includes `readOnly: true`, and the web app hides writing controls,
+automatic sync timers, and pages that require live fetching or generation. The
+existing read-only MCP endpoint remains available when separately configured.
+Without this environment variable, normal behavior is unchanged.
+
+This mode does not authenticate visitors, isolate accounts, or change the
+permissions of X credentials. Keep the existing web/MCP authentication configured.
+If the hosting environment also permits shell access or runs other processes,
+use appropriate operating-system isolation and read-scoped credentials there.
+An independent updater should prepare a new archive outside the read-only server
+and restart the server against the updated database.
+
+### Dry runs
 
 For dry runs, demos, or development against a fresh archive:
 
@@ -127,3 +227,7 @@ birdclaw blocks add @someone --account acct_primary
 ```
 
 Both commands record the intent locally where applicable but skip every transport call. Tests and CI rely on this exact mechanism.
+
+### CLI timing diagnostics
+
+Set `BIRDCLAW_CLI_METRICS=1` to write one `BIRDCLAW_CLI_METRICS ` JSON line to stderr when a CLI command finishes. Normal stdout and exit behavior remain unchanged. The versioned summary contains elapsed milliseconds, user/system CPU milliseconds for the CLI process (excluding child processes), SQL call count, and SQL milliseconds. Database timing includes prepared operations and exec/transaction batches; counts refer to calls rather than individual statements inside a batch. The summary contains no SQL text, bound values, paths, tokens, or archive contents. Missing or closed diagnostic output does not fail the command.

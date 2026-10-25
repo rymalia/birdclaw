@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Effect } from "effect";
+import { processOpenAIResponseSseChunk } from "./openai-response-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resetBirdclawPathsForTests } from "./config";
 import { getNativeDb, resetDatabaseForTests } from "./db";
@@ -69,6 +70,130 @@ describe("search discussion", () => {
 		expect(context.tweets.map((tweet) => tweet.id)).toContain("tweet_001");
 		expect(context.dms.map((dm) => dm.id)).toContain("dm_001");
 		expect(context.hash).toHaveLength(40);
+	});
+
+	it("keeps tweet media available for discussion citation popovers", () => {
+		const context = collectSearchDiscussionContext({
+			query: "developer-platform",
+			limit: 20,
+		});
+
+		expect(context.tweets[0]?.media).toEqual([
+			expect.objectContaining({
+				type: "image",
+				altText: "Pricing survey chart",
+			}),
+		]);
+	});
+
+	it("keeps live search scoped to the search bucket", () => {
+		const context = collectSearchDiscussionContext({
+			query: "local-first",
+			source: "search",
+			limit: 20,
+		});
+
+		expect(context.counts.home).toBe(0);
+		expect(context.tweets.map((tweet) => tweet.id)).not.toContain("tweet_001");
+	});
+
+	it("uses live search tweet ids without sweeping local search FTS", () => {
+		getNativeDb();
+		const context = collectSearchDiscussionContext({
+			query: "local-first",
+			source: "search",
+			limit: 20,
+			liveSearch: {
+				ok: true,
+				source: "xurl",
+				accountId: "acct_primary",
+				query: "local-first",
+				count: 1,
+				pageCount: 1,
+				tweetIds: ["tweet_001"],
+			},
+		});
+
+		expect(context.counts.search).toBe(1);
+		expect(context.tweets.map((tweet) => tweet.id)).toEqual(["tweet_001"]);
+		expect(context.tweets[0]?.source).toBe("search");
+	});
+
+	it("does not fall back to stale local tweets for empty live searches", () => {
+		const context = collectSearchDiscussionContext({
+			query: "local-first",
+			source: "search",
+			limit: 20,
+			liveSearch: {
+				ok: true,
+				source: "xurl",
+				accountId: "acct_primary",
+				query: "local-first",
+				count: 0,
+				pageCount: 1,
+				tweetIds: [],
+			},
+		});
+
+		expect(context.counts.search).toBe(0);
+		expect(context.tweets).toEqual([]);
+	});
+
+	it("applies discussion filters to live search tweet ids", () => {
+		getNativeDb();
+		const context = collectSearchDiscussionContext({
+			query: "scope",
+			source: "search",
+			limit: 20,
+			originalsOnly: true,
+			liveSearch: {
+				ok: true,
+				source: "xurl",
+				accountId: "acct_primary",
+				query: "scope",
+				count: 1,
+				pageCount: 1,
+				tweetIds: ["tweet_002"],
+			},
+		});
+
+		expect(context.counts.search).toBe(0);
+		expect(context.tweets).toEqual([]);
+	});
+
+	it("keeps live search collection state scoped to the live account", () => {
+		const db = getNativeDb();
+		db.prepare(
+			`
+      insert or replace into tweet_collections (
+        account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+      ) values (?, ?, ?, ?, ?, ?, ?)
+      `,
+		).run(
+			"acct_primary",
+			"tweet_002",
+			"bookmarks",
+			"2026-01-01T00:00:00.000Z",
+			"test",
+			"{}",
+			"2026-01-01T00:00:00.000Z",
+		);
+		const context = collectSearchDiscussionContext({
+			query: "scope",
+			source: "search",
+			limit: 20,
+			liveSearch: {
+				ok: true,
+				source: "xurl",
+				accountId: "acct_primary",
+				query: "scope",
+				count: 1,
+				pageCount: 1,
+				tweetIds: ["tweet_002"],
+			},
+		});
+
+		expect(context.tweets[0]?.bookmarked).toBe(true);
 	});
 
 	it("changes the context hash when profile prompt context changes", () => {
@@ -350,7 +475,7 @@ describe("search discussion", () => {
 			jsonMode: false,
 		};
 
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			state,
 			sseFrame({
 				type: "response.output_text.delta",
@@ -358,7 +483,7 @@ describe("search discussion", () => {
 			}),
 			handlers,
 		);
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			state,
 			sseFrame({
 				type: "response.output_text.delta",
@@ -366,7 +491,7 @@ describe("search discussion", () => {
 			}),
 			handlers,
 		);
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			state,
 			sseFrame({
 				type: "response.completed",
@@ -374,8 +499,8 @@ describe("search discussion", () => {
 			}),
 			handlers,
 		);
-		__test__.processSseChunk(state, "data: {bad json}\n\n", handlers);
-		__test__.processSseChunk(state, "data: [DONE]\n\n", handlers);
+		processOpenAIResponseSseChunk(state, "data: {bad json}\n\n", handlers);
+		processOpenAIResponseSseChunk(state, "data: [DONE]\n\n", handlers);
 
 		expect(state.jsonMode).toBe(true);
 		expect(state.responseId).toBe("resp_123");
@@ -396,7 +521,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			failedState,
 			sseFrame({
 				type: "response.failed",
@@ -420,7 +545,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			errorState,
 			sseFrame({ type: "error", error: { message: "stream denied" } }),
 			{},
@@ -436,7 +561,7 @@ describe("search discussion", () => {
 			jsonMode: false,
 		};
 		const handlers = { onDelta: vi.fn(), onEvent: vi.fn() };
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			holdState,
 			sseFrame({ type: "response.output_text.delta", delta: "tiny" }),
 			handlers,
@@ -456,7 +581,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			failedWithMessage,
 			sseFrame({
 				type: "response.failed",
@@ -478,7 +603,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			failedDefault,
 			sseFrame({ type: "response.incomplete", response: {} }),
 			{},
@@ -497,7 +622,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			errorDefault,
 			sseFrame({ type: "response.error", error: "plain" }),
 			{},
@@ -510,7 +635,7 @@ describe("search discussion", () => {
 			pendingVisible: "",
 			jsonMode: false,
 		};
-		__test__.processSseChunk(
+		processOpenAIResponseSseChunk(
 			completedDefault,
 			sseFrame({ type: "response.completed", response: null }),
 			{},
@@ -518,14 +643,24 @@ describe("search discussion", () => {
 		expect(completedDefault).not.toHaveProperty("responseId");
 	});
 
-	it("falls back when the streamed JSON is malformed", () => {
-		const parsed = __test__.parseDiscussionFromHybridText(
-			collectSearchDiscussionContext({
-				query: "local-first",
-				limit: 20,
-			}),
-			"# Report\n\nOnly Markdown\n\n---\n{bad",
+	it("falls back when the streamed JSON is malformed", async () => {
+		vi.stubGlobal(
+			"fetch",
+			vi.fn().mockResolvedValue(
+				streamResponse(
+					sseFrame({
+						type: "response.output_text.delta",
+						delta: "# Report\n\nOnly Markdown\n\n---\n{bad",
+					}) + "data: [DONE]\n\n",
+				),
+			),
 		);
+		const parsed = await streamSearchDiscussion({
+			query: "local-first",
+			limit: 20,
+			mode: "local",
+			refresh: true,
+		});
 
 		expect(parsed.markdown).toContain("Only Markdown");
 		expect(parsed.discussion.title).toContain("local-first");

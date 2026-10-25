@@ -1,6 +1,20 @@
 import type { Database } from "./sqlite";
+import { refreshSearchRows } from "./search-index";
 
 const now = new Date("2026-03-08T12:00:00.000Z");
+
+export type DemoSeedResult =
+	| {
+			seeded: true;
+			counts: {
+				accounts: number;
+				profiles: number;
+				tweets: number;
+				conversations: number;
+				messages: number;
+			};
+	  }
+	| { seeded: false; reason: "database-not-empty" };
 
 function isoMinutesAgo(minutes: number) {
 	return new Date(now.getTime() - minutes * 60_000).toISOString();
@@ -22,80 +36,60 @@ function svgAvatarDataUrl(label: string, hue: number) {
 	return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
-export function seedDemoData(db: Database) {
-	const accountCount = db
-		.prepare("select count(*) as count from accounts")
-		.get() as {
-		count: number;
-	};
+function hasStoredContent(db: Database) {
+	const tables = db
+		.prepare(`
+			select name
+			from sqlite_master
+			where type = 'table'
+			  and name not like 'sqlite_%'
+			  and name not glob 'tweets_fts_*'
+			  and name not glob 'dm_fts_*'
+			  and name != 'network_map_revision'
+			order by name
+		`)
+		.all() as Array<{ name: string }>;
 
-	if (accountCount.count > 0) {
-		return;
+	for (const { name } of tables) {
+		if (!/^[a-z0-9_]+$/.test(name)) return true;
+		if (db.prepare(`select 1 from "${name}" limit 1`).get()) return true;
 	}
+	return false;
+}
+
+function insertDemoRows(
+	db: Database,
+	table: string,
+	rows: Record<string, unknown>[],
+) {
+	const first = rows[0];
+	if (!first) return;
+	const keys = Object.keys(first);
+	const columns = keys.map((key) =>
+		key.replace(/[A-Z]/g, (letter) => "_" + letter.toLowerCase()),
+	);
+	const insert = db.prepare(
+		`insert into ${table} (${columns.join(", ")}) values (${keys.map(() => "?").join(", ")})`,
+	);
+	for (const row of rows) insert.run(...keys.map((key) => row[key]));
+}
+
+export function seedDemoData(db: Database): DemoSeedResult {
 	const linkNow = new Date();
 	const linkMinutesAgo = (minutes: number) =>
 		new Date(linkNow.getTime() - minutes * 60_000).toISOString();
 
-	const insertAccount = db.prepare(`
-    insert into accounts (id, name, handle, external_user_id, transport, is_default, created_at)
-    values (@id, @name, @handle, @externalUserId, @transport, @isDefault, @createdAt)
-  `);
-
-	const insertProfile = db.prepare(`
-    insert into profiles (id, handle, display_name, bio, followers_count, following_count, avatar_hue, avatar_url, created_at)
-    values (@id, @handle, @displayName, @bio, @followersCount, @followingCount, @avatarHue, @avatarUrl, @createdAt)
-  `);
-
-	const insertTweet = db.prepare(`
-    insert into tweets (
-      id, account_id, author_profile_id, kind, text, created_at, is_replied,
-      reply_to_id, like_count, media_count, bookmarked, liked, entities_json, media_json, quoted_tweet_id
-    ) values (
-      @id, @accountId, @authorProfileId, @kind, @text, @createdAt, @isReplied,
-      @replyToId, @likeCount, @mediaCount, @bookmarked, @liked, @entitiesJson, @mediaJson, @quotedTweetId
-    )
-  `);
-
-	const insertConversation = db.prepare(`
-    insert into dm_conversations (
-      id, account_id, participant_profile_id, title, last_message_at, unread_count, needs_reply
-    ) values (
-      @id, @accountId, @participantProfileId, @title, @lastMessageAt, @unreadCount, @needsReply
-    )
-  `);
-
-	const insertMessage = db.prepare(`
-    insert into dm_messages (
-      id, conversation_id, sender_profile_id, text, created_at, direction, is_replied, media_count
-    ) values (
-      @id, @conversationId, @senderProfileId, @text, @createdAt, @direction, @isReplied, @mediaCount
-    )
-  `);
-
-	const insertTweetsFts = db.prepare(
-		"insert into tweets_fts (tweet_id, text) values (?, ?)",
-	);
-	const insertDmFts = db.prepare(
-		"insert into dm_fts (message_id, text) values (?, ?)",
-	);
-	const insertUrlExpansion = db.prepare(`
-    insert into url_expansions (
-      short_url, expanded_url, final_url, status, expanded_tweet_id,
-      expanded_handle, title, description, image_url, site_name, error, source, updated_at
-    ) values (
-      @shortUrl, @expandedUrl, @finalUrl, @status, @expandedTweetId,
-      @expandedHandle, @title, @description, @imageUrl, @siteName, @error, @source, @updatedAt
-    )
-  `);
-	const insertLinkOccurrence = db.prepare(`
-    insert into link_occurrences (
-      source_kind, source_id, source_position, short_url, account_id,
-      conversation_id, direction, created_at
-    ) values (
-      @sourceKind, @sourceId, @sourcePosition, @shortUrl, @accountId,
-      @conversationId, @direction, @createdAt
-    )
-  `);
+	const insertTweetEdge = db.prepare(`
+	  insert into tweet_account_edges (
+	    account_id, tweet_id, kind, first_seen_at, last_seen_at, seen_count,
+	    source, raw_json, updated_at
+	  ) values (?, ?, ?, ?, ?, 1, 'demo', '{}', ?)
+	`);
+	const insertTweetCollection = db.prepare(`
+	  insert into tweet_collections (
+	    account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
+	  ) values (?, ?, ?, ?, 'demo', '{}', ?)
+	`);
 
 	const accounts = [
 		{
@@ -125,10 +119,8 @@ export function seedDemoData(db: Database) {
 			displayName: "Peter Steinberger",
 			bio: "Builds native software, tooling, and sharp little systems.",
 			followersCount: 21450,
-			followingCount: 0,
 			avatarHue: 18,
 			avatarUrl: svgAvatarDataUrl("PS", 18),
-			createdAt: now.toISOString(),
 		},
 		{
 			id: "profile_sam",
@@ -136,10 +128,8 @@ export function seedDemoData(db: Database) {
 			displayName: "Sam Altman",
 			bio: "Working on AGI, energy, chips, and shipping the hard parts.",
 			followersCount: 3180000,
-			followingCount: 0,
 			avatarHue: 210,
 			avatarUrl: svgAvatarDataUrl("SA", 210),
-			createdAt: now.toISOString(),
 		},
 		{
 			id: "profile_des",
@@ -147,10 +137,8 @@ export function seedDemoData(db: Database) {
 			displayName: "Des Traynor",
 			bio: "Intercom co-founder. Product, writing, and oddly specific opinions.",
 			followersCount: 178000,
-			followingCount: 0,
 			avatarHue: 144,
 			avatarUrl: svgAvatarDataUrl("DT", 144),
-			createdAt: now.toISOString(),
 		},
 		{
 			id: "profile_amelia",
@@ -158,10 +146,8 @@ export function seedDemoData(db: Database) {
 			displayName: "Amelia N",
 			bio: "Design systems, prototypes, and good typography over noise.",
 			followersCount: 4200,
-			followingCount: 0,
 			avatarHue: 320,
 			avatarUrl: svgAvatarDataUrl("AN", 320),
-			createdAt: now.toISOString(),
 		},
 		{
 			id: "profile_ava",
@@ -169,10 +155,8 @@ export function seedDemoData(db: Database) {
 			displayName: "Ava Wires",
 			bio: "Reports on infrastructure, AI policy, and the business of software.",
 			followersCount: 632000,
-			followingCount: 0,
 			avatarHue: 262,
 			avatarUrl: svgAvatarDataUrl("AW", 262),
-			createdAt: now.toISOString(),
 		},
 		{
 			id: "profile_noah",
@@ -180,25 +164,19 @@ export function seedDemoData(db: Database) {
 			displayName: "Noah Builds",
 			bio: "Bootstrapped indie apps. Pragmatic, fast, allergic to dashboards.",
 			followersCount: 12600,
-			followingCount: 0,
 			avatarHue: 74,
 			avatarUrl: svgAvatarDataUrl("NB", 74),
-			createdAt: now.toISOString(),
 		},
-	];
+	].map((row) => ({ followingCount: 0, createdAt: now.toISOString(), ...row }));
 
 	const tweets = [
 		{
 			id: "tweet_001",
-			accountId: "acct_primary",
 			authorProfileId: "profile_sam",
 			kind: "home",
 			text: "We need more software that defaults to local-first, legible state, and repairable failure modes. https://t.co/local",
 			createdAt: linkMinutesAgo(18),
-			isReplied: 0,
-			replyToId: null,
 			likeCount: 1240,
-			mediaCount: 0,
 			bookmarked: 1,
 			liked: 1,
 			entitiesJson: JSON.stringify({
@@ -214,12 +192,9 @@ export function seedDemoData(db: Database) {
 					},
 				],
 			}),
-			mediaJson: "[]",
-			quotedTweetId: null,
 		},
 		{
 			id: "tweet_002",
-			accountId: "acct_primary",
 			authorProfileId: "profile_des",
 			kind: "home",
 			text: "@sam The best product teams spend more time pruning scope than adding it.",
@@ -227,8 +202,6 @@ export function seedDemoData(db: Database) {
 			isReplied: 1,
 			replyToId: "tweet_001",
 			likeCount: 382,
-			mediaCount: 0,
-			bookmarked: 0,
 			liked: 1,
 			entitiesJson: JSON.stringify({
 				mentions: [
@@ -240,22 +213,15 @@ export function seedDemoData(db: Database) {
 					},
 				],
 			}),
-			mediaJson: "[]",
-			quotedTweetId: null,
 		},
 		{
 			id: "tweet_003",
-			accountId: "acct_primary",
 			authorProfileId: "profile_ava",
 			kind: "home",
 			text: "New developer-platform pricing survey out today. Early signal: teams want fewer layers, not more. https://t.co/survey https://t.co/video",
 			createdAt: linkMinutesAgo(91),
-			isReplied: 0,
-			replyToId: null,
 			likeCount: 128,
 			mediaCount: 1,
-			bookmarked: 0,
-			liked: 0,
 			entitiesJson: JSON.stringify({
 				urls: [
 					{
@@ -289,21 +255,14 @@ export function seedDemoData(db: Database) {
 					thumbnailUrl: svgImageDataUrl("pricing map", 194),
 				},
 			]),
-			quotedTweetId: null,
 		},
 		{
 			id: "tweet_004",
-			accountId: "acct_primary",
 			authorProfileId: "profile_amelia",
 			kind: "mention",
 			text: "@steipete curious how you decide when a local tool deserves a real sync engine versus manual import/export.",
 			createdAt: isoMinutesAgo(12),
-			isReplied: 0,
-			replyToId: null,
 			likeCount: 14,
-			mediaCount: 0,
-			bookmarked: 0,
-			liked: 0,
 			entitiesJson: JSON.stringify({
 				mentions: [
 					{
@@ -314,22 +273,15 @@ export function seedDemoData(db: Database) {
 					},
 				],
 			}),
-			mediaJson: "[]",
-			quotedTweetId: null,
 		},
 		{
 			id: "tweet_005",
-			accountId: "acct_primary",
 			authorProfileId: "profile_noah",
 			kind: "mention",
 			text: "@steipete your archive-first note resonated. I still want a path for people with zero clean export data.",
 			createdAt: isoMinutesAgo(54),
 			isReplied: 1,
-			replyToId: null,
 			likeCount: 8,
-			mediaCount: 0,
-			bookmarked: 0,
-			liked: 0,
 			entitiesJson: JSON.stringify({
 				mentions: [
 					{
@@ -340,8 +292,6 @@ export function seedDemoData(db: Database) {
 					},
 				],
 			}),
-			mediaJson: "[]",
-			quotedTweetId: null,
 		},
 		{
 			id: "tweet_006",
@@ -350,10 +300,7 @@ export function seedDemoData(db: Database) {
 			kind: "home",
 			text: "Agents need retrieval surfaces with small, stable contracts. Big blobs are not a strategy.",
 			createdAt: isoMinutesAgo(77),
-			isReplied: 0,
-			replyToId: null,
 			likeCount: 912,
-			mediaCount: 0,
 			bookmarked: 1,
 			liked: 1,
 			entitiesJson: JSON.stringify({
@@ -369,10 +316,19 @@ export function seedDemoData(db: Database) {
 					},
 				],
 			}),
-			mediaJson: "[]",
 			quotedTweetId: "tweet_001",
 		},
-	];
+	].map((row) => ({
+		accountId: "acct_primary",
+		isReplied: 0,
+		replyToId: null,
+		mediaCount: 0,
+		bookmarked: 0,
+		liked: 0,
+		mediaJson: "[]",
+		quotedTweetId: null,
+		...row,
+	}));
 
 	const conversations = [
 		{
@@ -420,9 +376,6 @@ export function seedDemoData(db: Database) {
 			senderProfileId: "profile_sam",
 			text: "Can you send the local-first sync sketch? The inbox angle is strong.",
 			createdAt: isoMinutesAgo(8),
-			direction: "inbound",
-			isReplied: 0,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_002",
@@ -432,7 +385,6 @@ export function seedDemoData(db: Database) {
 			createdAt: isoMinutesAgo(27),
 			direction: "outbound",
 			isReplied: 1,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_003",
@@ -440,9 +392,7 @@ export function seedDemoData(db: Database) {
 			senderProfileId: "profile_des",
 			text: "The minimal UI direction feels right. People should read, not manage a cockpit.",
 			createdAt: isoMinutesAgo(65),
-			direction: "inbound",
 			isReplied: 1,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_004",
@@ -452,7 +402,6 @@ export function seedDemoData(db: Database) {
 			createdAt: isoMinutesAgo(58),
 			direction: "outbound",
 			isReplied: 1,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_005",
@@ -460,8 +409,6 @@ export function seedDemoData(db: Database) {
 			senderProfileId: "profile_amelia",
 			text: "I mocked a cleaner split-pane DM layout. Want me to send it over?",
 			createdAt: isoMinutesAgo(25),
-			direction: "inbound",
-			isReplied: 0,
 			mediaCount: 1,
 		},
 		{
@@ -470,9 +417,6 @@ export function seedDemoData(db: Database) {
 			senderProfileId: "profile_amelia",
 			text: "Also added a tiny context rail for bios and follower counts.",
 			createdAt: isoMinutesAgo(22),
-			direction: "inbound",
-			isReplied: 0,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_007",
@@ -480,9 +424,7 @@ export function seedDemoData(db: Database) {
 			senderProfileId: "profile_ava",
 			text: "If you have a public draft later, I would love to quote the agent-query angle.",
 			createdAt: isoMinutesAgo(130),
-			direction: "inbound",
 			isReplied: 1,
-			mediaCount: 0,
 		},
 		{
 			id: "msg_008",
@@ -492,9 +434,13 @@ export function seedDemoData(db: Database) {
 			createdAt: isoMinutesAgo(124),
 			direction: "outbound",
 			isReplied: 1,
-			mediaCount: 0,
 		},
-	];
+	].map((row) => ({
+		direction: "inbound",
+		isReplied: 0,
+		mediaCount: 0,
+		...row,
+	}));
 
 	const urlExpansions = [
 		{
@@ -546,68 +492,111 @@ export function seedDemoData(db: Database) {
 
 	const linkOccurrences = [
 		{
-			sourceKind: "tweet",
 			sourceId: "tweet_001",
 			sourcePosition: 0,
 			shortUrl: "https://t.co/local",
-			accountId: "acct_primary",
-			conversationId: null,
-			direction: null,
 			createdAt: linkMinutesAgo(18),
 		},
 		{
-			sourceKind: "tweet",
 			sourceId: "tweet_003",
 			sourcePosition: 0,
 			shortUrl: "https://t.co/survey",
-			accountId: "acct_primary",
-			conversationId: null,
-			direction: null,
 			createdAt: linkMinutesAgo(91),
 		},
 		{
-			sourceKind: "tweet",
 			sourceId: "tweet_003",
 			sourcePosition: 1,
 			shortUrl: "https://t.co/video",
-			accountId: "acct_primary",
-			conversationId: null,
-			direction: null,
 			createdAt: linkMinutesAgo(91),
 		},
-	];
+	].map((row) => ({
+		sourceKind: "tweet",
+		accountId: "acct_primary",
+		conversationId: null,
+		direction: null,
+		...row,
+	}));
 
-	const transaction = db.transaction(() => {
-		for (const account of accounts) {
-			insertAccount.run(account);
+	const transaction = db.transaction((): DemoSeedResult => {
+		if (hasStoredContent(db)) {
+			return { seeded: false, reason: "database-not-empty" };
 		}
 
-		for (const profile of profiles) {
-			insertProfile.run(profile);
-		}
+		insertDemoRows(db, "accounts", accounts);
 
+		insertDemoRows(db, "profiles", profiles);
+
+		insertDemoRows(
+			db,
+			"tweets",
+			tweets.map(
+				({
+					accountId: _account,
+					kind: _kind,
+					bookmarked: _bookmarked,
+					liked: _liked,
+					...row
+				}) => row,
+			),
+		);
+		refreshSearchRows(
+			db,
+			"tweet",
+			tweets.map(({ id }) => id),
+		);
 		for (const tweet of tweets) {
-			insertTweet.run(tweet);
-			insertTweetsFts.run(tweet.id, tweet.text);
+			insertTweetEdge.run(
+				tweet.accountId,
+				tweet.id,
+				tweet.kind,
+				tweet.createdAt,
+				tweet.createdAt,
+				tweet.createdAt,
+			);
+			if (tweet.bookmarked) {
+				insertTweetCollection.run(
+					tweet.accountId,
+					tweet.id,
+					"bookmarks",
+					tweet.createdAt,
+					tweet.createdAt,
+				);
+			}
+			if (tweet.liked) {
+				insertTweetCollection.run(
+					tweet.accountId,
+					tweet.id,
+					"likes",
+					tweet.createdAt,
+					tweet.createdAt,
+				);
+			}
 		}
 
-		for (const conversation of conversations) {
-			insertConversation.run(conversation);
-		}
+		insertDemoRows(db, "dm_conversations", conversations);
 
-		for (const message of messages) {
-			insertMessage.run(message);
-			insertDmFts.run(message.id, message.text);
-		}
+		insertDemoRows(db, "dm_messages", messages);
+		refreshSearchRows(
+			db,
+			"dm",
+			messages.map(({ id }) => id),
+		);
 
-		for (const expansion of urlExpansions) {
-			insertUrlExpansion.run(expansion);
-		}
+		insertDemoRows(db, "url_expansions", urlExpansions);
 
-		for (const occurrence of linkOccurrences) {
-			insertLinkOccurrence.run(occurrence);
-		}
+		insertDemoRows(db, "link_occurrences", linkOccurrences);
+
+		return {
+			seeded: true,
+			counts: {
+				accounts: accounts.length,
+				profiles: profiles.length,
+				tweets: tweets.length,
+				conversations: conversations.length,
+				messages: messages.length,
+			},
+		};
 	});
 
-	transaction();
+	return transaction();
 }

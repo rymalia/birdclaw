@@ -7,6 +7,8 @@ description: "FTS5 search across archived and live-synced tweets and DMs."
 
 birdclaw indexes every tweet and DM in SQLite FTS5. Search runs locally, returns instantly, and works offline.
 
+Local `search tweets`, `search dms`, and `whois` require `--limit` to resolve to a non-negative safe integer. Zero and numeric spellings such as `+1`, `1e3`, and `0x10` remain accepted. Invalid values return a structured error and exit 1 before archive reads. `search links` retains its existing limit coercion.
+
 ## Search tweets
 
 ```bash
@@ -45,17 +47,31 @@ birdclaw search tweets --bookmarked --hide-low-quality --since 2024-01-01 --limi
 
 `--liked` and `--bookmarked` work uniformly across archive imports and live syncs because both feed the same canonical `tweets` table plus a collection edge.
 
+### List membership filters
+
+```bash
+birdclaw search tweets "sqlite" --list Builders --limit 50 --json
+birdclaw search tweets "local-first" --list-id 1234567890 --json
+```
+
+`--list` matches a cached List name case-insensitively; ambiguous names fail and print the candidate ids. `--list-id` is exact. Both filters are offline: run `birdclaw sync lists` explicitly to refresh membership. `partial` or `inferred` membership remains searchable, but it may omit accounts not reached by the bounded sync.
+
 ### Author filter
 
 ```bash
-birdclaw search tweets "AI" --author @borderline_handle --limit 20 --json
+birdclaw search tweets "AI" --author @sam --limit 20 --json
+birdclaw search tweets "AI from:sam" --limit 20 --json
 ```
 
-`--author` accepts a handle, `@handle`, numeric Twitter user id, or local profile id.
+`from:<handle>` and `--author <handle>` match the author's handle case-insensitively. Any remaining terms search the tweet text. Both forms also accept an `@handle`.
+
+Each query supports one author. An explicit `--author` takes precedence over `from:` in the query. The author filter also works with `--liked` and `--bookmarked`.
 
 ### Full flag list
 
-- `--author <handle-or-id>`
+- `--author <handle>`
+- `--account <accountId>`
+- `--list <name>` / `--list-id <id>`
 - `--since <date>` / `--until <date>`
 - `--originals-only`
 - `--hide-low-quality`

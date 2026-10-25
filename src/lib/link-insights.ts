@@ -1,11 +1,20 @@
+import { profileSelect, type ProfileSqlRow } from "./profile-row";
+import { parseJsonField } from "./json-codec";
 import { getNativeDb } from "./db";
+import { isReadOnlyDeployment } from "./config";
+import { ReadOnlyQueryCache } from "./read-only-query-cache";
+import type { Database } from "./sqlite";
+import type { LinkInsightResponse } from "./api-contracts";
+import {
+	normalizeProfileHandle,
+	nullableProfileFromDbRow,
+} from "./profile-row";
 import type {
 	LinkInsightItem,
 	LinkInsightKind,
 	LinkInsightMention,
 	LinkInsightQuery,
 	LinkInsightRange,
-	LinkInsightResponse,
 	LinkInsightSort,
 	ProfileRecord,
 	TweetMediaItem,
@@ -44,7 +53,13 @@ const RAW_URL_PATTERN = /https?:\/\/[^\s<>"'`]+/g;
 const SQL_URL_EXPRESSION =
 	"lower(coalesce(nullif(e.final_url, ''), nullif(e.expanded_url, ''), e.short_url))";
 
-interface LinkInsightRow {
+interface LinkInsightRow
+	extends
+		ProfileSqlRow<"source_author_">,
+		ProfileSqlRow<"dm_sender_">,
+		ProfileSqlRow<"participant_">,
+		ProfileSqlRow<"linked_author_"> {
+	[key: string]: string | number | null;
 	source_kind: "dm" | "tweet";
 	source_id: string;
 	source_position: number;
@@ -62,60 +77,18 @@ interface LinkInsightRow {
 	source_text: string;
 	source_media_json: string | null;
 	account_handle: string | null;
-	source_author_id: string | null;
-	source_author_handle: string | null;
-	source_author_display_name: string | null;
-	source_author_bio: string | null;
-	source_author_followers_count: number | null;
-	source_author_following_count: number | null;
-	source_author_avatar_hue: number | null;
-	source_author_avatar_url: string | null;
-	source_author_location: string | null;
-	source_author_url: string | null;
-	source_author_verified_type: string | null;
-	source_author_entities_json: string | null;
-	source_author_created_at: string | null;
-	dm_sender_id: string | null;
-	dm_sender_handle: string | null;
-	dm_sender_display_name: string | null;
-	dm_sender_bio: string | null;
-	dm_sender_followers_count: number | null;
-	dm_sender_following_count: number | null;
-	dm_sender_avatar_hue: number | null;
-	dm_sender_avatar_url: string | null;
-	dm_sender_location: string | null;
-	dm_sender_url: string | null;
-	dm_sender_verified_type: string | null;
-	dm_sender_entities_json: string | null;
-	dm_sender_created_at: string | null;
-	participant_id: string | null;
-	participant_handle: string | null;
-	participant_display_name: string | null;
-	participant_bio: string | null;
-	participant_followers_count: number | null;
-	participant_following_count: number | null;
-	participant_avatar_hue: number | null;
-	participant_avatar_url: string | null;
-	participant_location: string | null;
-	participant_url: string | null;
-	participant_verified_type: string | null;
-	participant_entities_json: string | null;
-	participant_created_at: string | null;
 	linked_text: string | null;
 	linked_media_json: string | null;
-	linked_author_id: string | null;
-	linked_author_handle: string | null;
-	linked_author_display_name: string | null;
-	linked_author_bio: string | null;
-	linked_author_followers_count: number | null;
-	linked_author_following_count: number | null;
-	linked_author_avatar_hue: number | null;
-	linked_author_avatar_url: string | null;
-	linked_author_location: string | null;
-	linked_author_url: string | null;
-	linked_author_verified_type: string | null;
-	linked_author_entities_json: string | null;
-	linked_author_created_at: string | null;
+}
+
+interface LinkInsightRankRow {
+	occurrence_rowid: number;
+	source_kind: "dm" | "tweet";
+	short_url: string;
+	created_at: string;
+	expanded_url: string;
+	final_url: string;
+	source_text: string;
 }
 
 interface NormalizedUrl {
@@ -142,6 +115,18 @@ interface InsightGroup {
 	topSharer: ProfileRecord | null;
 	totalInfluence: number;
 	url: string;
+}
+
+interface InsightRanking {
+	commentCount: number;
+	lastSeenAt: string;
+	shareCount: number;
+	totalInfluence: number;
+}
+
+interface RankedInsightGroup extends InsightRanking {
+	canonicalKey: string;
+	rowIds: number[];
 }
 
 const TITLE_SEGMENT_STOPWORDS = new Set([
@@ -193,49 +178,6 @@ const TITLE_SMALL_WORDS = new Set([
 	"vs",
 ]);
 
-function parseJsonField<T>(value: unknown, fallback: T): T {
-	if (typeof value !== "string" || value.length === 0) {
-		return fallback;
-	}
-	try {
-		return JSON.parse(value) as T;
-	} catch {
-		return fallback;
-	}
-}
-
-function getString(value: unknown) {
-	return typeof value === "string" && value.length > 0 ? value : undefined;
-}
-
-function toProfile(
-	row: LinkInsightRow,
-	prefix: "dm_sender_" | "linked_author_" | "participant_" | "source_author_",
-): ProfileRecord | null {
-	const id = row[`${prefix}id`];
-	if (!id) {
-		return null;
-	}
-	return {
-		id: String(id),
-		handle: String(row[`${prefix}handle`] ?? ""),
-		displayName: String(row[`${prefix}display_name`] ?? ""),
-		bio: String(row[`${prefix}bio`] ?? ""),
-		followersCount: Number(row[`${prefix}followers_count`] ?? 0),
-		followingCount: Number(row[`${prefix}following_count`] ?? 0),
-		avatarHue: Number(row[`${prefix}avatar_hue`] ?? 0),
-		avatarUrl: getString(row[`${prefix}avatar_url`]),
-		location: getString(row[`${prefix}location`]),
-		url: getString(row[`${prefix}url`]),
-		verifiedType: getString(row[`${prefix}verified_type`]),
-		entities: parseJsonField<Record<string, unknown>>(
-			row[`${prefix}entities_json`],
-			{},
-		),
-		createdAt: String(row[`${prefix}created_at`] ?? ""),
-	};
-}
-
 function isHostMatch(host: string, suffixes: string[], exact: Set<string>) {
 	const normalized = host.toLowerCase();
 	if (exact.has(normalized)) {
@@ -266,7 +208,18 @@ function addVideoUrlPrefilter(conditions: string[]) {
 		predicates.push(`${SQL_URL_EXPRESSION} like 'http://${host}/%'`);
 		predicates.push(`${SQL_URL_EXPRESSION} like 'https://${host}/%'`);
 	}
-	conditions.push(`(${predicates.join(" or ")})`);
+	// Most URLs are not videos. Reject them before testing every scheme/subdomain form.
+	const hints = new Set(
+		[...VIDEO_HOST_SUFFIXES, ...VIDEO_EXACT_HOSTS].map((host) =>
+			host.split(".").slice(-2).join(".").slice(0, 4),
+		),
+	);
+	const quick = [...hints].map(
+		(hint) => `${SQL_URL_EXPRESSION} like '%${hint}%'`,
+	);
+	conditions.push(
+		`case when (${quick.join(" or ")}) then (${predicates.join(" or ")}) else 0 end`,
+	);
 }
 
 function normalizeUrl(rawUrl: string): NormalizedUrl | null {
@@ -380,6 +333,8 @@ function resolveRange(
 
 	const start = new Date(now);
 	if (range === "today") {
+		// "Today" follows the user's local calendar day; toISOString below
+		// converts that local midnight into the correct UTC storage boundary.
 		start.setHours(0, 0, 0, 0);
 	} else {
 		const days = range === "week" ? 7 : range === "month" ? 30 : 365;
@@ -396,6 +351,30 @@ function getInfluenceScore(profile: ProfileRecord | null) {
 		return 0;
 	}
 	return Math.round(Math.log10(profile.followersCount + 10) * 24);
+}
+
+type LinkInfluenceRow = Pick<
+	LinkInsightRow,
+	| "source_kind"
+	| "source_author_id"
+	| "source_author_followers_count"
+	| "dm_sender_id"
+	| "dm_sender_followers_count"
+>;
+
+function getDetailRowInfluenceScore(row: LinkInfluenceRow) {
+	const profileId =
+		row.source_kind === "tweet" ? row.source_author_id : row.dm_sender_id;
+	if (!profileId) return 0;
+	const value =
+		row.source_kind === "tweet"
+			? row.source_author_followers_count
+			: row.dm_sender_followers_count;
+	const followersCount = Number(value ?? 0);
+	return Math.round(
+		Math.log10((Number.isFinite(followersCount) ? followersCount : 0) + 10) *
+			24,
+	);
 }
 
 function chooseMetadata(existing: string | null, candidate: string | null) {
@@ -440,7 +419,7 @@ function buildTweetUrl(
 	handle: string | null | undefined,
 	tweetId: string | null,
 ) {
-	const cleanHandle = handle?.replace(/^@/, "").trim();
+	const cleanHandle = normalizeProfileHandle(handle);
 	if (!cleanHandle || !tweetId) {
 		return null;
 	}
@@ -457,11 +436,13 @@ function sourceLabel(row: LinkInsightRow) {
 function buildMention(row: LinkInsightRow, normalized: NormalizedUrl) {
 	const sharedBy =
 		row.source_kind === "tweet"
-			? toProfile(row, "source_author_")
-			: toProfile(row, "dm_sender_");
+			? nullableProfileFromDbRow(row, "source_author_")
+			: nullableProfileFromDbRow(row, "dm_sender_");
 	const participant =
-		row.source_kind === "dm" ? toProfile(row, "participant_") : null;
-	const contentAuthor = toProfile(row, "linked_author_");
+		row.source_kind === "dm"
+			? nullableProfileFromDbRow(row, "participant_")
+			: null;
+	const contentAuthor = nullableProfileFromDbRow(row, "linked_author_");
 	const rawText = String(row.source_text ?? "");
 	const text = stripUrls(rawText, [
 		row.short_url,
@@ -513,6 +494,20 @@ function buildMention(row: LinkInsightRow, normalized: NormalizedUrl) {
 		participant,
 	};
 	return mention;
+}
+
+function rankRowHasComment(row: LinkInsightRankRow, normalized: NormalizedUrl) {
+	const rawText = String(row.source_text ?? "");
+	return (
+		stripUrls(rawText, [
+			row.short_url,
+			row.expanded_url,
+			row.final_url,
+			normalized.url,
+			normalized.displayUrl,
+			...(rawText.match(RAW_URL_PATTERN) ?? []),
+		]).length > 0
+	);
 }
 
 function toInsight(
@@ -569,7 +564,7 @@ function toInsight(
 	};
 }
 
-function compareRank(left: LinkInsightItem, right: LinkInsightItem) {
+function compareRank(left: InsightRanking, right: InsightRanking) {
 	if (right.shareCount !== left.shareCount) {
 		return right.shareCount - left.shareCount;
 	}
@@ -580,7 +575,7 @@ function compareRank(left: LinkInsightItem, right: LinkInsightItem) {
 }
 
 function compareInsights(sort: LinkInsightSort) {
-	return (left: LinkInsightItem, right: LinkInsightItem) => {
+	return (left: InsightRanking, right: InsightRanking) => {
 		if (sort === "recent") {
 			return (
 				right.lastSeenAt.localeCompare(left.lastSeenAt) ||
@@ -598,9 +593,95 @@ function compareInsights(sort: LinkInsightSort) {
 	};
 }
 
+function selectHydrationCandidates(
+	groups: RankedInsightGroup[],
+	sort: LinkInsightSort,
+	limit: number,
+) {
+	if (sort === "comments") {
+		return [...groups].sort(compareInsights(sort)).slice(0, limit);
+	}
+
+	// Share count and recency are the primary rank keys. Only groups tied at or
+	// above the limit boundary need their full profile/media rows hydrated.
+	const sorted = [...groups].sort((left, right) =>
+		sort === "recent"
+			? right.lastSeenAt.localeCompare(left.lastSeenAt)
+			: right.shareCount - left.shareCount,
+	);
+	const boundary = sorted[Math.min(limit - 1, sorted.length - 1)];
+	if (!boundary) return [];
+	return sorted.filter((group) =>
+		sort === "recent"
+			? group.lastSeenAt >= boundary.lastSeenAt
+			: group.shareCount >= boundary.shareCount,
+	);
+}
+
+const readCaches = new WeakMap<Database, ReadOnlyQueryCache>();
+
 export function getLinkInsights(
 	query: LinkInsightQuery = {},
 ): LinkInsightResponse {
+	const db = getNativeDb({ seedDemoData: false });
+	if (!isReadOnlyDeployment()) return buildLinkInsights(query, db);
+	let cache = readCaches.get(db);
+	if (!cache) {
+		cache = new ReadOnlyQueryCache();
+		readCaches.set(db, cache);
+	}
+	const bounds = resolveRange(
+		query.range ?? "week",
+		query.now ?? new Date(),
+		query.since,
+		query.until,
+	);
+	// Pin the boundary probes and result to one snapshot on this cache's owner.
+	return db.readTransaction(() => {
+		const boundary = (value: string | null) =>
+			value === null
+				? "unbounded"
+				: ((
+						db
+							.prepare(
+								"select created_at from link_occurrences where created_at < ? order by created_at desc limit 1",
+							)
+							.get(value) as { created_at: string } | undefined
+					)?.created_at ?? null);
+		const { now: _now, since: _since, until: _until, ...filters } = query;
+		const key = JSON.stringify([
+			filters,
+			boundary(bounds.since),
+			boundary(bounds.until),
+		]);
+		const body = cache.read(db, key, () =>
+			JSON.stringify(
+				buildLinkInsights(
+					{
+						...query,
+						since: bounds.since ?? undefined,
+						until: bounds.until ?? undefined,
+					},
+					db,
+				),
+			),
+		);
+		return { ...JSON.parse(body), ...bounds } as LinkInsightResponse;
+	})();
+}
+
+function buildLinkInsights(
+	query: LinkInsightQuery = {},
+	db: Database,
+): LinkInsightResponse {
+	const normalizedUrls = new Map<string, NormalizedUrl | null>();
+	const normalize = (url: string) => {
+		const cached = normalizedUrls.get(url);
+		if (cached !== undefined) return cached;
+		const normalized = normalizeUrl(url);
+		normalizedUrls.set(url, normalized);
+		return normalized;
+	};
 	const kind = query.kind ?? "links";
 	const range = query.range ?? "week";
 	const sort = query.sort ?? "rank";
@@ -663,7 +744,122 @@ export function getLinkInsights(
 		addVideoUrlPrefilter(conditions);
 	}
 
-	const db = getNativeDb({ seedDemoData: false });
+	const rankSourceText =
+		sort === "comments" ? "coalesce(dm.text, source_tweet.text, '')" : "''";
+	const rankSourceJoins =
+		sort === "comments"
+			? `left join dm_messages dm
+        on o.source_kind = 'dm' and dm.id = o.source_id
+      left join tweets source_tweet
+        on o.source_kind = 'tweet' and source_tweet.id = o.source_id`
+			: "";
+	const rankRows = db
+		.prepare(`
+      select
+        o.rowid as occurrence_rowid,
+        o.source_kind,
+        o.short_url,
+        o.created_at,
+        e.expanded_url,
+        e.final_url,
+        ${rankSourceText} as source_text
+      from link_occurrences o
+      join url_expansions e on e.short_url = o.short_url
+      ${rankSourceJoins}
+      where ${conditions.join(" and ")}
+      order by o.created_at desc
+    `)
+		.all(...params) as LinkInsightRankRow[];
+
+	const rankedGroups = new Map<string, RankedInsightGroup>();
+	let occurrences = 0;
+	for (const row of rankRows) {
+		const normalized = normalize(
+			row.final_url || row.expanded_url || row.short_url,
+		);
+		if (!normalized) continue;
+		const rowKind: LinkInsightKind = isVideoHost(normalized.host)
+			? "videos"
+			: "links";
+		if (rowKind !== kind) continue;
+		occurrences++;
+
+		const existing = rankedGroups.get(normalized.canonicalKey);
+		if (existing) {
+			existing.rowIds.push(row.occurrence_rowid);
+			existing.shareCount++;
+			if (sort === "comments" && rankRowHasComment(row, normalized)) {
+				existing.commentCount++;
+			}
+			if (row.created_at > existing.lastSeenAt) {
+				existing.lastSeenAt = row.created_at;
+			}
+			continue;
+		}
+
+		rankedGroups.set(normalized.canonicalKey, {
+			canonicalKey: normalized.canonicalKey,
+			commentCount:
+				sort === "comments" && rankRowHasComment(row, normalized) ? 1 : 0,
+			lastSeenAt: row.created_at,
+			rowIds: [row.occurrence_rowid],
+			shareCount: 1,
+			totalInfluence: 0,
+		});
+	}
+
+	const preliminaryGroups = selectHydrationCandidates(
+		[...rankedGroups.values()],
+		sort,
+		limit,
+	);
+	const candidateRowIds = preliminaryGroups.flatMap((group) => group.rowIds);
+	if (candidateRowIds.length === 0) {
+		return {
+			kind,
+			range,
+			sort,
+			source,
+			since: bounds.since,
+			until: bounds.until,
+			items: [],
+			stats: { occurrences, groups: rankedGroups.size },
+		};
+	}
+
+	let selectedGroups = preliminaryGroups;
+	// A separate query only pays off when the tie set substantially exceeds a page.
+	const needsRankingPass = preliminaryGroups.length > Math.max(limit * 2, 32);
+	if (needsRankingPass) {
+		const groupByRowId = new Map(
+			preliminaryGroups.flatMap((group) =>
+				group.rowIds.map((id) => [id, group] as const),
+			),
+		);
+		const influenceRows = db
+			.prepare(`
+      select o.rowid as occurrence_rowid, o.source_kind,
+        author.id as source_author_id, author.followers_count as source_author_followers_count,
+        sender.id as dm_sender_id, sender.followers_count as dm_sender_followers_count
+      from link_occurrences o
+      left join tweets tweet on o.source_kind = 'tweet' and tweet.id = o.source_id
+      left join profiles author on author.id = tweet.author_profile_id
+      left join dm_messages dm on o.source_kind = 'dm' and dm.id = o.source_id
+      left join profiles sender on sender.id = dm.sender_profile_id
+      where o.rowid in (select cast(value as integer) from json_each(?))
+    `)
+			.all(JSON.stringify(candidateRowIds)) as Array<
+			LinkInfluenceRow & { occurrence_rowid: number }
+		>;
+		for (const row of influenceRows) {
+			const group = groupByRowId.get(row.occurrence_rowid);
+			if (group) group.totalInfluence += getDetailRowInfluenceScore(row);
+		}
+		selectedGroups = preliminaryGroups
+			.sort(compareInsights(sort))
+			.slice(0, limit);
+	}
+
 	const rows = db
 		.prepare(`
       select
@@ -684,60 +880,12 @@ export function getLinkInsights(
         coalesce(dm.text, source_tweet.text, '') as source_text,
         source_tweet.media_json as source_media_json,
         account.handle as account_handle,
-        source_author.id as source_author_id,
-        source_author.handle as source_author_handle,
-        source_author.display_name as source_author_display_name,
-        source_author.bio as source_author_bio,
-        source_author.followers_count as source_author_followers_count,
-        source_author.following_count as source_author_following_count,
-        source_author.avatar_hue as source_author_avatar_hue,
-        source_author.avatar_url as source_author_avatar_url,
-        source_author.location as source_author_location,
-        source_author.url as source_author_url,
-        source_author.verified_type as source_author_verified_type,
-        source_author.entities_json as source_author_entities_json,
-        source_author.created_at as source_author_created_at,
-        dm_sender.id as dm_sender_id,
-        dm_sender.handle as dm_sender_handle,
-        dm_sender.display_name as dm_sender_display_name,
-        dm_sender.bio as dm_sender_bio,
-        dm_sender.followers_count as dm_sender_followers_count,
-        dm_sender.following_count as dm_sender_following_count,
-        dm_sender.avatar_hue as dm_sender_avatar_hue,
-        dm_sender.avatar_url as dm_sender_avatar_url,
-        dm_sender.location as dm_sender_location,
-        dm_sender.url as dm_sender_url,
-        dm_sender.verified_type as dm_sender_verified_type,
-        dm_sender.entities_json as dm_sender_entities_json,
-        dm_sender.created_at as dm_sender_created_at,
-        participant.id as participant_id,
-        participant.handle as participant_handle,
-        participant.display_name as participant_display_name,
-        participant.bio as participant_bio,
-        participant.followers_count as participant_followers_count,
-        participant.following_count as participant_following_count,
-        participant.avatar_hue as participant_avatar_hue,
-        participant.avatar_url as participant_avatar_url,
-        participant.location as participant_location,
-        participant.url as participant_url,
-        participant.verified_type as participant_verified_type,
-        participant.entities_json as participant_entities_json,
-        participant.created_at as participant_created_at,
+        ${profileSelect("source_author", "source_author_")},
+        ${profileSelect("dm_sender", "dm_sender_")},
+        ${profileSelect("participant", "participant_")},
         linked.text as linked_text,
         linked.media_json as linked_media_json,
-        linked_author.id as linked_author_id,
-        linked_author.handle as linked_author_handle,
-        linked_author.display_name as linked_author_display_name,
-        linked_author.bio as linked_author_bio,
-        linked_author.followers_count as linked_author_followers_count,
-        linked_author.following_count as linked_author_following_count,
-        linked_author.avatar_hue as linked_author_avatar_hue,
-        linked_author.avatar_url as linked_author_avatar_url,
-        linked_author.location as linked_author_location,
-        linked_author.url as linked_author_url,
-        linked_author.verified_type as linked_author_verified_type,
-        linked_author.entities_json as linked_author_entities_json,
-        linked_author.created_at as linked_author_created_at
+        ${profileSelect("linked_author", "linked_author_")}
       from link_occurrences o
       join url_expansions e on e.short_url = o.short_url
       left join accounts account on account.id = o.account_id
@@ -757,16 +905,35 @@ export function getLinkInsights(
         on linked.id = e.expanded_tweet_id
       left join profiles linked_author
         on linked_author.id = linked.author_profile_id
-      where ${conditions.join(" and ")}
-      order by o.created_at desc
-    `)
-		.all(...params) as LinkInsightRow[];
+	      where o.rowid in (
+	        select cast(value as integer)
+	        from json_each(?)
+	      )
+	      order by o.created_at desc
+	    `)
+		.all(
+			JSON.stringify(selectedGroups.flatMap((group) => group.rowIds)),
+		) as LinkInsightRow[];
+
+	for (const row of needsRankingPass ? [] : rows) {
+		const normalized = normalize(
+			row.final_url || row.expanded_url || row.short_url,
+		);
+		if (!normalized) continue;
+		const rankedGroup = rankedGroups.get(normalized.canonicalKey);
+		if (rankedGroup) {
+			rankedGroup.totalInfluence += getDetailRowInfluenceScore(row);
+		}
+	}
+	selectedGroups = selectedGroups.sort(compareInsights(sort)).slice(0, limit);
+	const selectedKeys = new Set(
+		selectedGroups.map((group) => group.canonicalKey),
+	);
 
 	const groups = new Map<string, InsightGroup>();
-	let occurrences = 0;
 	for (const row of rows) {
 		const rawUrl = row.final_url || row.expanded_url || row.short_url;
-		const normalized = normalizeUrl(rawUrl);
+		const normalized = normalize(rawUrl);
 		if (!normalized) {
 			continue;
 		}
@@ -776,8 +943,7 @@ export function getLinkInsights(
 		if (rowKind !== kind) {
 			continue;
 		}
-		occurrences++;
-
+		if (!selectedKeys.has(normalized.canonicalKey)) continue;
 		const mention = buildMention(row, normalized);
 		const sharerKey = mention.sharedBy
 			? mention.sharedBy.id
@@ -837,10 +1003,15 @@ export function getLinkInsights(
 		});
 	}
 
-	const items = [...groups.values()]
-		.map((group) => toInsight(group, commentsLimit))
-		.sort(compareInsights(sort))
-		.slice(0, limit);
+	const itemsByKey = new Map(
+		[...groups.entries()].map(([key, group]) => [
+			key,
+			toInsight(group, commentsLimit),
+		]),
+	);
+	const items = selectedGroups
+		.map((group) => itemsByKey.get(group.canonicalKey))
+		.filter((item): item is LinkInsightItem => item !== undefined);
 
 	return {
 		kind,
@@ -852,7 +1023,7 @@ export function getLinkInsights(
 		items,
 		stats: {
 			occurrences,
-			groups: groups.size,
+			groups: rankedGroups.size,
 		},
 	};
 }

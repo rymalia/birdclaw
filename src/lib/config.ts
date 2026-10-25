@@ -4,6 +4,7 @@ import {
 	existsSync,
 	mkdirSync,
 	readFileSync,
+	writeFileSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,10 +17,27 @@ export interface BirdclawPaths {
 	configPath: string;
 }
 
-export type MentionsDataSource = "birdclaw" | "xurl" | "bird";
+export type MentionsDataSource = "birdclaw" | "auto" | "xurl" | "bird";
 export type ActionsTransport = "auto" | "bird" | "xurl";
+export type LiveTransport = "bird" | "xurl";
+
+export function isReadOnlyDeployment() {
+	return process.env.BIRDCLAW_DEPLOYMENT_READ_ONLY === "1";
+}
+
+export function assertWritableDeployment() {
+	if (isReadOnlyDeployment()) {
+		throw new Error("This archive deployment is read-only");
+	}
+}
 
 export interface BirdclawConfig {
+	transport?: {
+		preferred?: LiveTransport;
+	};
+	accounts?: {
+		default?: string;
+	};
 	mentions?: {
 		dataSource?: MentionsDataSource;
 		birdCommand?: string;
@@ -33,6 +51,47 @@ export interface BirdclawConfig {
 		autoSync?: boolean;
 		staleAfterSeconds?: number;
 	};
+}
+
+export function getPreferredTransport(): LiveTransport | undefined {
+	const envPreferred =
+		process.env.BIRDCLAW_PREFERRED_TRANSPORT?.trim().toLowerCase();
+	if (envPreferred === "bird" || envPreferred === "xurl") return envPreferred;
+	const preferred = getBirdclawConfig().transport?.preferred;
+	if (preferred === "bird" || preferred === "xurl") return preferred;
+	return undefined;
+}
+
+export function getAutoTransportOrder(
+	defaultPrimary: LiveTransport = "xurl",
+): readonly [LiveTransport, LiveTransport] {
+	const primary = getPreferredTransport() ?? defaultPrimary;
+	return [primary, primary === "bird" ? "xurl" : "bird"];
+}
+
+export function defaultLiveSyncMode(
+	defaultMode: ActionsTransport,
+): ActionsTransport {
+	return getPreferredTransport() ? "auto" : defaultMode;
+}
+
+export function autoTransportCacheSuffix(mode: string) {
+	const preferred = mode === "auto" ? getPreferredTransport() : undefined;
+	return preferred ? `:preferred:${preferred}` : "";
+}
+
+export function setPreferredTransport(preferred: LiveTransport | "auto") {
+	const config = getBirdclawConfig();
+	const transport = { ...config.transport };
+	if (preferred === "auto") delete transport.preferred;
+	else transport.preferred = preferred;
+	const configPath = writeBirdclawConfig({ ...config, transport });
+	return { configPath, preferred: transport.preferred ?? null };
+}
+
+export function getDefaultAccountSelector() {
+	const selector = getBirdclawConfig().accounts?.default?.trim();
+	return selector || undefined;
 }
 
 let cachedPaths: BirdclawPaths | undefined;
@@ -82,11 +141,38 @@ export function getBirdclawConfig(): BirdclawConfig {
 	return cachedConfig;
 }
 
+function getConfigPath() {
+	return process.env.BIRDCLAW_CONFIG?.trim() || getBirdclawPaths().configPath;
+}
+
+export function writeBirdclawConfig(config: BirdclawConfig) {
+	assertWritableDeployment();
+	const configPath = getConfigPath();
+	mkdirSync(path.dirname(configPath), { recursive: true });
+	writeFileSync(configPath, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+	cachedConfig = config;
+	return configPath;
+}
+
+export function setActionsTransport(transport: ActionsTransport) {
+	const config = getBirdclawConfig();
+	const nextConfig: BirdclawConfig = {
+		...config,
+		actions: {
+			...config.actions,
+			transport,
+		},
+	};
+	const configPath = writeBirdclawConfig(nextConfig);
+	return { configPath, transport };
+}
+
 export function resolveMentionsDataSource(
 	requestedMode?: string,
 ): MentionsDataSource {
 	if (
 		requestedMode === "birdclaw" ||
+		requestedMode === "auto" ||
 		requestedMode === "xurl" ||
 		requestedMode === "bird"
 	) {
@@ -94,13 +180,19 @@ export function resolveMentionsDataSource(
 	}
 
 	const envMode = process.env.BIRDCLAW_MENTIONS_DATA_SOURCE?.trim();
-	if (envMode === "birdclaw" || envMode === "xurl" || envMode === "bird") {
+	if (
+		envMode === "birdclaw" ||
+		envMode === "auto" ||
+		envMode === "xurl" ||
+		envMode === "bird"
+	) {
 		return envMode;
 	}
 
 	const configMode = getBirdclawConfig().mentions?.dataSource;
 	if (
 		configMode === "birdclaw" ||
+		configMode === "auto" ||
 		configMode === "xurl" ||
 		configMode === "bird"
 	) {
@@ -177,6 +269,7 @@ export function getBirdCommand() {
 
 export function ensureBirdclawDirs(): BirdclawPaths {
 	const paths = getBirdclawPaths();
+	if (isReadOnlyDeployment()) return paths;
 
 	mkdirSync(paths.rootDir, { recursive: true });
 	mkdirSync(paths.mediaOriginalsDir, { recursive: true });

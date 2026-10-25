@@ -2,6 +2,7 @@ import { Effect } from "effect";
 import { describe, expect, it } from "vitest";
 import {
 	jsonResponse,
+	LOCAL_WEB_PEER_HEADER,
 	parseBoundedInteger,
 	requestJsonEffect,
 	runRouteEffect,
@@ -120,6 +121,41 @@ describe("http Effect helpers", () => {
 			} else {
 				process.env.BIRDCLAW_LOCAL_WEB = originalLocalWeb;
 			}
+		}
+	});
+
+	it("requires socket provenance in production server mode", () => {
+		const originalNodeEnv = process.env.NODE_ENV;
+		const originalVitest = process.env.VITEST;
+		const originalToken = process.env.BIRDCLAW_WEB_TOKEN;
+		const originalLocalWeb = process.env.BIRDCLAW_LOCAL_WEB;
+		delete process.env.VITEST;
+		process.env.NODE_ENV = "production";
+		delete process.env.BIRDCLAW_WEB_TOKEN;
+		process.env.BIRDCLAW_LOCAL_WEB = "socket";
+
+		try {
+			expect(
+				sensitiveRequestErrorResponse(
+					new Request("http://127.0.0.1/api/action"),
+				)?.status,
+			).toBe(403);
+			expect(
+				sensitiveRequestErrorResponse(
+					new Request("http://127.0.0.1/api/action", {
+						headers: { [LOCAL_WEB_PEER_HEADER]: "1" },
+					}),
+				),
+			).toBeNull();
+		} finally {
+			if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+			else process.env.NODE_ENV = originalNodeEnv;
+			if (originalVitest === undefined) delete process.env.VITEST;
+			else process.env.VITEST = originalVitest;
+			if (originalToken === undefined) delete process.env.BIRDCLAW_WEB_TOKEN;
+			else process.env.BIRDCLAW_WEB_TOKEN = originalToken;
+			if (originalLocalWeb === undefined) delete process.env.BIRDCLAW_LOCAL_WEB;
+			else process.env.BIRDCLAW_LOCAL_WEB = originalLocalWeb;
 		}
 	});
 
