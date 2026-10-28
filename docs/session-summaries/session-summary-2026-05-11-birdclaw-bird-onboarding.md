@@ -18,7 +18,7 @@ The premise turned out to be wrong in an interesting and load-bearing way. Surfa
 
 ## Key Findings — bird vs birdclaw
 
-The full comparison lives in [`docs/assessment-bird-vs-birdclaw_2026-05-11.md`](./assessment-bird-vs-birdclaw_2026-05-11.md) (~330 lines). For onboarding purposes, the load-bearing facts:
+The full comparison lives in [`docs/assessment-bird-vs-birdclaw_2026-05-11.md`](../assessment-bird-vs-birdclaw_2026-05-11.md) (~330 lines). For onboarding purposes, the load-bearing facts:
 
 1. **`birdclaw` does NOT bundle `bird`.** It contains a ~640-line subprocess adapter (`src/lib/bird.ts`) that `execFile`s `bird` as one of three external transports. Three independent confirmations: `pnpm-lock.yaml` has no `@steipete/bird` entry; the adapter uses `execFile`, never `import`; the error string says *"Install @steipete/bird or set BIRDCLAW_BIRD_COMMAND..."*.
 
