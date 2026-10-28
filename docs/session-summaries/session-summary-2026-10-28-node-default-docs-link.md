@@ -47,7 +47,7 @@ v24). birdclaw still runs on 26.12.1 through its local `.nvmrc`, but it now need
 - **After the fix:**
   - `node scripts/build-docs-site.mjs` → `built docs site: dist/docs-site`.
   - `run-vitest.mjs run src/docs-site.test.ts` → 1 file, 7/7 passed.
-  - The full suite was not re-run.
+  - Full `npm run test:node` re-run on v26.12.1: **181/181 files, 1,962/1,962 tests passed** (122s). The 7 earlier "skipped" were `docs-site.test.ts`'s own tests, skipped because the file failed at import.
 - **Native addons checked:** `node_modules/**/*.node` are all N-API platform prebuilds (lightningcss, rolldown, oxfmt, oxlint, tailwind oxide, sharp, fsevents), so they don't depend on the Node ABI.
 - **Codex gpt-5.6-luna (high):** a read-only review of the link fix, also asked to look for other relative links that broke in the move and that the checker might miss. Verdict **SHIP**: the new target resolves, and it is the only relative Markdown link in `docs/session-summaries/`.
 
@@ -55,7 +55,7 @@ v24). birdclaw still runs on 26.12.1 through its local `.nvmrc`, but it now need
 
 - Repo files changed: 1 (+ this summary)
 - Broken links fixed: 1
-- Test files: 181 run, 1 failed (now fixed and re-run alone)
+- Test files: 181 run, 1 failed before the fix; 181/181 after
 
 ## Discoveries / Handoff Notes
 
@@ -66,5 +66,4 @@ v24). birdclaw still runs on 26.12.1 through its local `.nvmrc`, but it now need
 ## Unfinished Work
 
 - Run `nvm use` in this repo before any `*:node` script (`dev:node`, `test:node`, `build:node`, `e2e:node`, …).
-- Optional: re-run the full `test:node` suite to confirm 181/181 files.
 - Still open from 2026-10-27: X archive import before any live sync (see memory `project-pending-x-archive`). The flaky timeline test is addressed by open PR #253 ("give the large timeline render case a 30s timeout").
