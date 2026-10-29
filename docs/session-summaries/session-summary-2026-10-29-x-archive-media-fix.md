@@ -157,7 +157,7 @@ The fix is commit `f78c167` on `fix/x-web-viewer-provided-variables` (worktree `
 
 - https://github.com/steipete/birdclaw/pull/254 — opened this session (the archive-media fix)
 - https://github.com/steipete/birdclaw/pull/253 — status checked only (opened in a prior session)
-- Web DM viewerQuery fix — PR not yet opened (branch not pushed)
+- Web DM viewerQuery fix — branch pushed later in the session; PR not yet opened (see the wrap-up summary)
 
 ## Unfinished Work
 
