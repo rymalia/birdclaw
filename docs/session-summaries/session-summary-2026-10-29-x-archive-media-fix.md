@@ -92,6 +92,39 @@ Provenance: the filter arrived with archive media extraction in `0a3359d` (2026-
 - PR #253 (head `a809572`) and PR #254 (head `cdd4f0e`): open, mergeable, GitGuardian passed, ClawSweeper 5/6 "ready for maintainer look", CI awaiting maintainer approval. Upstream `main` is still `a08c264`.
 - #254's ClawSweeper verdict is pinned to `326efad`, before the changelog-only commit.
 
+## Live checks and the first bookmark sync, explained
+
+These were "open questions" added after the session. They describe what the pending items will do; none of them has been run yet.
+
+### What the live smoke tests are
+
+Small, deliberately capped reads against X. They prove that each transport works end to end on the real database: authentication, the account-identity guard, normalization, and the SQLite write. They're the leftover step from the 2026-10-27 setup session (`session-summary-2026-10-27-node26-bird-xurl-setup.md`), where they stopped because `~/.birdclaw` held the demo seed. None of them writes to X; each one only reads from X and writes into local SQLite.
+
+| Check | What it does | What "pass" looks like | Cost / risk |
+|---|---|---|---|
+| **Bookmarks** `sync bookmarks --mode auto --limit 5 --max-pages 1 --refresh --json` | Fetches **one page of 5** of your most recent bookmarks. In `auto`, bookmarks try xurl first (official X v2 API, OAuth2), then fall back to bird (cookie-based web GraphQL). `--refresh` skips the 120 s live cache. `--max-pages 1` turns on paging but caps it at one page. Before writing, the guard in `live-sync-engine.ts:114` checks that the user X says you're logged in as matches the local account's external id. On 2026-10-27 this is the step that refused (`bird is authenticated as user 16281489; refusing to sync into acct_primary (25401953)`), because the local account was the demo's. Now the account is 16281489, so it should pass. | `ok: true`, a `source` of `xurl` (or `bird` on fallback), 5 tweets, plus a `next_token` showing more pages exist. `search tweets --bookmarked` should then return those 5. | Through xurl, about 5 "Owned Read" posts at $0.001 each, so roughly half a cent (per `~/projects/x-api/docs/x-api-cost-guide.md`). Through bird it's an unofficial web endpoint, so no API bill. |
+| **Mention threads** `sync mention-threads --mode auto --limit 1 --max-pages 1 --json` | Takes your most recent mention and fetches its conversation (xurl first) so the thread is stored locally. It passed on 2026-10-27, but against the demo account; this rerun proves it works on the real one. | `ok: true, threads: 1, succeeded: 1` | A handful of post reads. These are *other people's* tweets, so they bill at the unowned rate ($0.005 each). |
+| **DMs (web)** `dms sync --mode web --inbox accepted --limit 1 --max-pages 0 --refresh --json` | Reads your **accepted** DM inbox through birdclaw's native web transport (`x-web-dms.ts`). It makes direct `fetch` calls to x.com using the `AUTH_TOKEN` and `CT0` cookie values from your environment; it never reads your browser's cookie store. `--max-pages 0` means only the initial inbox fetch, with no extra pages (`x-web-dms.ts:250`). New messages are upserted into `dm_messages` by id, alongside the 804 imported from the archive. This is the one transport that hasn't been exercised at all. | `ok: true` with conversations and messages that match what you see on x.com; `dms list` shows them. | No API bill (it's the web API, not v2), but it acts as your logged-in session. Treat `AUTH_TOKEN` like a password: export it only in the shell running the command, and don't put it in a file in the repo. **Avoid** `dms accept`, `dms reject` and `dms block`, which change things on X. |
+
+How to get `AUTH_TOKEN` / `CT0`: in a browser logged into x.com, open DevTools → Application → Cookies → `https://x.com` and copy the `auth_token` and `ct0` values. Then run `export AUTH_TOKEN=… CT0=…` in the shell, or with `! export …` in Claude Code, before running the command.
+
+### What the first real bookmark sync is
+
+X archives don't include bookmarks (the archive had no bookmarks file), so the database has **0 bookmarks** right now. The smoke test above fetches only 5. The "first real sync" is a deliberate, bounded backfill that pulls in as much of your bookmark history as X will return:
+
+```
+bun run cli sync bookmarks --mode auto --limit 100 --max-pages 20 --early-stop --refresh --json
+```
+
+- **Pages:** xurl caps bookmark pages at **90** results, whatever `--limit` says (`BOOKMARKS_MAX_RESULTS_CAP` in `xurl.ts:32`, a workaround for an X pagination bug). So 20 pages is at most about 1,800 bookmarks. `--max-pages` is the hard limit on spend.
+- **What gets written:** each bookmarked tweet lands once in the canonical `tweets` table (new or merged by id), with a `bookmark` row in `tweet_collections` for your account. Authors' profiles are filled in or updated as well. A tweet you already have, because you liked it or wrote it, gets a bookmark row; it isn't stored a second time.
+- **`--early-stop`:** stops at the first page where every tweet is already local. On this first run that never happens, so `--max-pages` is the effective limit. On later runs it's the cheap way to pick up only new bookmarks, usually one page (`docs/sync.md`).
+- **Resuming:** if 20 pages isn't enough, copy `payload.meta.next_token` from the output into `--pagination-token` on the next run, which needs `--mode xurl`.
+- **How far back:** X's bookmarks API may only expose a recent window. X's own docs have cited the most recent 800, which isn't verified here. The sync will show where pagination runs out.
+- **Cost:** through xurl, bookmark reads are Owned Reads at about $0.001 per post, so a full 1,800 is about $1.80. Expansions such as author and media are free until 2026-11-22, after which they bill too, so it's cheaper to run before then.
+- **Why it matters:** `search tweets --bookmarked`, the web UI's bookmark views, and `birdclaw research` (a markdown brief built from bookmarks plus their threads) all read bookmarks from the local database. Until this runs they find nothing. Run `sync bookmarks` first, then `research` (see `docs/research.md`).
+- **Unverified:** whether a sync removes local bookmarks you've since un-bookmarked on X was not checked this session.
+
 ## Issues & PRs
 
 - https://github.com/steipete/birdclaw/pull/254 — opened this session (the fix)
@@ -99,10 +132,11 @@ Provenance: the filter arrived with archive media extraction in `0a3359d` (2026-
 
 ## Unfinished Work
 
-- **Live smoke tests**, now unblocked by the real DB:
+- **Live smoke tests**, now unblocked by the real DB (detail below):
   - `bun run cli sync bookmarks --mode auto --limit 5 --max-pages 1 --refresh --json`
+  - `bun run cli sync mention-threads --mode auto --limit 1 --max-pages 1 --json` (passed on the demo DB on 2026-10-27; rerun on real data)
   - `bun run cli dms sync --mode web --inbox accepted --limit 1 --max-pages 0 --refresh --json`, with `AUTH_TOKEN` / `CT0` exported
-- **First real bookmark sync**: archives don't include bookmarks.
+- **First real bookmark sync**: archives don't include bookmarks (detail below).
 - **Optional:** `@clawsweeper re-review` on #254 so the verdict covers `cdd4f0e`.
 - **After #254 merges:** sync `dev` with upstream, then remove the `birdclaw-archive-media` worktree and branch.
 - **Optional cleanup:** delete `~/.birdclaw/birdclaw.demo.sqlite*` and the unzipped archive folder in Downloads.
