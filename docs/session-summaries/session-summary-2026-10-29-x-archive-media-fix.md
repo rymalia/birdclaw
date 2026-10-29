@@ -94,7 +94,7 @@ Provenance: the filter arrived with archive media extraction in `0a3359d` (2026-
 
 ## Live checks and the first bookmark sync, explained
 
-These were "open questions" added after the session. They describe what the pending items will do; none of them has been run yet.
+These were "open questions" added after the session. The smoke tests were then run; see **Smoke test results** below. The first real bookmark sync has not been run.
 
 ### What the live smoke tests are
 
@@ -125,18 +125,45 @@ bun run cli sync bookmarks --mode auto --limit 100 --max-pages 20 --early-stop -
 - **Why it matters:** `search tweets --bookmarked`, the web UI's bookmark views, and `birdclaw research` (a markdown brief built from bookmarks plus their threads) all read bookmarks from the local database. Until this runs they find nothing. Run `sync bookmarks` first, then `research` (see `docs/research.md`).
 - **Unverified:** whether a sync removes local bookmarks you've since un-bookmarked on X was not checked this session.
 
+## Smoke test results (2026-10-29, after the summary was first written)
+
+All run under Node v26.12.1 against the real `~/.birdclaw` DB.
+
+| Check | Result |
+|---|---|
+| `sync bookmarks --mode auto --limit 5 --max-pages 1 --refresh --json` | **Pass.** `ok: true, source: xurl, count: 5`, with a `next_token` (more pages exist). The account guard accepted the real account. `tweet_collections` now has 5 `bookmark` rows. |
+| `sync mention-threads --mode auto --limit 1 --max-pages 1 --json` | First run: `ok: true` but `mentions: 0`. It works from **locally stored mentions**, and archives contain none. After `sync mentions --latest --limit 5 --max-pages 1 --refresh --json` (xurl, 3 mentions, exit **5** = partial, more pages remain), the rerun **passed**: `mentions: 1, succeeded: 1, mergedTweets: 1`. |
+| `dms sync --mode web --inbox accepted --limit 1 --max-pages 0 --refresh --json` | **Failed on upstream code** with `X web request failed (HTTP 422)`, which turned out to be a second upstream bug (below). **Passed with the fix:** `ok: true, source: web, conversations: 1, messages: 1`. `dm_messages` stayed at 804, because the newest message (2026-09-26) was already in the archive and was updated in place by its id. |
+
+Notes:
+- `! export AUTH_TOKEN=… CT0=…` in Claude Code does **not** carry over to later Bash tool calls, since each call starts a fresh shell. The cookies had to be passed inline on each command.
+- The cookie values now appear in this session's transcript. If that's a concern, log out of x.com in that browser (or end the session), which invalidates `auth_token`.
+
+## Second bug: web DM account check sends a stale Relay variable
+
+The native web transport (`src/lib/x-web.ts`) verifies the account with X's GraphQL `viewerQuery` before any DM request. It hardcoded the provided variable `__relay_internal__pv__appviewerisloggedinprovider`. X's current bundle (`startup-*.js`, viewerQuery id `Ouqgpqn9ihXpKGhjVeQPoQ`) declares `providedVariables:{__relay_internal__pv__xclientsfeaturesappviewerisloggedinrelayprovider:Ed}`, so X returns `422 GRAPHQL_VALIDATION_FAILED "must be defined"`. That breaks every `dms sync --mode web`.
+
+How it was diagnosed: a scratch script wrapped `fetch` to log each request's path and status (never headers), then crawled X's web modules to find the viewerQuery operation definition. The hardcoded variable came in with #209 (`368f569`).
+
+The fix is commit `f78c167` on `fix/x-web-viewer-provided-variables` (worktree `/Users/rymalia/projects/birdclaw-xweb-viewer`, based on `upstream/main`, tracking unset, **not pushed**):
+- Provider names are now read from the viewerQuery's `providedVariables` during the existing public-client discovery and each is sent as `true`. If a bundle declares none, it falls back to the current known name.
+- Codex pass 1 returned FIX: P1, the id/name match could span into a neighbouring operation; P2, a 422 didn't clear the cached client; P2, missing tests. All three were addressed. Pass 2 returned SHIP with no findings.
+- Two new tests, plus one updated expectation. Each new test fails with its fix removed.
+- Test results: `check` clean; Node 26.12.1 1964/1964; Bun 1.4.4 1964/1964.
+- Shipped-CLI before/after against the real account: `main@a08c264` exits 1 with HTTP 422; `f78c167` exits 0 with `ok: true, source: web`.
+- The PR body is drafted at `/private/tmp/claude-501/-Users-rymalia-projects-birdclaw/dfdd5f3e-e063-4890-919b-ba6eb2e41bbf/scratchpad/pr-body-xweb.md`; it contains no credentials or personal ids.
+
 ## Issues & PRs
 
-- https://github.com/steipete/birdclaw/pull/254 — opened this session (the fix)
+- https://github.com/steipete/birdclaw/pull/254 — opened this session (the archive-media fix)
 - https://github.com/steipete/birdclaw/pull/253 — status checked only (opened in a prior session)
+- Web DM viewerQuery fix — PR not yet opened (branch not pushed)
 
 ## Unfinished Work
 
-- **Live smoke tests**, now unblocked by the real DB (detail below):
-  - `bun run cli sync bookmarks --mode auto --limit 5 --max-pages 1 --refresh --json`
-  - `bun run cli sync mention-threads --mode auto --limit 1 --max-pages 1 --json` (passed on the demo DB on 2026-10-27; rerun on real data)
-  - `bun run cli dms sync --mode web --inbox accepted --limit 1 --max-pages 0 --refresh --json`, with `AUTH_TOKEN` / `CT0` exported
-- **First real bookmark sync**: archives don't include bookmarks (detail below).
+- **Push `fix/x-web-viewer-provided-variables`** (`git -C ~/projects/birdclaw-xweb-viewer push -u origin fix/x-web-viewer-provided-variables`). Then open the PR with the drafted body, and add a CHANGELOG commit referencing its number (a second push).
+- **Until that fix merges**, run web DM reads from the `birdclaw-xweb-viewer` worktree; `dev` still has the broken variable.
+- **First real bookmark sync**: archives don't include bookmarks (detail above); only 5 have been synced.
 - **Optional:** `@clawsweeper re-review` on #254 so the verdict covers `cdd4f0e`.
 - **After #254 merges:** sync `dev` with upstream, then remove the `birdclaw-archive-media` worktree and branch.
 - **Optional cleanup:** delete `~/.birdclaw/birdclaw.demo.sqlite*` and the unzipped archive folder in Downloads.
