@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { buildTweetMedia, indexMediaIncludes } from "./media-includes";
 import { refreshSearchRows } from "./search-index";
 import { snowflakeToIso } from "./snowflake";
 import type { Database } from "./sqlite";
@@ -66,6 +67,7 @@ export interface DeweyCorpusImportResult {
 	malformedLines: number;
 	tweetsUpserted: number;
 	tweetsStubbed: number;
+	stubMediaFilled: number;
 	tweetsKept: number;
 	quotedTweetsUpserted: number;
 	skippedNoDate: number;
@@ -201,12 +203,13 @@ function toEntities(hydrated: JsonRecord) {
 	});
 }
 
-function toMedia(hydrated: JsonRecord): XurlMediaItem[] {
+function toMedia(hydrated: JsonRecord, tweetId: string): XurlMediaItem[] {
 	return (Array.isArray(hydrated.media) ? hydrated.media : [])
-		.map(asRecord)
-		.filter((item): item is JsonRecord => Boolean(item && str(item.media_key)))
-		.map((item) => {
-			const variants = (Array.isArray(item.variants) ? item.variants : [])
+		.map((rawItem, index) => ({ item: asRecord(rawItem), index }))
+		.filter(({ item }) => Boolean(item))
+		.map(({ item, index }) => {
+			const mediaKey = str(item!.media_key);
+			const variants = (Array.isArray(item!.variants) ? item!.variants : [])
 				.map(asRecord)
 				.filter((variant): variant is JsonRecord =>
 					Boolean(variant && str(variant.url)),
@@ -218,17 +221,42 @@ function toMedia(hydrated: JsonRecord): XurlMediaItem[] {
 						bit_rate: num(variant.bit_rate) ?? num(variant.bitrate),
 					}),
 				);
+			if (!mediaKey && variants.length === 0) {
+				const videoUrl = str(item!.video_url);
+				if (videoUrl)
+					variants.push(
+						compact({
+							url: videoUrl,
+							content_type: "video/mp4",
+							bit_rate: undefined,
+						}),
+					);
+			}
 			return compact({
-				media_key: String(item.media_key),
-				type: str(item.type) ?? "photo",
-				url: str(item.url),
-				preview_image_url: str(item.preview_url),
-				width: num(item.width),
-				height: num(item.height),
-				duration_ms: num(item.duration_ms),
+				media_key: mediaKey ?? `dewey_${tweetId}_${index}`,
+				type: str(item!.type) ?? "photo",
+				url: str(item!.url),
+				// Legacy bird video items carry the poster JPG in `url` and the MP4
+				// in `video_url`; without this the stored item points at the MP4.
+				preview_image_url:
+					str(item!.preview_url) ??
+					(str(item!.video_url) ? str(item!.url) : undefined),
+				width: num(item!.width),
+				height: num(item!.height),
+				duration_ms: num(item!.duration_ms),
 				variants: variants.length > 0 ? variants : undefined,
 			}) as XurlMediaItem;
 		});
+}
+
+function stubMedia(record: DeweyCorpusRecord) {
+	const media = record.hydrated
+		? toMedia(record.hydrated, record.tweet_id)
+		: [];
+	return buildTweetMedia(
+		{ attachments: { media_keys: media.map((item) => item.media_key) } },
+		indexMediaIncludes(media),
+	);
 }
 
 /**
@@ -251,7 +279,7 @@ export function toXurlTweet(
 	const retweeted = str(hydrated.retweeted_tweet_id);
 	if (retweeted) references.push({ type: "retweeted", id: retweeted });
 	const metrics = asRecord(hydrated.metrics) ?? {};
-	const media = toMedia(hydrated);
+	const media = toMedia(hydrated, record.tweet_id);
 	const editIds = asRecord(hydrated.edit)?.edit_history_tweet_ids;
 	const bookmarkedAt = toIsoDate(record.bookmarked_at);
 	const tweet = compact({
@@ -374,6 +402,7 @@ function emptyResult(
 		malformedLines: 0,
 		tweetsUpserted: 0,
 		tweetsStubbed: 0,
+		stubMediaFilled: 0,
 		tweetsKept: 0,
 		quotedTweetsUpserted: 0,
 		skippedNoDate: 0,
@@ -457,14 +486,18 @@ function importBatch(
 		(
 			db
 				.prepare(
-					`select id, author_profile_id from tweets where id in (${lookupIds.map(() => "?").join(", ")})`,
+					`select id, author_profile_id, media_json from tweets where id in (${lookupIds.map(() => "?").join(", ")})`,
 				)
-				.all(...lookupIds) as { id: string; author_profile_id: string }[]
-		).map((row) => [row.id, row.author_profile_id]),
+				.all(...lookupIds) as {
+				id: string;
+				author_profile_id: string;
+				media_json: string;
+			}[]
+		).map((row) => [row.id, row]),
 	);
 	const writable = (id: string) => {
-		const author = existing.get(id);
-		return author === undefined || author === UNKNOWN_PROFILE_ID;
+		const row = existing.get(id);
+		return row === undefined || row.author_profile_id === UNKNOWN_PROFILE_ID;
 	};
 	const existingCollections = new Map(
 		(
@@ -483,7 +516,18 @@ function importBatch(
 
 	const payloadTweets: XurlTweetData[] = [];
 	const payloadMedia: XurlMediaItem[] = [];
-	const stubs: { id: string; text: string; createdAt: string }[] = [];
+	const stubs: {
+		id: string;
+		text: string;
+		createdAt: string;
+		mediaCount: number;
+		mediaJson: string;
+	}[] = [];
+	const stubMediaRepairs: {
+		id: string;
+		mediaCount: number;
+		mediaJson: string;
+	}[] = [];
 	const collections: {
 		id: string;
 		bookmarkedAt: string | null;
@@ -492,6 +536,7 @@ function importBatch(
 
 	for (const record of batch) {
 		const mapped = toXurlTweet(record);
+		const media = mapped ? undefined : stubMedia(record);
 		let hasTweet = existing.has(record.tweet_id);
 		if (mapped && writable(record.tweet_id)) {
 			payloadTweets.push(mapped.tweet);
@@ -508,11 +553,29 @@ function importBatch(
 				id: record.tweet_id,
 				text: str(record.hydrated?.full_text) ?? str(record.csv?.content) ?? "",
 				createdAt,
+				mediaCount: media?.count ?? 0,
+				mediaJson: media?.json ?? "[]",
 			});
 			result.tweetsStubbed += 1;
 			hasTweet = true;
 		} else {
 			result.tweetsKept += 1;
+			const existingTweet = existing.get(record.tweet_id);
+			if (
+				!mapped &&
+				existingTweet?.author_profile_id === UNKNOWN_PROFILE_ID &&
+				["", "[]", "null"].includes(existingTweet.media_json) &&
+				media &&
+				media.count > 0 &&
+				media.json !== "[]"
+			) {
+				stubMediaRepairs.push({
+					id: record.tweet_id,
+					mediaCount: media.count,
+					mediaJson: media.json,
+				});
+				result.stubMediaFilled += 1;
+			}
 		}
 		const bookmarkedAt = toIsoDate(record.bookmarked_at) ?? null;
 		if (bookmarkedAt) result.bookmarksWithSaveTime += 1;
@@ -557,17 +620,36 @@ function importBatch(
 			});
 		}
 		const insertStub = db.prepare(
-			`insert into tweets (id, author_profile_id, text, created_at)
-			 values (?, ?, ?, ?) on conflict(id) do nothing`,
+			`insert into tweets (id, author_profile_id, text, created_at, media_count, media_json)
+			 values (?, ?, ?, ?, ?, ?) on conflict(id) do nothing`,
 		);
 		for (const stub of stubs) {
-			insertStub.run(stub.id, UNKNOWN_PROFILE_ID, stub.text, stub.createdAt);
+			insertStub.run(
+				stub.id,
+				UNKNOWN_PROFILE_ID,
+				stub.text,
+				stub.createdAt,
+				stub.mediaCount,
+				stub.mediaJson,
+			);
 		}
 		if (stubs.length > 0) {
 			refreshSearchRows(
 				db,
 				"tweet",
 				stubs.map((stub) => stub.id),
+			);
+		}
+		const updateStubMedia = db.prepare(
+			`update tweets set media_count = ?, media_json = ?
+			 where id = ? and author_profile_id = ? and media_json in ('', '[]', 'null')`,
+		);
+		for (const repair of stubMediaRepairs) {
+			updateStubMedia.run(
+				repair.mediaCount,
+				repair.mediaJson,
+				repair.id,
+				UNKNOWN_PROFILE_ID,
 			);
 		}
 		const upsertCollection = db.prepare(
