@@ -35,6 +35,15 @@ function getReferencedTweetId(tweet: XurlMentionData, type: string) {
 	);
 }
 
+/**
+ * Revisions are shared across accounts, so drop fields that describe the
+ * viewer rather than the tweet (they live on per-account tweet_collections).
+ */
+function withoutViewerFields(tweet: XurlMentionData) {
+	const { bookmarked_at: _viewerSpecific, ...shared } = tweet;
+	return shared;
+}
+
 function toCanonicalTweets(payload: XurlMentionsResponse) {
 	const tweetsById = new Map<string, XurlMentionData>();
 	for (const tweet of payload.includes?.tweets ?? []) {
@@ -114,8 +123,9 @@ export function ingestTweetPayload(
 		? db.prepare(`
         insert into tweet_collections (
           account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
-        ) values (?, ?, ?, null, ?, ?, ?)
+        ) values (?, ?, ?, ?, ?, ?, ?)
         on conflict(account_id, tweet_id, kind) do update set
+          collected_at = coalesce(excluded.collected_at, tweet_collections.collected_at),
           source = excluded.source,
           raw_json = excluded.raw_json,
           updated_at = excluded.updated_at
@@ -179,7 +189,7 @@ export function ingestTweetPayload(
 			recordTweetRevision(db, {
 				tweetId: tweet.id,
 				editHistoryIds: editHistoryIdsFromPayload(tweet.id, tweet),
-				payloadJson: JSON.stringify(tweet),
+				payloadJson: JSON.stringify(withoutViewerFields(tweet)),
 				source,
 				observedAt,
 			});
@@ -205,6 +215,7 @@ export function ingestTweetPayload(
 					accountId,
 					tweet.id,
 					collectionKind,
+					collectionKind === "bookmarks" ? (tweet.bookmarked_at ?? null) : null,
 					source,
 					JSON.stringify(tweet),
 					observedAt,

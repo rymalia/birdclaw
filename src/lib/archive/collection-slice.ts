@@ -31,7 +31,7 @@ export function parseCollectionSliceEffect({
 				plan.collections.push({
 					tweetId: tweet.id,
 					kind: slice,
-					collectedAt: tweet.createdAt,
+					collectedAt: tweet.collectedAt,
 					source: "archive",
 					rawJson: JSON.stringify(wrapper),
 				});

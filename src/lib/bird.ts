@@ -61,6 +61,8 @@ interface BirdTweetItem {
 	_raw?: unknown;
 	media?: BirdTweetMedia[];
 	article?: BirdTweetArticle | null;
+	/** Bookmark save time (bird fork >= 0.9.0, `bookmarks` command only). */
+	bookmarkedAt?: string;
 }
 
 export interface BirdDmUser {
@@ -624,7 +626,14 @@ function normalizeBirdTweets(items: BirdTweetItem[]): XurlMentionsResponse {
 			edit_history_tweet_ids: [item.id],
 		};
 	};
-	const data = items.map((item): XurlMentionData => normalizeItem(item));
+	const data = items.map((item): XurlMentionData => {
+		const tweet = normalizeItem(item);
+		const savedMs = item.bookmarkedAt ? Date.parse(item.bookmarkedAt) : NaN;
+		const bookmarkedAt = Number.isNaN(savedMs)
+			? undefined
+			: new Date(savedMs).toISOString();
+		return bookmarkedAt ? { ...tweet, bookmarked_at: bookmarkedAt } : tweet;
+	});
 	const includes: XurlMentionsResponse["includes"] = {};
 	if (users.size > 0) {
 		includes.users = Array.from(users.values());

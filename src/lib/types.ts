@@ -270,6 +270,12 @@ export interface XurlTweetData {
 	referenced_tweets?: XurlReferencedTweet[];
 	public_metrics?: XurlPublicMetrics;
 	edit_history_tweet_ids?: string[];
+	/**
+	 * birdclaw extension, not an X API v2 field: when the viewer bookmarked
+	 * this tweet (ISO 8601). Only the bird transport supplies it, decoded from
+	 * the Bookmarks timeline entry's sortIndex (`sortIndex >> 20` = Unix ms).
+	 */
+	bookmarked_at?: string;
 }
 
 export interface XurlNoteTweet {

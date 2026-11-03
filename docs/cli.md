@@ -104,6 +104,7 @@ birdclaw compose post
 birdclaw compose reply <tweet-id>
 birdclaw db stats
 birdclaw db vacuum
+birdclaw db repair-dates [--dry-run]
 birdclaw backup export --repo <path>
 birdclaw backup sync --repo <path> --remote <url>
 birdclaw backup import <path>
@@ -163,6 +164,10 @@ birdclaw show dm <conversation-id> --account <username> --json
 ### `db vacuum`
 
 Reclaim unused SQLite space without changing archive contents. This can take time and requires a writable database; concurrent activity may cause a busy error. `--json` returns `{"ok":true,"operation":"vacuum"}` after completion.
+
+### `db repair-dates`
+
+Repair historical `1970-01-01` placeholders: decode eligible Snowflake tweet IDs into `created_at` and clear placeholder collection dates. The command reports `tweetsCreatedAtRepaired`, `placeholdersLeft`, and `collectionsPlaceholderCleared`; `--dry-run` reports the same counts without writing. Use `--json` for machine-readable output.
 
 ### `import tweet <tweet-id-or-url...>`
 

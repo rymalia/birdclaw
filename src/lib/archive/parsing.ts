@@ -1,3 +1,4 @@
+import { isEpochPlaceholder, snowflakeToIso } from "../snowflake";
 import { safeHttpUrl } from "../url-safety";
 import type {
 	ArchiveAccountPayload,
@@ -13,6 +14,13 @@ export function parseTwitterDate(value: unknown) {
 	return Number.isNaN(parsed.getTime())
 		? new Date(0).toISOString()
 		: parsed.toISOString();
+}
+
+/** Like parseTwitterDate, but unknown/invalid input is null, not 1970. */
+export function parseOptionalTwitterDate(value: unknown): string | null {
+	if (typeof value !== "string" || value.length === 0) return null;
+	const parsed = parseTwitterDate(value);
+	return isEpochPlaceholder(parsed) ? null : parsed;
 }
 
 export function compareIsoTimestamp(left: string, right: string) {
@@ -234,13 +242,14 @@ export function extractCollectionTweet(
 				entry.expanded_url ??
 				"",
 		),
-		createdAt: parseTwitterDate(
-			entry.likedAt ??
-				entry.bookmarkedAt ??
-				entry.createdAt ??
-				entry.created_at ??
-				new Date(0).toISOString(),
-		),
+		// like.js / bookmark entries carry no post time; the Snowflake ID does.
+		createdAt:
+			parseOptionalTwitterDate(entry.createdAt ?? entry.created_at) ??
+			snowflakeToIso(id) ??
+			new Date(0).toISOString(),
+		// When the user liked/bookmarked it. X archives omit this, so it is
+		// usually null (unknown) rather than a fake date.
+		collectedAt: parseOptionalTwitterDate(entry.likedAt ?? entry.bookmarkedAt),
 		likeCount: toInt(entry.favorite_count ?? entry.like_count),
 	};
 }

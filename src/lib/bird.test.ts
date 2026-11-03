@@ -324,6 +324,38 @@ describe("bird transport", () => {
 		expectBirdCommandCall(2, ["mentions", "-n", "5", "--json"]);
 	});
 
+	it("carries the bookmark save time onto primary tweets only", async () => {
+		const { __test__ } = await import("./bird");
+		const normalized = __test__.normalizeBirdTweets([
+			{
+				id: "200",
+				text: "saved",
+				createdAt: "Mon Feb 10 13:34:39 +0000 2025",
+				bookmarkedAt: "2025-02-11T09:00:00.123Z",
+				authorId: "42",
+				quotedTweet: {
+					id: "100",
+					text: "quoted",
+					createdAt: "Sun Feb 09 10:00:00 +0000 2025",
+					bookmarkedAt: "2025-02-11T09:00:00.123Z",
+					authorId: "43",
+				},
+			},
+			{
+				id: "201",
+				text: "bad date",
+				createdAt: "Mon Feb 10 13:34:39 +0000 2025",
+				bookmarkedAt: "not a date",
+				authorId: "42",
+			},
+		]);
+		expect(normalized.data[0]?.bookmarked_at).toBe("2025-02-11T09:00:00.123Z");
+		expect(normalized.data[1]).not.toHaveProperty("bookmarked_at");
+		expect(normalized.includes?.tweets?.[0]).not.toHaveProperty(
+			"bookmarked_at",
+		);
+	});
+
 	it("keeps an avatar found on a later tweet from the same author", async () => {
 		const { __test__ } = await import("./bird");
 

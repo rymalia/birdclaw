@@ -97,6 +97,10 @@ birdclaw sync bookmarks --mode xurl --limit 100 --max-pages 70 --pagination-toke
 
 Bookmarks are queried via `birdclaw search tweets --bookmarked` and drive the [research](research.md) workflow.
 
+**Save times.** Only the bird transport knows *when* you bookmarked something: bird ≥ 0.9.0 decodes it from the Bookmarks timeline (`bookmarkedAt`), and Birdclaw stores it in `tweet_collections.collected_at`. The official API (xurl) has no save time, so `--mode auto` (xurl first) leaves it empty. A later sync never erases a known save time, and a re-bookmark reported by X replaces it. To backfill save times for bookmarks you already have, run `--mode bird --all` without `--early-stop`, because early stop skips pages that are already known locally.
+
+**Like times don't exist.** No X source records when you liked a tweet. The Likes timeline is only *ordered* by like time, and `like.js` in the archive has no dates. Liked tweets keep their real post time (`created_at`), and `collected_at` stays empty.
+
 `--early-stop` behaves the same way as on `sync likes`: stop paging when a full page is already locally known. Recommended default for any scheduled bookmark sync against a stable account.
 
 ## sync timeline
