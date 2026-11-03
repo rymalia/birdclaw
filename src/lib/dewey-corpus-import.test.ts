@@ -103,6 +103,22 @@ function tweetRow(id: string) {
 		| undefined;
 }
 
+function tweetMediaRow(id: string) {
+	return db()
+		.prepare(
+			"select author_profile_id, text, created_at, media_count, media_json from tweets where id = ?",
+		)
+		.get(id) as
+		| {
+				author_profile_id: string;
+				text: string;
+				created_at: string;
+				media_count: number;
+				media_json: string;
+		  }
+		| undefined;
+}
+
 function bookmarkRow(id: string) {
 	return db()
 		.prepare(
@@ -179,6 +195,74 @@ describe("dewey corpus mapping", () => {
 		expect(mapped?.tweet.referenced_tweets).toEqual([
 			{ type: "replied_to", id: "1657965228120735745" },
 			{ type: "quoted", id: QUOTED_ID },
+		]);
+	});
+
+	it("maps keyless photos and legacy video URLs into stable media includes", () => {
+		const mapped = toXurlTweet(
+			hydratedRecord(NEW_ID, {
+				media: [
+					{ type: "photo", url: "https://pbs.twimg.com/photo.jpg" },
+					{
+						type: "video",
+						url: "https://pbs.twimg.com/thumb.jpg",
+						video_url: "https://video.twimg.com/clip.mp4",
+					},
+				],
+			}),
+		);
+		expect(mapped?.media).toEqual([
+			{
+				media_key: `dewey_${NEW_ID}_0`,
+				type: "photo",
+				url: "https://pbs.twimg.com/photo.jpg",
+			},
+			{
+				media_key: `dewey_${NEW_ID}_1`,
+				type: "video",
+				url: "https://pbs.twimg.com/thumb.jpg",
+				preview_image_url: "https://pbs.twimg.com/thumb.jpg",
+				variants: [
+					{
+						url: "https://video.twimg.com/clip.mp4",
+						content_type: "video/mp4",
+					},
+				],
+			},
+		]);
+	});
+
+	it("stores legacy videos with the poster as url and thumbnail", async () => {
+		writeCorpus([
+			{
+				tweet_id: UNHYDRATED_ID,
+				csv: { date: "", content: "deleted video tweet" },
+				bookmarked_at: null,
+				hydrated: {
+					source: "bird",
+					media: [
+						{
+							type: "video",
+							url: "https://pbs.twimg.com/thumb.jpg",
+							video_url: "https://video.twimg.com/clip.mp4",
+						},
+					],
+				},
+			},
+		]);
+		await importDeweyCorpus(db(), corpusPath, { accountId: ACCOUNT });
+		const row = db()
+			.prepare("select media_json from tweets where id = ?")
+			.get(UNHYDRATED_ID) as { media_json: string };
+		expect(JSON.parse(row.media_json)).toEqual([
+			{
+				url: "https://pbs.twimg.com/thumb.jpg",
+				type: "video",
+				thumbnailUrl: "https://pbs.twimg.com/thumb.jpg",
+				variants: [
+					expect.objectContaining({ url: "https://video.twimg.com/clip.mp4" }),
+				],
+			},
 		]);
 	});
 
@@ -359,6 +443,91 @@ describe("importDeweyCorpus", () => {
 			)
 			.all();
 		expect(hit).toEqual([{ tweet_id: UNHYDRATED_ID }]);
+	});
+
+	it("writes hydrated media on a new profile_unknown stub", async () => {
+		writeCorpus([
+			hydratedRecord(UNHYDRATED_ID, {
+				author: null,
+				media: [{ type: "photo", url: "https://pbs.twimg.com/stub.jpg" }],
+			}),
+		]);
+		const result = await importDeweyCorpus(db(), corpusPath, {
+			accountId: ACCOUNT,
+		});
+		expect(tweetMediaRow(UNHYDRATED_ID)).toEqual({
+			author_profile_id: "profile_unknown",
+			text: `dp text ${UNHYDRATED_ID}`,
+			created_at: "2023-05-29T22:57:09.000Z",
+			media_count: 1,
+			media_json: JSON.stringify([
+				{ url: "https://pbs.twimg.com/stub.jpg", type: "image" },
+			]),
+		});
+		expect(result).toMatchObject({ tweetsStubbed: 1, stubMediaFilled: 0 });
+	});
+
+	it("fills missing media on an existing profile_unknown stub once", async () => {
+		const database = db();
+		database
+			.prepare(
+				"insert into tweets (id, author_profile_id, text, created_at, media_json) values (?, 'profile_unknown', 'archive text', '2022-10-17T15:46:40.902Z', '[]')",
+			)
+			.run(UNHYDRATED_ID);
+		const record = hydratedRecord(UNHYDRATED_ID, {
+			author: null,
+			full_text: "corpus text must not replace archive text",
+			media: [{ type: "photo", url: "https://pbs.twimg.com/repaired.jpg" }],
+		});
+		writeCorpus([record]);
+		const first = await importDeweyCorpus(db(), corpusPath, {
+			accountId: ACCOUNT,
+		});
+		expect(first).toMatchObject({
+			tweetsKept: 1,
+			tweetsStubbed: 0,
+			stubMediaFilled: 1,
+		});
+		expect(tweetMediaRow(UNHYDRATED_ID)).toEqual({
+			author_profile_id: "profile_unknown",
+			text: "archive text",
+			created_at: "2022-10-17T15:46:40.902Z",
+			media_count: 1,
+			media_json: JSON.stringify([
+				{ url: "https://pbs.twimg.com/repaired.jpg", type: "image" },
+			]),
+		});
+		const afterFirst = tableCounts();
+		const second = await importDeweyCorpus(db(), corpusPath, {
+			accountId: ACCOUNT,
+		});
+		expect(second).toMatchObject({ tweetsKept: 1, stubMediaFilled: 0 });
+		expect(tableCounts()).toEqual(afterFirst);
+	});
+
+	it("does not fill media on an existing known-author tweet", async () => {
+		db()
+			.prepare(
+				"insert into tweets (id, author_profile_id, text, created_at, media_json) values (?, 'profile_user_999', 'live text', '2022-10-17T15:46:40.902Z', '[]')",
+			)
+			.run(UNHYDRATED_ID);
+		writeCorpus([
+			hydratedRecord(UNHYDRATED_ID, {
+				author: null,
+				media: [{ type: "photo", url: "https://pbs.twimg.com/ignored.jpg" }],
+			}),
+		]);
+		const result = await importDeweyCorpus(db(), corpusPath, {
+			accountId: ACCOUNT,
+		});
+		expect(tweetMediaRow(UNHYDRATED_ID)).toEqual({
+			author_profile_id: "profile_user_999",
+			text: "live text",
+			created_at: "2022-10-17T15:46:40.902Z",
+			media_count: 0,
+			media_json: "[]",
+		});
+		expect(result).toMatchObject({ tweetsKept: 1, stubMediaFilled: 0 });
 	});
 
 	it("writes quoted tweets that are not corpus bookmarks, with a sparse author", async () => {
