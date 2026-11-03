@@ -57,6 +57,7 @@ birdclaw auth status
 birdclaw auth use <transport>
 birdclaw auth prefer <bird|xurl|auto>
 birdclaw import archive [path]
+birdclaw import dewey-corpus <corpus.jsonl> [--dry-run]
 birdclaw import tweet <tweet-id-or-url...> --fxtwitter
 birdclaw sync authored
 birdclaw dms sync
@@ -338,6 +339,28 @@ birdclaw import archive ~/Downloads/twitter-archive.zip --select tweets --json
 birdclaw import archive ~/Downloads/twitter-archive.zip --select likes,bookmarks --json
 birdclaw import archive ~/Downloads/twitter-archive.zip --select dms --json
 birdclaw import archive ~/Downloads/twitter-archive.zip --select followers,following --json
+```
+
+### `import dewey-corpus <corpus.jsonl>`
+
+Imports bookmark records from a dewey-pipeline `data/corpus.jsonl` (one JSON record per line). The import goes one way, is idempotent, and only fills gaps: it never overrides data that a live sync or the archive already holds.
+
+- **Bookmarks:** adds `tweet_collections(kind='bookmarks', source='dewey-pipeline')`, with `collected_at` set to the record's `bookmarked_at` (the save time, or null when unknown). An existing bookmark keeps its `collected_at` and `source`; only a null save time is filled.
+- **Tweets:** a tweet is written through the same upsert live syncs use, but only when it's absent or still an archive stub (`profile_unknown`). A tweet that already has a known author is left alone.
+  - The post time comes from the hydrated date, then the Snowflake decode, then the CSV date (UTC).
+  - Note tweets keep their full text, and media, mentions, URLs and references are mapped.
+- **Profiles:** the author is taken from `hydrated.author.id`, never from the CSV handle, because handles get reused. A profile is created or upgraded only when it's missing or not yet hydrated (no `public_metrics`). Profiles are processed oldest observation first, so the most recent claimant of a reused handle keeps it. Quoted-tweet authors that aren't known yet get sparse profiles.
+- **Unhydrated records:** these become a `profile_unknown` tweet with the CSV text, which is searchable.
+- **Not imported:** deleted-tweet verdicts (`hydration_error`), threads and URL archives.
+
+Flags:
+
+- `--dry-run` — report the counts without writing (this also skips backup auto-sync)
+- `--account <username>` — the target account (default: the default account)
+- `--limit <n>` — import only the first n records
+
+```bash
+birdclaw import dewey-corpus ~/projects/chrome-extensions/dewey-account-data/data/corpus.jsonl --dry-run --json
 ```
 
 ### `sync *`

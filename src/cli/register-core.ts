@@ -12,7 +12,9 @@ import {
 	setActionsTransport,
 	setPreferredTransport,
 } from "#/lib/config";
+import { resolveOperationAccount } from "#/lib/account-selection";
 import { getNativeDb } from "#/lib/db";
+import { importDeweyCorpus } from "#/lib/dewey-corpus-import";
 import {
 	FxTwitterError,
 	importConversationViaFxTwitter,
@@ -351,6 +353,43 @@ export function registerCoreCommands({
 			await autoSyncAfterWrite();
 			print(result, asJson());
 		});
+	importCommand
+		.command("dewey-corpus <corpusPath>")
+		.description(
+			"Import dewey-pipeline bookmark records (corpus.jsonl); fills gaps, never overrides live data",
+		)
+		.option("--account <username>", "Account username or id")
+		.option("--dry-run", "Report what would be imported without writing")
+		.option("--limit <n>", "Import only the first n corpus records")
+		.action(
+			async (
+				corpusPath: string,
+				options: { account?: string; dryRun?: boolean; limit?: string },
+			) => {
+				const db = getNativeDb({ seedDemoData: false });
+				const account = resolveOperationAccount(options.account, db);
+				const limit =
+					options.limit === undefined
+						? undefined
+						: parsePositiveIntegerOption(options.limit, "--limit");
+				const json = Boolean(asJson());
+				const result = await importDeweyCorpus(db, corpusPath, {
+					accountId: account.id,
+					dryRun: Boolean(options.dryRun),
+					limit,
+					...(!json
+						? {
+								onProgress: (processed: number) => {
+									process.stderr.write(`\rdewey-corpus: ${processed} records`);
+								},
+							}
+						: {}),
+				});
+				if (!json) process.stderr.write("\n");
+				if (!options.dryRun) await autoSyncAfterWrite();
+				print(result, json);
+			},
+		);
 	importCommand
 		.command("hydrate-profiles")
 		.description(
