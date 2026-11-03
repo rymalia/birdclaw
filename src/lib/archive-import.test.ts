@@ -3436,6 +3436,7 @@ describe("archive import", () => {
 			id: "42",
 			text: "collection fallback",
 			createdAt: "2026-05-01T00:00:00.000Z",
+			collectedAt: null,
 			likeCount: 4,
 		});
 		expect(
@@ -3454,6 +3455,7 @@ describe("archive import", () => {
 			id: "43",
 			text: "https://example.com/bookmark",
 			createdAt: "2026-05-02T00:00:00.000Z",
+			collectedAt: null,
 			likeCount: 9,
 		});
 		expect(
@@ -3471,6 +3473,40 @@ describe("archive import", () => {
 			id: "44",
 			text: "fallback text",
 			createdAt: "2026-05-03T00:00:00.000Z",
+		});
+		// Real like.js shape: no dates at all. Post time comes from the Snowflake;
+		// like time stays unknown (null) instead of a fake 1970 value.
+		expect(
+			__test__.extractCollectionTweet(
+				{ like: { tweetId: "1888944671579078978", fullText: "liked" } },
+				"like",
+			),
+		).toMatchObject({
+			createdAt: "2025-02-10T13:34:39.256Z",
+			collectedAt: null,
+		});
+		expect(
+			__test__.extractCollectionTweet(
+				{ like: { tweetId: "17623011985", fullText: "pre-Snowflake" } },
+				"like",
+			),
+		).toMatchObject({
+			createdAt: "1970-01-01T00:00:00.000Z",
+			collectedAt: null,
+		});
+		expect(
+			__test__.extractCollectionTweet(
+				{
+					bookmark: {
+						tweetId: "1888944671579078978",
+						bookmarkedAt: "2025-02-11T09:00:00.000Z",
+					},
+				},
+				"bookmark",
+			),
+		).toMatchObject({
+			createdAt: "2025-02-10T13:34:39.256Z",
+			collectedAt: "2025-02-11T09:00:00.000Z",
 		});
 		expect(
 			__test__.extractTweetEntities({

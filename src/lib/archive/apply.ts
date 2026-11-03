@@ -139,6 +139,7 @@ export function applyArchiveImportPlanEffect({
 		        else tweets.text
 		      end,
 		      created_at = case
+		        when tweets.created_at like '1970-01-01%' then excluded.created_at
 		        when ? = 1 then tweets.created_at
 		        else excluded.created_at
 		      end,
@@ -193,7 +194,10 @@ export function applyArchiveImportPlanEffect({
 		      account_id, tweet_id, kind, collected_at, source, raw_json, updated_at
 		    ) values (?, ?, ?, ?, ?, ?, ?)
 		    on conflict(account_id, tweet_id, kind) do update set
-		      collected_at = coalesce(excluded.collected_at, tweet_collections.collected_at),
+		      collected_at = coalesce(
+		        excluded.collected_at,
+		        nullif(tweet_collections.collected_at, '1970-01-01T00:00:00.000Z')
+		      ),
 		      source = case
 		        when tweet_collections.source = 'archive' then excluded.source
 		        else tweet_collections.source

@@ -192,7 +192,7 @@ After import, archive data and live data live in the same canonical tables. Ther
 - **Bio entities** → `profile_bio_entities` table for extracted `@handle`, domain, and company-phrase identity hints
 - **Blocks** (when present in the archive export) → `blocks` table per account
 
-Tweets whose archive timestamps are missing or impossible (`1970-01-01` rows) get bucketed into `data/tweets/unknown.jsonl` on backup export rather than pretending they belong to 1970.
+`like.js` and bookmark entries carry no dates, so the importer takes each tweet's post time from its Snowflake ID, `(id >> 22) + 1288834974657` ms. It leaves the like or bookmark time (`collected_at`) empty, because X doesn't export it. Only tweets from before Snowflake IDs (2010-11-04 and earlier, ID ≤ 29700859247) still get the `1970-01-01` placeholder. Those rows are bucketed into `data/tweets/unknown.jsonl` on backup export rather than pretending they belong to 1970. Databases imported before this change can be fixed in place with `birdclaw db repair-dates` (try `--dry-run` first).
 
 ## After import
 

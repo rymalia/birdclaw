@@ -173,6 +173,13 @@ const maximum = (table: string, column: string) =>
 	`max(${table}.${column}, excluded.${column})`;
 const minimum = (table: string, column: string) =>
 	`min(${table}.${column}, excluded.${column})`;
+/** Earliest date, ignoring birdclaw's 1970 "unknown date" placeholder. */
+const earliestKnown = (table: string, column: string) =>
+	`case
+		when ${table}.${column} like '1970-01-01%' then excluded.${column}
+		when excluded.${column} like '1970-01-01%' then ${table}.${column}
+		else min(${table}.${column}, excluded.${column})
+	end`;
 const newest = (table: string, column: string) =>
 	`case when excluded.updated_at >= ${table}.updated_at then excluded.${column} else ${table}.${column} end`;
 
@@ -430,7 +437,7 @@ const definitions = {
 		  when tweets.note_tweet_json is not null then tweets.text
 		  else coalesce(nullif(excluded.text, ''), tweets.text)
 		end`,
-			created_at: minimum,
+			created_at: earliestKnown,
 			is_replied: maximum,
 			reply_to_id: incomingNonNull,
 			like_count: maximum,
@@ -651,7 +658,11 @@ const definitions = {
 			account_id: null,
 			tweet_id: null,
 			kind: null,
-			collected_at: `coalesce(tweet_collections.collected_at, excluded.collected_at)`,
+			// Local wins (a backup may be older), but the 1970 placeholder never survives.
+			collected_at: `coalesce(
+				nullif(tweet_collections.collected_at, '1970-01-01T00:00:00.000Z'),
+				nullif(excluded.collected_at, '1970-01-01T00:00:00.000Z')
+			)`,
 			source: incomingNonEmpty,
 			raw_json: `case
           when excluded.raw_json not in ('', '{}', 'null') then excluded.raw_json

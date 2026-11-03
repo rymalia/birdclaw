@@ -800,6 +800,7 @@ describe("cli", () => {
 		expect(db?.commands.map((command) => command.name())).toEqual([
 			"stats",
 			"vacuum",
+			"repair-dates",
 		]);
 		expect(db?.commands[0]?.description()).toBe(
 			"Show local storage and dataset stats",

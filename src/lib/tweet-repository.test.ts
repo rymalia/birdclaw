@@ -102,6 +102,61 @@ it("reconciles each payload author once and observes new profile data in the nex
 	}
 });
 
+it("stores bookmark save times without clobbering a known one", () => {
+	tempRoot = mkdtempSync(path.join(os.tmpdir(), "birdclaw-bookmarked-at-"));
+	process.env.BIRDCLAW_HOME = tempRoot;
+	resetBirdclawPathsForTests();
+	resetDatabaseForTests();
+	const db = getNativeDb({ seedDemoData: false });
+	const tweet = {
+		id: "1888944671579078978",
+		author_id: "42",
+		text: "saved",
+		created_at: "2025-02-10T13:34:39.256Z",
+	};
+	const ingest = (
+		collectionKind: "bookmarks" | "likes",
+		bookmarked_at?: string,
+	) =>
+		ingestTweetPayload(db, {
+			accountId: "fixture",
+			source: "bird",
+			collectionKind,
+			payload: {
+				data: [bookmarked_at ? { ...tweet, bookmarked_at } : tweet],
+				includes: { users: [{ id: "42", username: "sam", name: "Sam" }] },
+			},
+		});
+	const collectedAt = (kind: string) =>
+		(
+			db
+				.prepare(
+					"select collected_at from tweet_collections where tweet_id = ? and kind = ?",
+				)
+				.get(tweet.id, kind) as { collected_at: string | null }
+		).collected_at;
+
+	ingest("bookmarks", "2025-02-11T09:00:00.000Z");
+	expect(collectedAt("bookmarks")).toBe("2025-02-11T09:00:00.000Z");
+	// An xurl sync (no save time) must not erase what bird told us.
+	ingest("bookmarks");
+	expect(collectedAt("bookmarks")).toBe("2025-02-11T09:00:00.000Z");
+	// A re-bookmark reported by X replaces the old save time.
+	ingest("bookmarks", "2026-01-05T12:00:00.000Z");
+	expect(collectedAt("bookmarks")).toBe("2026-01-05T12:00:00.000Z");
+	// Likes have no recoverable like time; a stray field is not applied to them.
+	ingest("likes", "2026-01-05T12:00:00.000Z");
+	expect(collectedAt("likes")).toBeNull();
+	// The save time is per-viewer; it must not leak into shared tweet history.
+	const revisions = db
+		.prepare("select payload_json from tweet_revisions where revision_id = ?")
+		.all(tweet.id) as { payload_json: string }[];
+	expect(revisions.length).toBeGreaterThan(0);
+	for (const { payload_json } of revisions) {
+		expect(payload_json).not.toContain("bookmarked_at");
+	}
+});
+
 afterEach(() => {
 	resetDatabaseForTests();
 	resetBirdclawPathsForTests();
